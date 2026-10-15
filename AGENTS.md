@@ -340,6 +340,18 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   Allocation retains cleanup authority before checkout starts, including through startup errors and
   cancellation. Controllers confirm destruction before recording an allocation failure as terminal.
   Local Git retains the caller identity.
+- Local controllers may use `ZEROSHOT_GITHUB_TOKEN_FILE` for renewable trusted GitHub delivery
+  authority. The private file stays outside the checkout and is reopened at delivery entry and after
+  authentication rejection. Explicit `GH_TOKEN` wins and invalid explicit values fail closed. The
+  host rotates the file atomically; unchanged rejected issuances wait for rotation. The file setting
+  is removed from provider context, travels only through the consumed private bootstrap, and is
+  freshly selected on resume, never persisted in recovery or run history.
+- `ZEROSHOT_DELIVERY_CHECK_COMMAND` selects one private absolute executable outside the checkout
+  for trusted local publication, review observation and merge validation. Its capability travels only through the consumed
+  private bootstrap, never provider context or recovery metadata; resume selects it freshly. The
+  controller owns process cleanup and passes public candidate facts without ambient credentials.
+  Authoritative merged/closed observations settle before hooks or late feedback; a completed remote
+  merge cannot become a new repair merely because main now contains the fix.
 - Before first publication, delivery captures and fetches the exact current target revision and
   merges it while preserving candidate history and dirty work. Any changed candidate returns through
   the authored repair/review loop before push. Delivery feedback distinguishes immutable
@@ -366,7 +378,14 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   overrides a stricter restriction. Direct merge submission reads all rule pages with an independent
   cursor; PR observation and queues do not require direct-method discovery. Incomplete rule reads and
   empty method intersections stop merge submission with policy diagnostics. Merge queues choose their
-  own method. Merge commands retain contained process cleanup and use the GitHub API error boundary,
+  own method. Queue admission uses explicit `enqueuePullRequest` with the validated PR node ID and
+  exact `expectedHeadOid`; enabling auto-merge alone is not enqueue confirmation. Completed transient
+  submissions retry after fresh exact-head policy checks; retries retain earlier uncertainty so an
+  empty snapshot cannot authorize repair. Before a merge
+  delivery returns repair, refusal, error, or cancellation, trusted authority confirms withdrawal
+  of queued/auto-merge effects or the exact already-merged revision. Failed withdrawal never
+  authorizes agent repair. Authorities that schedule deferred merges must override
+  `withdraw_merge_request`; its default is valid only when no autonomous merge effects exist. Merge commands retain contained process cleanup and use the GitHub API error boundary,
   never Git repair; changed gates cannot mask a permanent rejection. Configured
   branch-protection contexts remain pending until they appear on the exact PR head, preventing a
   newly opened PR from looking ready before its required workflow registers. Missing or stale human
