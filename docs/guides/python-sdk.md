@@ -6,8 +6,12 @@ and engine on one release line.
 
 ## Install and run
 
+Download the wheel for your OS and CPU from [Python SDK releases](https://github.com/the-open-engine/zeroshot/releases?q=zeroshot-python-v).
+`x86_64` wheels target Intel/AMD CPUs; `arm64`/`aarch64` target ARM CPUs, including Apple silicon.
+Windows x64 uses `win_amd64`. Replace `WHEEL_FILE` with its local path:
+
 ```console
-python -m pip install the-open-engine-zeroshot
+python -m pip install WHEEL_FILE
 ```
 
 ```python
