@@ -95,7 +95,11 @@ fn wave6_cli_contract_uniform_runtime_and_template_bindings_preserve_authority()
         insert_template_binding(
             &mut invalid,
             delivery_name,
-            git_delivery_binding(PullRequestFeedback::Consider).assert_value(),
+            git_delivery_binding(
+                PullRequestFeedback::Consider,
+                crate::native_v2_delivery::DeliveryMode::PullRequestV2
+            )
+            .assert_value(),
             false,
         )
         .assert_error()
@@ -230,6 +234,9 @@ async fn wave8_cli_contract_validate_only_preflight_materializes_without_backend
     )
     .assert_value();
     let run = RunCommand {
+        cwd: None,
+        source_connection: None,
+
         environment: None,
         target: None,
         title: RunTitle::new("Validate only").assert_value(),
@@ -252,7 +259,7 @@ async fn wave8_cli_contract_validate_only_preflight_materializes_without_backend
     let mut output = Vec::new();
     assert_eq!(
         try_execute_native_v2_preflight_with_environment(
-            &NativeV2CliCommand::Run(run.clone()),
+            &NativeV2CliCommand::Run(Box::new(run.clone())),
             &mut output,
             |_| None,
         )
@@ -263,14 +270,14 @@ async fn wave8_cli_contract_validate_only_preflight_materializes_without_backend
     assert_eq!(output, b"{\"valid\":true}\n");
 
     for command in [
-        NativeV2CliCommand::Run(RunCommand {
+        NativeV2CliCommand::Run(Box::new(RunCommand {
             validate_only: false,
             ..run.clone()
-        }),
-        NativeV2CliCommand::Run(RunCommand {
+        })),
+        NativeV2CliCommand::Run(Box::new(RunCommand {
             selection: RunSelection::Profile(None),
             ..run
-        }),
+        })),
         NativeV2CliCommand::TemplateList,
     ] {
         assert!(

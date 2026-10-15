@@ -81,7 +81,7 @@ where
         return execute_target(command, context.backend).await;
     }
     match command {
-        NativeV2CliCommand::Run(run) => execute_run(run, context, signal, output).await,
+        NativeV2CliCommand::Run(run) => execute_run(*run, context, signal, output).await,
         NativeV2CliCommand::Update
         | NativeV2CliCommand::TargetServe(_)
         | NativeV2CliCommand::Ui { .. } => Err(NativeV2CliError::ProcessCommand),
@@ -197,6 +197,7 @@ where
                 connections,
                 connection_resolver: None,
                 github_token,
+                git_credentials: None,
             },
         )
         .await?;
