@@ -933,6 +933,107 @@ fn local_git_source_uses_remote_upstream_and_rejects_ambiguous_or_stale_selectio
     assert_eq!(source.branch.as_str(), "main");
 }
 
+// Source resolution selects the local branch name; the preflight must reject
+// it because the remote does not contain that branch.
+#[test]
+fn fresh_local_branch_without_upstream_can_resolve_to_missing_remote_branch() {
+    let repo = crate::native_v2_candidate::test_support::TestGitRepository::delivery();
+
+    // Create a local branch with no upstream.
+    git(&repo.workspace, &["checkout", "-b", "my-change"]);
+
+    // The bare remote has main, but not my-change.
+    let status = std::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(&repo.remote)
+        .args(["show-ref", "--verify", "--quiet", "refs/heads/my-change"])
+        .status()
+        .assert_value();
+
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "the remote fixture should not contain my-change"
+    );
+
+    // Keep the remote URL in a format accepted by source resolution.
+    git(
+        &repo.workspace,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/open-engine/zeroshot.git",
+        ],
+    );
+
+    let source = resolved_git_source(&repo.workspace, Path::new("git"), None).assert_value();
+
+    // Source resolution selects the local branch name; the preflight must reject
+// it because the remote does not contain that branch.
+    assert_eq!(source.branch.as_str(), "my-change");
+}
+
+#[tokio::test]
+async fn remote_base_validation_distinguishes_missing_branch_from_remote_failure() {
+    let repo = crate::native_v2_candidate::test_support::TestGitRepository::delivery();
+    let remote = repo.remote.to_str().assert_value();
+    let invoking_directory = std::env::current_dir().assert_value();
+    let state_root = repo.root.path();
+
+    validate_remote_base_ref(
+        remote,
+        "main",
+        &repo.workspace,
+        &invoking_directory,
+        Path::new("git"),
+        state_root,
+        None,
+        None,
+    )
+    .await
+    .assert_value();
+
+    let missing = validate_remote_base_ref(
+        remote,
+        "my-change",
+        &repo.workspace,
+        &invoking_directory,
+        Path::new("git"),
+        state_root,
+        None,
+        None,
+    )
+    .await
+    .expect_err("a missing remote target branch should be rejected");
+
+    assert!(matches!(
+        missing,
+        LocalCompositionError::MissingRemoteBase { ref branch }
+            if branch == "my-change"
+    ));
+
+    let unreachable = repo.root.child("does-not-exist.git");
+
+    let failed = validate_remote_base_ref(
+        unreachable.to_str().assert_value(),
+        "main",
+        &repo.workspace,
+        &invoking_directory,
+        Path::new("git"),
+        state_root,
+        None,
+        None,
+    )
+    .await
+    .expect_err("a remote failure must not be reported as a missing branch");
+
+    assert!(matches!(
+        failed,
+        LocalCompositionError::RemoteBaseCheck { ref branch }
+            if branch == "main"
+    ));
+}
 #[test]
 fn local_git_source_keeps_long_transport_identity_stable_without_losing_locator() {
     let repo = crate::native_v2_candidate::test_support::TestGitRepository::delivery();

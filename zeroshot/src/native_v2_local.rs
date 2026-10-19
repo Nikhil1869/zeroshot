@@ -64,6 +64,14 @@ pub enum LocalCompositionError {
     AmbiguousRemote,
     #[error("Git delivery requires a committed repository source")]
     DeliverySourceRequired,
+    #[error(
+        "remote does not have target branch `{branch}`; set the intended upstream (for example `git branch --set-upstream-to=origin/main`) or create the worktree from `origin/main`"
+    )]
+    MissingRemoteBase { branch: String },
+    #[error(
+        "could not verify target branch `{branch}` on the remote; check remote connectivity and credentials"
+    )]
+    RemoteBaseCheck { branch: String },
     #[error("current Git resolved source is invalid")]
     ResolvedSource,
     #[error("local run identity could not be assigned")]
@@ -329,6 +337,80 @@ fn git_output(
     }
     let value = String::from_utf8(output.stdout).map_err(|_| LocalCompositionError::Workspace)?;
     Ok(value.trim_end_matches(['\r', '\n']).to_owned())
+}
+
+/// Confirms that a PR/merge target branch exists on the selected remote before starting agents.
+/// The supervised Git transport distinguishes an absent ref from a failed remote observation.
+pub(crate) async fn validate_remote_base_branch(
+    source: Option<&openengine_cluster_protocol::ResolvedSource>,
+    workspace: &Path,
+    invoking_directory: &Path,
+    git_program: &Path,
+    state_root: &Path,
+    github_token: Option<&str>,
+    git_credentials: Option<&GitTransportCredentials>,
+) -> Result<(), LocalCompositionError> {
+    let source = source.ok_or(LocalCompositionError::DeliverySourceRequired)?;
+    let remote = crate::source_code_provider::adapters::core::source_remote(source);
+
+    validate_remote_base_ref(
+        &remote,
+        source.branch.as_str(),
+        workspace,
+        invoking_directory,
+        git_program,
+        state_root,
+        github_token,
+        git_credentials,
+    )
+    .await
+}
+async fn validate_remote_base_ref(
+    remote: &str,
+    branch: &str,
+    workspace: &Path,
+    invoking_directory: &Path,
+    git_program: &Path,
+    state_root: &Path,
+    github_token: Option<&str>,
+    git_credentials: Option<&GitTransportCredentials>,
+) -> Result<(), LocalCompositionError> {
+    let native_environment = capture_local_native_environment(invoking_directory)?;
+    let harness_environment = LocalHarnessEnvironment::new(native_environment.clone());
+
+    let home_directory =
+        current_user_home(&harness_environment).ok_or(LocalCompositionError::NativeEnvironment)?;
+
+    let private_directory = state_root.join("git-preflight");
+    prepare_private_directory(&private_directory)?;
+
+    let transport = crate::native_v2_delivery::transport::GitTransport::new(
+        crate::native_v2_delivery::transport::GitTransportConfig {
+            git_program: git_program.to_owned(),
+            workspace: workspace.to_owned(),
+            home_directory,
+            private_directory,
+            identity: None,
+            local_environment: Some(native_environment),
+            deadline: std::time::Duration::from_secs(10 * 60),
+        },
+        remote,
+    );
+
+    let credential = crate::native_v2_delivery::transport::source_credential(
+        github_token.unwrap_or(""),
+        git_credentials,
+    );
+
+    match transport.read_ref(branch, credential).await {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(LocalCompositionError::MissingRemoteBase {
+            branch: branch.to_owned(),
+        }),
+        Err(_) => Err(LocalCompositionError::RemoteBaseCheck {
+            branch: branch.to_owned(),
+        }),
+    }
 }
 
 /// Builds a local-user process candidate rooted in the existing workspace.

@@ -239,6 +239,21 @@ impl LocalCliBackend {
             RunEnvironment::exact_for_submission(&submission, request.connections.clone())?
                 .resolve_git_source()
                 .await?;
+        if crate::native_v2_admission::delivery_capabilities(&request.intent.graph.root)
+            .contains(&crate::source_code_provider::SourceCapability::PullRequest)
+        {
+            crate::native_v2_local::validate_remote_base_branch(
+                source.as_ref(),
+                &workspace,
+                &self.current_directory,
+                &self.git_program,
+                &self.state_root,
+                request.github_token.as_deref(),
+                request.git_credentials.as_ref(),
+            )
+            .await
+            .map_err(|error| NativeV2CliError::Usage(error.to_string()))?;
+        }
         request.cwd = Some(workspace);
         request.source = source.map(|resolved| super::NamedRunSource {
             resolved,
