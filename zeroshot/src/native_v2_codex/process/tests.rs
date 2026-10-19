@@ -150,7 +150,6 @@ fn coverage_contract_delivery_and_process_failures_preserve_all_safe_evidence() 
         &Err(ProcessRunnerError::Launch("not started".to_owned())),
         true,
     )
-    .assert_value()
     .assert_value();
     assert!(completion_error.contains("provider process completion failed"));
     let merged = merge_completion_detail(
@@ -174,4 +173,61 @@ fn coverage_contract_output_chunk_boundaries_preserve_utf8_without_exceeding_the
     assert_eq!(end, 8 * 1024 - 1);
     assert!(text.is_char_boundary(end));
     assert!(end <= 8 * 1024);
+}
+
+#[test]
+fn unconfirmed_cleanup_retains_redacted_native_input_and_process_causes() {
+    let secret = "sk-cleanup-secret";
+    let output = Ok(CodexOutput::provider_failure(format!(
+        "native model rejection {secret}"
+    )));
+    let mut process = completion(ProcessCleanupEvidence::TimedOut, true);
+    process.exit_code = Some(17);
+    process.stderr_tail = format!("stderr cause {secret}").into_bytes();
+    let process = Ok(process);
+    let input = ProcessRunnerError::Io(format!("stdin rejected {secret}"));
+    let diagnostic =
+        cleanup_failure_diagnostic(&output, &process, Some(&input), &[secret.to_owned()]).unwrap();
+    assert!(diagnostic.contains("native model rejection [REDACTED]"));
+    assert!(diagnostic.contains("stdin rejected [REDACTED]"));
+    assert!(diagnostic.contains("stderr cause [REDACTED]"));
+    assert!(!diagnostic.contains(secret));
+    assert!(matches!(
+        resolve_input_failure(output, input, process, true),
+        Err(NodeRunnerError::CleanupUnconfirmed)
+    ));
+}
+
+#[test]
+fn successful_answer_text_is_never_previewed_as_a_cleanup_failure() {
+    let mut decoder = CodexOutputDecoder::new();
+    decoder.push(b"{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"private successful answer\"}}\n");
+    decoder.push(b"{\"type\":\"turn.completed\"}\n");
+    let output = Ok(decoder.finish());
+    let diagnostic = cleanup_failure_diagnostic(
+        &output,
+        &Ok(completion(ProcessCleanupEvidence::TimedOut, false)),
+        None,
+        &[],
+    )
+    .unwrap();
+    assert!(diagnostic.contains("cleanup"));
+    assert!(!diagnostic.contains("private successful answer"));
+}
+
+#[test]
+fn cancelled_cleanup_keeps_stderr_without_a_parsed_native_failure() {
+    let mut process = completion(ProcessCleanupEvidence::TimedOut, true);
+    process.stderr_tail = b"buffered native failure private-token".to_vec();
+    let process = Ok(process);
+    let output = Err(NodeRunnerError::Cancelled);
+    let diagnostic =
+        cleanup_failure_diagnostic(&output, &process, None, &["private-token".to_owned()])
+            .assert_value();
+    assert!(diagnostic.contains("buffered native failure [REDACTED]"));
+    assert!(!diagnostic.contains("private-token"));
+    assert!(matches!(
+        resolve_process_completion(output, process, true),
+        Err(NodeRunnerError::CleanupUnconfirmed)
+    ));
 }

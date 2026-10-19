@@ -15,6 +15,7 @@ import {
   X,
 } from 'lucide-react';
 import { InspectorPanel } from './InspectorPanel';
+import { RunFailureDetails } from './RunFailureDetails';
 import {
   useRunView,
   historyViewCursor,
@@ -47,6 +48,7 @@ import {
   type HistoryPage,
   type Invocation,
   type RunDetail,
+  type RunTerminal,
 } from './run-history';
 import { canFollowHistory, observationEnded } from './history-contract';
 import { readHistoryWhenReady } from './history-readiness';
@@ -78,6 +80,7 @@ export function RunHistoryView({
 }: RunHistoryViewProps) {
   const { saved: savedView, canvas, setCanvas } = useRunView(viewKey);
   const [playing, setPlaying] = useState(false);
+  const failureView = useFailurePresentation(savedView);
   const [playbackNode, setPlaybackNode] = useState<string>();
   const [selected, setSelected] = useState(''),
     [inspector, setInspector] = useState(false),
@@ -85,6 +88,27 @@ export function RunHistoryView({
   const [readingExecution, setReadingExecution] = useState('');
   const [positions, setPositions] = useState<Positions>({}),
     [focus, setFocus] = useState<{ name: string; tick: number }>();
+  const history = useHistoryFeed(runId, source, {
+    restore: savedView,
+    onLoad: () => {
+      setPlaying(false);
+      setPlaybackNode(undefined);
+    },
+    onReset: () => {
+      failureView.reset();
+      setCanvas(savedView.canvas);
+      setInspector(Boolean(savedView.inspector));
+      setExecution(savedView.execution ?? '');
+      setReadingExecution('');
+      setFocus(undefined);
+      setPositions({});
+    },
+    onOpen: (detail) => {
+      setSelected(restoredRunNode(detail.graph.root, savedView));
+      setInspector(failureView.open(detail));
+    },
+    onMissing: () => setPlaying(false),
+  });
   const {
     run,
     events,
@@ -104,28 +128,7 @@ export function RunHistoryView({
     isLiveRun,
     follow,
     loadHistory,
-  } = useHistoryFeed(runId, source, {
-    restore: savedView,
-    onLoad: () => {
-      setPlaying(false);
-      setPlaybackNode(undefined);
-    },
-    onReset: () => {
-      setCanvas(savedView.canvas);
-      setInspector(Boolean(savedView.inspector));
-      setExecution(savedView.execution ?? '');
-      setReadingExecution('');
-      setFocus(undefined);
-      setPositions({});
-    },
-    onOpen: (detail) => {
-      setSelected(restoredRunNode(detail.graph.root, savedView));
-      setInspector(
-        savedView.inspector ?? (detail.phase === 'admitted' || !!environmentFailure(detail))
-      );
-    },
-    onMissing: () => setPlaying(false),
-  });
+  } = history;
   useRunViewPersistence(viewKey, run, loading, {
     selected,
     inspector,
@@ -178,6 +181,7 @@ export function RunHistoryView({
     // Each step owns its checkpoint until the timer fires; incoming live logs cannot postpone it.
   }, [playing, cursorIndex, playbackNode]);
   function scrub(next: number) {
+    failureView.replay();
     setPlaying(false);
     follow(false);
     setExecution('');
@@ -185,6 +189,7 @@ export function RunHistoryView({
     setCursorIndex(moments[Math.max(0, Math.min(moments.length - 1, next))].index);
   }
   function goLatest() {
+    failureView.latest();
     setPlaying(false);
     setPlaybackNode(undefined);
     setExecution('');
@@ -204,6 +209,7 @@ export function RunHistoryView({
   }
   function playNode(restart = false) {
     if (!selectedReplay.length) return;
+    failureView.replay();
     follow(false);
     if (!restart && playing && playbackNode === selected) {
       setPlaying(false);
@@ -218,10 +224,26 @@ export function RunHistoryView({
     setPlaybackNode(selected);
     setPlaying(nextReplayPosition(start, moments.length, selectedReplay) !== undefined);
   }
+  function inspectDiagnostic(cursor: string) {
+    const target = failureView.diagnostic(cursor, events, projection);
+    if (!target || !document) return;
+    setPlaying(false);
+    follow(false);
+    setReadingExecution('');
+    setSelected(target.invocation?.node ?? document.graph.root.name);
+    setExecution(target.invocation?.id ?? '');
+    setInspector(true);
+    setCursorIndex(target.index);
+  }
   function reveal(name: string) {
     inspect(name);
     setFocus({ name, tick: Date.now() });
   }
+  const { terminal: displayedTerminal, currentFailure } = failureView.presentation(
+    history,
+    moment.index,
+    projection?.terminal
+  );
   const node = document && findNode(document.graph.root, selected);
   const names = node && descendantNames(node);
   const nodeInvocations =
@@ -240,39 +262,16 @@ export function RunHistoryView({
   const nodeControls = projection?.controls.filter((visit) => visit.node === node?.name) ?? [];
   const showExecutions =
     node && (['step', 'verifier'].includes(node.kind) || node.name === document?.graph.root.name);
-  const preparing = isPreparingEnvironment(run, events);
-  const currentState =
-    projection?.terminal?.status ??
-    (loadedHead && run?.runtimeFailure
-      ? 'failed'
-      : loadedHead && preparing
-        ? 'Preparing environment'
-        : safePosition === 0
-          ? 'Before run'
-          : loadedHead && run?.phase === 'finished'
-            ? 'Recorded history'
-            : 'In progress');
-  const shownStatus = safePosition === moments.length - 1 && loadedHead ? currentState : 'Replay';
-
   return (
     <main className="workspace history-workspace">
       {run && document && projection ? (
         <>
-          <div className="workspace-header history-header">
-            <div className="profile-title">
-              <h1 title={run.title}>{run.title}</h1>
-              <span
-                className={`run-status state-${projection.terminal?.status ?? (shownStatus === 'failed' ? 'failed' : 'replay')}`}
-              >
-                {run.example ? 'Simulated' : humanize(shownStatus)}
-              </span>
-            </div>
-          </div>
-          <RunHistoryAlerts
+          <RunHistoryHeader
             run={run}
-            error={error}
-            loading={loading}
-            preparing={preparing}
+            terminal={displayedTerminal}
+            history={history}
+            position={safePosition}
+            momentsCount={moments.length}
             openLog={() => inspect(document.graph.root.name)}
             retry={() => void loadHistory(run.runId, source, false)}
           />
@@ -298,6 +297,8 @@ export function RunHistoryView({
                 run={run}
                 document={document}
                 projection={projection}
+                terminal={displayedTerminal}
+                currentFailure={currentFailure}
                 node={node}
                 moment={moment}
                 nodeControls={nodeControls}
@@ -323,6 +324,8 @@ export function RunHistoryView({
                 play={() => playNode()}
                 restart={() => playNode(true)}
                 reveal={reveal}
+                inspectDiagnostic={inspectDiagnostic}
+                hasLog={(cursor) => events.some((entry) => entry.cursor === cursor)}
                 readingTranscript={readingTranscript}
               />
             )}
@@ -344,6 +347,7 @@ export function RunHistoryView({
             goLatest={goLatest}
             scrub={scrub}
             togglePlay={() => {
+              failureView.replay();
               follow(false);
               if (safePosition === moments.length - 1) setCursorIndex(-1);
               setPlaybackNode(undefined);
@@ -366,6 +370,133 @@ export function RunHistoryView({
       )}
     </main>
   );
+}
+
+type HistoryFeed = ReturnType<typeof useHistoryFeed>;
+function useFailurePresentation(saved: Partial<RunViewState>) {
+  const [viewingLatest, setViewingLatest] = useState(true);
+  return {
+    reset() {
+      setViewingLatest(!saved.cursor || saved.following === true);
+    },
+    open(detail: RunDetail) {
+      setViewingLatest(!saved.cursor || saved.following === true || saved.cursor === detail.cursor);
+      return (
+        saved.inspector ??
+        (detail.phase === 'admitted' ||
+          !!environmentFailure(detail) ||
+          (detail.terminal?.status === 'failed' && !!detail.terminal.context) ||
+          !!detail.runtimeFailure?.context)
+      );
+    },
+    replay() {
+      setViewingLatest(false);
+    },
+    latest() {
+      setViewingLatest(true);
+    },
+    presentation(history: HistoryFeed, index: number, observed: RunTerminal | undefined) {
+      const atHead = index === history.events.length - 1;
+      const failure = history.run?.runtimeFailure;
+      const terminal =
+        observed ??
+        (history.loadedHead && atHead && failure
+          ? { status: 'failed' as const, reason: failure.reason, context: failure.context }
+          : undefined);
+      return {
+        terminal,
+        currentFailure: terminal
+          ? undefined
+          : latestUnavailableFailure(history, atHead, viewingLatest),
+      };
+    },
+    diagnostic(
+      cursor: string,
+      events: HistoryEvent[],
+      projection: ReturnType<typeof projectHistory> | undefined
+    ) {
+      const index = events.findIndex((event) => event.cursor === cursor);
+      if (index < 0) return;
+      setViewingLatest(false);
+      const event = events[index].event;
+      const reference = event.reference ?? event.completion?.reference;
+      const execution = event.execution ?? reference?.execution;
+      const invocation = projection?.invocations.find((item) => item.id === String(execution));
+      return { index, invocation };
+    },
+  };
+}
+
+function latestUnavailableFailure(history: HistoryFeed, atHead: boolean, viewingLatest: boolean) {
+  if (!viewingLatest || history.restorePending || !atHead) return;
+  if (history.loadedHead || history.loading || !history.error) return;
+  return unavailableFailure(history.run);
+}
+
+function currentHistoryState(
+  run: RunDetail,
+  terminal: RunTerminal | undefined,
+  preparing: boolean,
+  atStart: boolean
+) {
+  if (terminal) return terminal.status;
+  if (run.runtimeFailure) return 'failed';
+  if (preparing) return 'Preparing environment';
+  if (atStart) return 'Before run';
+  return run.phase === 'finished' ? 'Recorded history' : 'In progress';
+}
+
+function RunHistoryHeader({
+  run,
+  terminal,
+  history,
+  position,
+  momentsCount,
+  openLog,
+  retry,
+}: {
+  run: RunDetail;
+  terminal: RunTerminal | undefined;
+  history: HistoryFeed;
+  position: number;
+  momentsCount: number;
+  openLog: () => void;
+  retry: () => void;
+}) {
+  const preparing = isPreparingEnvironment(run, history.events);
+  const shownStatus =
+    history.loadedHead && position === momentsCount - 1
+      ? currentHistoryState(run, terminal, preparing, position === 0)
+      : 'Replay';
+  return (
+    <>
+      <div className="workspace-header history-header">
+        <div className="profile-title">
+          <h1 title={run.title}>{run.title}</h1>
+          <span
+            className={`run-status state-${terminal?.status ?? (shownStatus === 'failed' ? 'failed' : 'replay')}`}
+          >
+            {run.example ? 'Simulated' : humanize(shownStatus)}
+          </span>
+        </div>
+      </div>
+      <RunHistoryAlerts
+        run={run}
+        error={history.error}
+        loading={history.loading}
+        preparing={preparing}
+        openLog={openLog}
+        retry={retry}
+      />
+    </>
+  );
+}
+
+function unavailableFailure(run: RunDetail | undefined) {
+  if (!['incomplete', 'expired', 'unavailable'].includes(run?.observation?.state ?? '')) return;
+  if (run?.terminal?.status === 'failed') return run.terminal;
+  const failure = run?.runtimeFailure;
+  return failure && { status: 'failed' as const, reason: failure.reason, context: failure.context };
 }
 
 function isPreparingEnvironment(run: RunDetail | undefined, events: HistoryEvent[]): boolean {
@@ -944,7 +1075,7 @@ function RunTimeline({
           className="icon-button"
           title="Go to latest"
           aria-label="Go to latest"
-          disabled={safePosition === moments.length - 1 && (!isLiveRun || following)}
+          disabled={safePosition === moments.length - 1 && loadedHead && (!isLiveRun || following)}
           onClick={goLatest}
         >
           <ChevronsRight size={18} />
@@ -976,6 +1107,8 @@ type RunInspectorProps = {
   run: RunDetail;
   document: Document;
   projection: ReturnType<typeof projectHistory>;
+  terminal?: RunTerminal;
+  currentFailure?: Extract<RunTerminal, { status: 'failed' }>;
   node: GraphNode;
   moment: ReturnType<typeof historyMoments>[number];
   nodeControls: ReturnType<typeof projectHistory>['controls'];
@@ -993,6 +1126,8 @@ type RunInspectorProps = {
   play: () => void;
   restart: () => void;
   reveal: (name: string) => void;
+  inspectDiagnostic: (cursor: string) => void;
+  hasLog: (cursor: string) => boolean;
   readingTranscript: (reading: boolean) => void;
 };
 
@@ -1000,6 +1135,8 @@ function RunInspector({
   run,
   document,
   projection,
+  terminal,
+  currentFailure,
   node,
   moment,
   nodeControls,
@@ -1017,6 +1154,8 @@ function RunInspector({
   play,
   restart,
   reveal,
+  inspectDiagnostic,
+  hasLog,
   readingTranscript,
 }: RunInspectorProps) {
   return (
@@ -1056,15 +1195,34 @@ function RunInspector({
               <dt>At cursor</dt>
               <dd className="mono">{moment.cursor}</dd>
             </dl>
-            {projection.terminal && (
+            {currentFailure && (
+              <section aria-label="Current run status">
+                <h3>Current run status</h3>
+                <p className="history-muted">
+                  The run failed. This status is separate from the available recorded playback.
+                </p>
+                <ValueSection title="Failure reason" value={currentFailure.reason} open />
+                {currentFailure.context && (
+                  <RunFailureDetails
+                    context={currentFailure.context}
+                    openLog={inspectDiagnostic}
+                    hasLog={hasLog}
+                  />
+                )}
+              </section>
+            )}
+            {terminal && (
               <ValueSection
-                title={projection.terminal.status === 'succeeded' ? 'Run output' : 'Failure reason'}
-                value={
-                  projection.terminal.status === 'succeeded'
-                    ? projection.terminal.output
-                    : projection.terminal.reason
-                }
+                title={terminal.status === 'succeeded' ? 'Run output' : 'Failure reason'}
+                value={terminal.status === 'succeeded' ? terminal.output : terminal.reason}
                 open
+              />
+            )}
+            {terminal?.status === 'failed' && terminal.context && (
+              <RunFailureDetails
+                context={terminal.context}
+                openLog={inspectDiagnostic}
+                hasLog={hasLog}
               />
             )}
             <ValueSection title="Run inputs" value={run.initialInput} />

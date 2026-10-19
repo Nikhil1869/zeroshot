@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
+use openengine_cluster_protocol::FailureDiagnosticKind;
 
 use crate::execution::{SessionScope, WorkspaceAccessMode};
 use crate::execution::process::{
@@ -362,9 +363,18 @@ pub(crate) fn process_failure_context(
     if output.cancelled || externally_cancelled {
         return Err(NodeRunnerError::Cancelled);
     }
+    Ok(process_failure_evidence(output, provider_output_failed))
+}
+
+/// Captured process facts remain useful when cleanup fails, even after cancellation.
+/// This only formats evidence; callers still own cancellation and cleanup classification.
+pub(crate) fn process_failure_evidence(
+    output: &ProcessSessionOutput,
+    provider_output_failed: bool,
+) -> Option<ProviderProcessFailure> {
     let mut failures = process_failure_reasons(output);
     if failures.is_empty() && !provider_output_failed {
-        return Ok(None);
+        return None;
     }
     let kind = if failures.is_empty() {
         ProviderProcessFailureKind::Stderr
@@ -376,10 +386,10 @@ pub(crate) fn process_failure_context(
         &output.stderr_tail,
         output.stderr_tail_truncated,
     );
-    Ok((!failures.is_empty()).then(|| ProviderProcessFailure {
+    (!failures.is_empty()).then(|| ProviderProcessFailure {
         kind,
         detail: failures.join("; "),
-    }))
+    })
 }
 
 fn process_failure_reasons(output: &ProcessSessionOutput) -> Vec<String> {
@@ -512,9 +522,17 @@ impl ProviderFailureRetry {
     pub(crate) async fn report_correction(
         &self,
         control: &DriverControl,
-        error: &NodeRunnerError,
+        response: &crate::native_v2_runner::AgentResponse,
+        terminal: bool,
     ) -> Result<(), NodeRunnerError> {
-        report_provider_error(self.provider, error, &self.redactions, control).await
+        if let Some(error) = response.correction_error()
+            && let Some(mut output) =
+                provider_error_output(self.provider, &error, &self.redactions)?
+        {
+            output.diagnostic = terminal.then_some(FailureDiagnosticKind::Failure);
+            control.emit(output).await?;
+        }
+        Ok(())
     }
 }
 
@@ -525,15 +543,39 @@ pub(crate) async fn report_provider_error(
     redactions: &[String],
     control: &DriverControl,
 ) -> Result<(), NodeRunnerError> {
+    if let Some(output) = provider_error_output(provider, error, redactions)? {
+        control.emit(output).await?;
+    }
+    Ok(())
+}
+
+/// Cleanup failure must settle even if its durable consumer has stopped reading.
+pub(crate) async fn report_cleanup_failure(control: &DriverControl, diagnostic: String) {
+    let publication = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        control.emit(LiveOutput::diagnostic(
+            FailureDiagnosticKind::Failure,
+            diagnostic,
+        )),
+    )
+    .await;
+    if !matches!(publication, Ok(Ok(()))) {
+        control.mark_diagnostics_incomplete();
+    }
+}
+
+pub(crate) fn provider_error_output(
+    provider: &str,
+    error: &NodeRunnerError,
+    redactions: &[String],
+) -> Result<Option<LiveOutput>, NodeRunnerError> {
     let detail = match error {
         NodeRunnerError::Driver => None,
         NodeRunnerError::DriverDetail(detail) => Some(detail.as_str()),
-        _ => return Ok(()),
+        _ => return Ok(None),
     };
     let diagnostic = provider_failure_diagnostic(provider, detail, None, redactions);
-    control
-        .emit(LiveOutput::new(LiveOutputStream::Error, diagnostic)?)
-        .await
+    LiveOutput::new(LiveOutputStream::Error, diagnostic).map(Some)
 }
 
 pub(crate) fn redaction_values<'a>(values: impl Iterator<Item = &'a str>) -> Vec<String> {
