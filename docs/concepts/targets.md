@@ -21,6 +21,20 @@ Existing inactive state folders do not impose a separate admission rule. Disjoin
 run concurrently. Aliases share one lease; a folder and its subtree cannot run at the same time. Reusing a submission key for
 another folder returns a conflict rather than a run from the first folder.
 
+### Workspace snapshot disk usage
+
+Native workspace snapshots recursively copy workspace entries and do not filter them using
+`.gitignore`. This includes ignored or generated directories such as `target/` and `node_modules/`.
+
+Zeroshot attempts filesystem-level cloning or reflinks where supported. When these are unavailable,
+capturing a workspace may temporarily require disk space for another full copy, bringing total usage
+to roughly twice the workspace size while both copies exist. Concurrent runs can increase peak disk
+usage and fail with `no space left on device`.
+
+When disk space is limited, consider cleaning unnecessary build artifacts or keeping large generated
+directories outside the workspace where practical. Be especially mindful of disk usage before running
+multiple jobs concurrently against a large workspace.
+
 Local execution is the only mode that mutates the caller's existing folder; each selected
 installed harness runs as the current user. A plan with
 [per-node lanes](../reference/runtime-plan.md#per-node-lanes) needs every lane's CLI installed. The
