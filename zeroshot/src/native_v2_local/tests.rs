@@ -970,7 +970,7 @@ fn fresh_local_branch_without_upstream_can_resolve_to_missing_remote_branch() {
     let source = resolved_git_source(&repo.workspace, Path::new("git"), None).assert_value();
 
     // Source resolution selects the local branch name; the preflight must reject
-// it because the remote does not contain that branch.
+    // it because the remote does not contain that branch.
     assert_eq!(source.branch.as_str(), "my-change");
 }
 
@@ -981,29 +981,29 @@ async fn remote_base_validation_distinguishes_missing_branch_from_remote_failure
     let invoking_directory = std::env::current_dir().assert_value();
     let state_root = repo.root.path();
 
-    validate_remote_base_ref(
+    validate_remote_base_ref(RemoteBaseRefRequest {
         remote,
-        "main",
-        &repo.workspace,
-        &invoking_directory,
-        Path::new("git"),
+        branch: "main",
+        workspace: &repo.workspace,
+        invoking_directory: &invoking_directory,
+        git_program: Path::new("git"),
         state_root,
-        None,
-        None,
-    )
+        github_token: None,
+        git_credentials: None,
+    })
     .await
     .assert_value();
 
-    let missing = validate_remote_base_ref(
+    let missing = validate_remote_base_ref(RemoteBaseRefRequest {
         remote,
-        "my-change",
-        &repo.workspace,
-        &invoking_directory,
-        Path::new("git"),
+        branch: "my-change",
+        workspace: &repo.workspace,
+        invoking_directory: &invoking_directory,
+        git_program: Path::new("git"),
         state_root,
-        None,
-        None,
-    )
+        github_token: None,
+        git_credentials: None,
+    })
     .await
     .expect_err("a missing remote target branch should be rejected");
 
@@ -1015,16 +1015,16 @@ async fn remote_base_validation_distinguishes_missing_branch_from_remote_failure
 
     let unreachable = repo.root.child("does-not-exist.git");
 
-    let failed = validate_remote_base_ref(
-        unreachable.to_str().assert_value(),
-        "main",
-        &repo.workspace,
-        &invoking_directory,
-        Path::new("git"),
+    let failed = validate_remote_base_ref(RemoteBaseRefRequest {
+        remote: unreachable.to_str().assert_value(),
+        branch: "main",
+        workspace: &repo.workspace,
+        invoking_directory: &invoking_directory,
+        git_program: Path::new("git"),
         state_root,
-        None,
-        None,
-    )
+        github_token: None,
+        git_credentials: None,
+    })
     .await
     .expect_err("a remote failure must not be reported as a missing branch");
 
@@ -1033,6 +1033,27 @@ async fn remote_base_validation_distinguishes_missing_branch_from_remote_failure
         LocalCompositionError::RemoteBaseCheck { ref branch }
             if branch == "main"
     ));
+}
+#[test]
+fn preflight_token_file_is_read_and_fails_closed_when_unavailable() {
+    let repo = crate::native_v2_candidate::test_support::TestGitRepository::delivery();
+    let token_path = repo.root.child("github-token");
+
+    std::fs::write(&token_path, "test-token").assert_value();
+
+    let token_file =
+        crate::native_v2_delivery::TrustedGitHubTokenFile::new(token_path.clone(), &repo.workspace)
+            .assert_value();
+
+    let token = read_preflight_token_file(None, Some(&token_file)).assert_value();
+    assert_eq!(token.as_deref(), Some("test-token"));
+
+    std::fs::remove_file(&token_path).assert_value();
+
+    let error = read_preflight_token_file(None, Some(&token_file))
+        .expect_err("an unavailable trusted token file must fail closed");
+
+    assert!(matches!(error, LocalCompositionError::GitHubTokenFile));
 }
 #[test]
 fn local_git_source_keeps_long_transport_identity_stable_without_losing_locator() {

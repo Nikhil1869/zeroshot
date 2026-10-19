@@ -203,9 +203,11 @@ impl LocalCliBackend {
             .validate_intent(&request.intent, DeliveryPolicy::Optional)
             .await
             .map_err(NativeV2CliError::InvalidRun)?;
+
         let prepared = self.prepare_run(request).await?;
         let digest = submission_digest(&prepared.submission).map_err(local_error)?;
         let _submission_lock = self.acquire_submission_lock().await?;
+
         if let Some(run_id) = self
             .existing_submission(
                 &prepared.submission.submission_key,
@@ -216,9 +218,28 @@ impl LocalCliBackend {
         {
             return Ok(run_id);
         }
+
+        if crate::native_v2_admission::delivery_capabilities(&prepared.submission.graph.root)
+            .contains(&crate::source_code_provider::SourceCapability::PullRequest)
+        {
+            crate::native_v2_local::validate_remote_base_branch(
+                crate::native_v2_local::RemoteBaseBranchRequest {
+                    source: prepared.submission.source.as_ref(),
+                    workspace: &prepared.workspace,
+                    invoking_directory: &self.current_directory,
+                    git_program: &self.git_program,
+                    state_root: &self.state_root,
+                    github_token: prepared.github_token.as_deref(),
+                    github_token_file: prepared.github_token_file.as_ref(),
+                    git_credentials: prepared.git_credentials.as_ref(),
+                },
+            )
+            .await
+            .map_err(|error| NativeV2CliError::Usage(error.to_string()))?;
+        }
+
         self.start_prepared_controller(prepared).await
     }
-
     async fn prepare_run(
         &self,
         mut request: PreparedRunRequest,
@@ -239,21 +260,7 @@ impl LocalCliBackend {
             RunEnvironment::exact_for_submission(&submission, request.connections.clone())?
                 .resolve_git_source()
                 .await?;
-        if crate::native_v2_admission::delivery_capabilities(&request.intent.graph.root)
-            .contains(&crate::source_code_provider::SourceCapability::PullRequest)
-        {
-            crate::native_v2_local::validate_remote_base_branch(
-                source.as_ref(),
-                &workspace,
-                &self.current_directory,
-                &self.git_program,
-                &self.state_root,
-                request.github_token.as_deref(),
-                request.git_credentials.as_ref(),
-            )
-            .await
-            .map_err(|error| NativeV2CliError::Usage(error.to_string()))?;
-        }
+
         request.cwd = Some(workspace);
         request.source = source.map(|resolved| super::NamedRunSource {
             resolved,
