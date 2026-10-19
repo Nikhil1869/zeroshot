@@ -20,11 +20,13 @@ use crate::native_v2_candidate::{
     NativeV2HarnessConfig, TrustedDeliveryCapabilities,
     build_local_native_v2_candidate_with_authority, build_local_owner_native_v2_candidate,
 };
-use crate::native_v2_claude::{ClaudeAdapterConfig, ClaudeAdapterConfigError, ClaudeProcessEnvironment};
+use crate::native_v2_claude::{ClaudeAdapterConfig, ClaudeAdapterConfigError};
 use crate::native_v2_cli::PreparedRunRequest;
 use crate::native_v2_codex::{NativeV2CodexConfig, NativeV2CodexUser};
 use crate::native_v2_contract::AdmittedRun;
+use crate::native_v2_capsule::HarnessProcessEnvironment;
 use crate::native_v2_copilot::{CopilotConfig, CopilotLocalUser};
+use crate::native_v2_pi::{PiAdapterConfigError, PiConfig};
 use crate::native_v2_capsule::provider_process::{COPILOT_LOCAL_ENVIRONMENT, LocalHarnessEnvironment};
 use crate::native_v2_delivery::{NativeV2DeliveryConfig, TrustedGitHubTokenFile};
 use crate::native_v2_delivery::validation::TrustedDeliveryValidator;
@@ -46,6 +48,8 @@ use workspace::resolve_workspace;
 
 #[derive(Debug, Error)]
 pub enum LocalCompositionError {
+    #[error(transparent)]
+    ProcessEnvironment(#[from] crate::native_v2_capsule::ProcessEnvironmentError),
     #[error("current working folder could not be resolved")]
     Workspace,
     #[error(
@@ -85,8 +89,12 @@ pub enum LocalCompositionError {
         lane: RuntimeLane,
         executable: &'static str,
     },
+    #[error("Git delivery needs the `{executable}` executable on PATH")]
+    MissingDeliveryExecutable { executable: &'static str },
     #[error(transparent)]
     Claude(#[from] ClaudeAdapterConfigError),
+    #[error(transparent)]
+    Pi(#[from] PiAdapterConfigError),
     #[error(transparent)]
     Candidate(#[from] NativeV2CandidateError),
 }
@@ -213,25 +221,70 @@ pub(crate) fn capture_local_native_environment(
     let mut environment = LocalHarnessEnvironment::new(
         crate::native_v2_capsule::provider_process::current_process_environment(),
     );
+    resolve_relative_home_overrides(&mut environment, invoking_directory)?;
+    Ok(environment.into_values())
+}
+
+/// Resolves every harness home override that the invoking shell may have set relatively against
+/// the invoking directory, before the controller detaches. The variable is forwarded to the
+/// harness child, whose working directory differs, so leaving it relative would change what it
+/// points at.
+fn resolve_relative_home_overrides(
+    environment: &mut LocalHarnessEnvironment,
+    invoking_directory: &Path,
+) -> Result<(), LocalCompositionError> {
+    let user_home = current_user_home(environment);
     for name in [
         "CODEX_HOME",
         "CLAUDE_CONFIG_DIR",
         "COPILOT_HOME",
         "COPILOT_PROVIDERS_CONFIG",
+        "PI_CODING_AGENT_DIR",
     ] {
         let Some(value) = environment.get_mut(name) else {
             continue;
         };
-        let path = PathBuf::from(&*value);
-        if path.is_relative() {
-            *value = invoking_directory
-                .join(path)
-                .into_os_string()
-                .into_string()
-                .map_err(|_| LocalCompositionError::NativeEnvironment)?;
+        // Pi owns file-URL decoding, including platform rules and percent escapes.
+        if name == "PI_CODING_AGENT_DIR" && value.starts_with("file://") {
+            continue;
         }
+        let path = if name == "PI_CODING_AGENT_DIR" {
+            pi_agent_directory_path(value, user_home.as_deref())?
+        } else {
+            PathBuf::from(&*value)
+        };
+        let path = if path.is_relative() {
+            invoking_directory.join(path)
+        } else {
+            path
+        };
+        *value = path
+            .into_os_string()
+            .into_string()
+            .map_err(|_| LocalCompositionError::NativeEnvironment)?;
     }
-    Ok(environment.into_values())
+    Ok(())
+}
+
+/// Pi expands a leading home shorthand before resolving its agent directory. Resolve it against
+/// the captured user's home before detachment instead of treating the tilde as a workspace name.
+fn pi_agent_directory_path(
+    value: &str,
+    user_home: Option<&Path>,
+) -> Result<PathBuf, LocalCompositionError> {
+    let relative = if value == "~" {
+        Some("")
+    } else {
+        value
+            .strip_prefix("~/")
+            .or_else(|| value.strip_prefix("~\\").filter(|_| cfg!(windows)))
+    };
+    match relative {
+        Some(relative) => Ok(user_home
+            .ok_or(LocalCompositionError::NativeEnvironment)?
+            .join(relative)),
+        None => Ok(PathBuf::from(value)),
+    }
 }
 
 pub(crate) fn local_resolved_source(
@@ -327,11 +380,17 @@ fn build_local_candidate_config(
             .ok_or(LocalCompositionError::DeliverySourceRequired)?;
         let target = crate::native_v2_delivery::source_target(source, mode)
             .map_err(|_| LocalCompositionError::ResolvedSource)?;
+        let programs = local_delivery_programs(
+            source,
+            &required_capabilities,
+            native_environment,
+            workspace,
+        )?;
         let authority = delivery_authority(SourceDeliveryFactoryRequest {
             source,
             workspace,
-            git_program: Path::new("git"),
-            gh_program: Path::new("gh"),
+            git_program: &programs.git,
+            gh_program: &programs.gh,
             home_directory: &runtime_home,
             private_directory: &runtime_home,
             git_identity: None,
@@ -346,7 +405,7 @@ fn build_local_candidate_config(
                 adopt_existing_delivery,
                 git_identity: None,
                 workspace: workspace.to_owned(),
-                git_program: PathBuf::from("git"),
+                git_program: programs.git,
                 target,
                 poll: Default::default(),
             },
@@ -465,7 +524,18 @@ fn local_lane(
             runtime_home: runtime_home.to_owned(),
             local_user_home: local_home.clone(),
             native_environment: native_environment.clone(),
-            base_environment: local_claude_environment(search_path, native_environment)?,
+            base_environment: local_process_environment(search_path, native_environment)?,
+            process_pool,
+        }),
+        RuntimeLane::Pi { provider } => NativeV2HarnessConfig::Pi(PiConfig {
+            provider,
+            executable: "pi".to_owned(),
+            prefix_arguments: Vec::new(),
+            workspace: workspace.to_owned(),
+            runtime_home: runtime_home.to_owned(),
+            local_user_home: local_home.clone(),
+            native_environment: native_environment.clone(),
+            base_environment: local_process_environment(search_path, native_environment)?,
             process_pool,
         }),
     };
@@ -487,23 +557,77 @@ pub(crate) fn search_path_depends_on_working_directory(
     std::env::split_paths(&search_path).any(|entry| entry.is_relative())
 }
 
+fn find_local_executable(
+    executable: &str,
+    native_environment: &BTreeMap<String, String>,
+    working_directory: &Path,
+) -> Option<PathBuf> {
+    let search_path = local_search_path(&LocalHarnessEnvironment::new(native_environment.clone()));
+    let lookup = BTreeMap::from([("PATH".to_owned(), search_path)]);
+    crate::execution::platform::find_executable(executable, &lookup, working_directory)
+}
+
 /// Checks that each lane's harness executable is on the search path its adapter spawns with.
 pub(crate) fn check_lane_executables(
     runtime: &RuntimePlan,
     native_environment: &BTreeMap<String, String>,
     working_directory: &Path,
 ) -> Result<(), LocalCompositionError> {
-    let search_path = local_search_path(&LocalHarnessEnvironment::new(native_environment.clone()));
-    let lookup = BTreeMap::from([("PATH".to_owned(), search_path)]);
     for lane in runtime.lanes() {
         let executable = lane.harness_name();
-        if crate::execution::platform::find_executable(executable, &lookup, working_directory)
-            .is_none()
-        {
+        if find_local_executable(executable, native_environment, working_directory).is_none() {
             return Err(LocalCompositionError::MissingLaneExecutable { lane, executable });
         }
     }
     Ok(())
+}
+
+struct LocalDeliveryPrograms {
+    git: PathBuf,
+    gh: PathBuf,
+}
+
+/// Pins delivery's programs to the files the captured search path finds. Delivery clears the
+/// environment of its Git and GitHub CLI processes, so a bare name would search only the system's
+/// default directories.
+fn local_delivery_programs(
+    source: &ResolvedSource,
+    required: &[crate::source_code_provider::SourceCapability],
+    native_environment: &BTreeMap<String, String>,
+    working_directory: &Path,
+) -> Result<LocalDeliveryPrograms, LocalCompositionError> {
+    let find = |executable| {
+        find_local_executable(executable, native_environment, working_directory)
+            .ok_or(LocalCompositionError::MissingDeliveryExecutable { executable })
+    };
+    // Other providers never start the GitHub CLI.
+    let gh = if crate::source_code_provider::adapters::core::delivery_uses_github_cli(
+        source, required,
+    ) {
+        find("gh")?
+    } else {
+        PathBuf::from("gh")
+    };
+    Ok(LocalDeliveryPrograms {
+        git: find("git")?,
+        gh,
+    })
+}
+
+/// Checks that the programs the submission's delivery runs are on the captured search path.
+pub(crate) fn check_delivery_executables(
+    submission: &RunSubmission,
+    native_environment: &BTreeMap<String, String>,
+    working_directory: &Path,
+) -> Result<(), LocalCompositionError> {
+    let required = crate::native_v2_admission::delivery_capabilities(&submission.graph.root);
+    match &submission.source {
+        Some(source) if !required.is_empty() => {
+            local_delivery_programs(source, &required, native_environment, working_directory)
+                .map(drop)
+        }
+        _ => Ok(()),
+    }
 }
 
 fn current_user_home(environment: &LocalHarnessEnvironment) -> Option<PathBuf> {
@@ -529,17 +653,17 @@ fn default_search_path(environment: &LocalHarnessEnvironment) -> String {
     }
 }
 
-fn local_claude_environment(
+fn local_process_environment(
     search_path: &str,
     native_environment: &LocalHarnessEnvironment,
-) -> Result<ClaudeProcessEnvironment, ClaudeAdapterConfigError> {
+) -> Result<HarnessProcessEnvironment, crate::native_v2_capsule::ProcessEnvironmentError> {
     let mut base_environment = BTreeMap::from([("PATH".to_owned(), search_path.to_owned())]);
     for name in ["LANG", "LC_ALL", "TERM", "TMPDIR"] {
         if let Some(value) = native_environment.get(name) {
             base_environment.insert(name.to_owned(), value.clone());
         }
     }
-    ClaudeProcessEnvironment::new(base_environment)
+    HarnessProcessEnvironment::new(base_environment)
 }
 
 fn prepare_private_directory(path: &Path) -> Result<(), LocalCompositionError> {

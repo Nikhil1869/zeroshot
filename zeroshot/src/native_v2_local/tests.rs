@@ -283,10 +283,32 @@ async fn local_harness_contract_materializes_each_native_lane_without_processes(
         NativeV2HarnessConfig::Claude(config) => {
             assert_eq!(config.workspace, workspace);
             assert_eq!(config.runtime_home, runtime_home);
-            assert_eq!(config.local_user_home, Some(home));
+            assert_eq!(config.local_user_home, Some(home.clone()));
             assert_eq!(config.executable, "claude");
         }
         _ => panic!("expected Claude harness"),
+    }
+    match single_lane(
+        local_lanes(
+            &admitted_for("pi", "anthropic").await,
+            &workspace,
+            &runtime_home,
+            &environment,
+        )
+        .assert_value(),
+    ) {
+        NativeV2HarnessConfig::Pi(config) => {
+            assert_eq!(
+                config.provider,
+                crate::native_v2_contract::PiProvider::Anthropic
+            );
+            assert_eq!(config.executable, "pi");
+            assert_eq!(config.workspace, workspace);
+            assert_eq!(config.runtime_home, runtime_home);
+            // A native-local lane reuses the invoking user's home so Pi finds `~/.pi/agent`.
+            assert_eq!(config.local_user_home, Some(home.clone()));
+        }
+        _ => panic!("expected Pi harness"),
     }
 }
 
@@ -532,6 +554,122 @@ fn an_empty_path_entry_finds_lane_executables_in_the_directory_the_harness_start
     check_lane_executables(&mixed_lane_plan(), &environment, &workspace).assert_value();
 }
 
+fn forge_source(url: &str, provider: &str) -> ResolvedSource {
+    serde_json::from_value(json!({
+        "repository": "open-engine/zeroshot",
+        "branch": "main",
+        "revision": "0123456789abcdef0123456789abcdef01234567",
+        "remote": {
+            "url": url,
+            "forge": { "provider": provider, "repository": "open-engine/zeroshot" }
+        }
+    }))
+    .assert_value()
+}
+
+fn github_source() -> ResolvedSource {
+    forge_source(
+        "https://github.com/open-engine/zeroshot.git",
+        "source.github",
+    )
+}
+
+fn delivery_submission(source: &ResolvedSource) -> RunSubmission {
+    serde_json::from_value(json!({
+        "title": "Local delivery programs",
+        "graph": full_graph(vec![
+            crate::native_v2_candidate::test_support::git_delivery_node(),
+            success_node(),
+        ]),
+        "initialInput": null,
+        "runtime": {
+            "harness": "codex",
+            "provider": "openai",
+            "size": "small",
+            "nodes": { "deliver": { "kind": "git_delivery" } }
+        },
+        "source": source,
+        "submissionKey": "local-delivery-programs"
+    }))
+    .assert_value()
+}
+
+#[cfg(unix)]
+#[test]
+fn delivery_pins_git_and_the_github_cli_that_the_captured_search_path_finds() {
+    let root = TestDirectory::new("delivery-programs-pinned");
+    let (bin, environment) = search_directory(&root);
+    install_executable(&bin, "git");
+    install_executable(&bin, "gh");
+
+    let required = crate::native_v2_delivery::DeliveryMode::PullRequest.required_capabilities();
+    let programs = local_delivery_programs(&github_source(), required, &environment, root.path())
+        .assert_value();
+    assert_eq!(programs.git, bin.join("git"));
+    assert_eq!(programs.gh, bin.join("gh"));
+}
+
+// Only Unix restricts lookup to the captured PATH; Windows retains native fallback searches.
+#[cfg(unix)]
+#[test]
+fn github_delivery_without_gh_or_git_on_the_captured_search_path_names_the_missing_program() {
+    let root = TestDirectory::new("delivery-programs-missing");
+    let (bin, environment) = search_directory(&root);
+    let submission = delivery_submission(&github_source());
+
+    install_executable(&bin, "git");
+    let error = check_delivery_executables(&submission, &environment, root.path()).assert_error();
+    assert!(matches!(
+        error,
+        LocalCompositionError::MissingDeliveryExecutable { executable: "gh" }
+    ));
+    assert_eq!(
+        error.to_string(),
+        "Git delivery needs the `gh` executable on PATH"
+    );
+
+    std::fs::remove_file(bin.join("git")).assert_value();
+    install_executable(&bin, "gh");
+    let error = check_delivery_executables(&submission, &environment, root.path()).assert_error();
+    assert_eq!(
+        error.to_string(),
+        "Git delivery needs the `git` executable on PATH"
+    );
+
+    install_executable(&bin, "git");
+    check_delivery_executables(&submission, &environment, root.path()).assert_value();
+}
+
+#[test]
+fn only_github_forge_delivery_needs_the_github_cli() {
+    use crate::native_v2_delivery::DeliveryMode;
+    use crate::source_code_provider::adapters::contributed::registration_tests::{
+        HTTPS_REMOTE, PROVIDER,
+    };
+
+    let root = TestDirectory::new("delivery-programs-forge");
+    let (bin, environment) = search_directory(&root);
+    install_executable(&bin, "git");
+
+    for (source, required) in [
+        (github_source(), DeliveryMode::Push.required_capabilities()),
+        (
+            forge_source(HTTPS_REMOTE, PROVIDER),
+            DeliveryMode::Merge.required_capabilities(),
+        ),
+    ] {
+        let programs =
+            local_delivery_programs(&source, required, &environment, root.path()).assert_value();
+        assert_eq!(programs.gh, Path::new("gh"));
+    }
+
+    let without_delivery = RunSubmission {
+        graph: full_graph(vec![success_node()]),
+        ..delivery_submission(&github_source())
+    };
+    check_delivery_executables(&without_delivery, &BTreeMap::new(), root.path()).assert_value();
+}
+
 #[test]
 fn parses_canonical_github_remote_forms() {
     for remote in [
@@ -574,6 +712,110 @@ fn local_preparation_rejects_target_hooks_before_resolving_source_or_installing_
             Err(LocalCompositionError::PreparationRequiresTarget)
         ));
     }
+}
+
+#[test]
+fn relative_harness_home_overrides_resolve_against_the_invoking_directory() {
+    let invoking = Path::new("/invoking/dir");
+    let mut environment = LocalHarnessEnvironment::new(BTreeMap::from([
+        ("CODEX_HOME".to_owned(), "codex".to_owned()),
+        ("CLAUDE_CONFIG_DIR".to_owned(), "claude".to_owned()),
+        ("COPILOT_HOME".to_owned(), "copilot".to_owned()),
+        (
+            "COPILOT_PROVIDERS_CONFIG".to_owned(),
+            "providers.json".to_owned(),
+        ),
+        ("PI_CODING_AGENT_DIR".to_owned(), "pi".to_owned()),
+        ("PATH".to_owned(), "/usr/bin".to_owned()),
+    ]));
+    resolve_relative_home_overrides(&mut environment, invoking).assert_value();
+
+    for (name, relative) in [
+        ("CODEX_HOME", "codex"),
+        ("CLAUDE_CONFIG_DIR", "claude"),
+        ("COPILOT_HOME", "copilot"),
+        ("COPILOT_PROVIDERS_CONFIG", "providers.json"),
+        ("PI_CODING_AGENT_DIR", "pi"),
+    ] {
+        let expected = invoking.join(relative);
+        assert_eq!(
+            environment.get(name).map(String::as_str),
+            expected.to_str(),
+            "{name} must resolve against the invoking directory"
+        );
+    }
+    // An unrelated name, and an already-absolute override, are left untouched.
+    assert_eq!(
+        environment.get("PATH").map(String::as_str),
+        Some("/usr/bin")
+    );
+
+    let mut absolute = LocalHarnessEnvironment::new(BTreeMap::from([(
+        "PI_CODING_AGENT_DIR".to_owned(),
+        "/absolute/pi".to_owned(),
+    )]));
+    resolve_relative_home_overrides(&mut absolute, invoking).assert_value();
+    assert_eq!(
+        absolute.get("PI_CODING_AGENT_DIR").map(String::as_str),
+        Some("/absolute/pi")
+    );
+}
+
+#[test]
+fn pi_agent_home_shorthand_uses_the_captured_user_home() {
+    let invoking = Path::new("/invoking/dir");
+    let home = if cfg!(windows) {
+        Path::new(r"C:\Users\captured")
+    } else {
+        Path::new("/captured/home")
+    };
+    for (authored, relative) in [("~", ""), ("~/.pi/custom", ".pi/custom")] {
+        let mut environment = LocalHarnessEnvironment::new(BTreeMap::from([
+            ("HOME".to_owned(), home.to_string_lossy().into_owned()),
+            (
+                "USERPROFILE".to_owned(),
+                home.to_string_lossy().into_owned(),
+            ),
+            ("PI_CODING_AGENT_DIR".to_owned(), authored.to_owned()),
+        ]));
+        resolve_relative_home_overrides(&mut environment, invoking).assert_value();
+        assert_eq!(
+            environment.get("PI_CODING_AGENT_DIR").map(PathBuf::from),
+            Some(home.join(relative)),
+            "{authored} must keep Pi's native home expansion"
+        );
+    }
+    assert_eq!(
+        pi_agent_directory_path("~otheruser/.pi", Some(home)).assert_value(),
+        PathBuf::from("~otheruser/.pi")
+    );
+    let backslash = pi_agent_directory_path(r"~\.pi\custom", Some(home)).assert_value();
+    assert_eq!(
+        backslash,
+        if cfg!(windows) {
+            home.join(r".pi\custom")
+        } else {
+            PathBuf::from(r"~\.pi\custom")
+        }
+    );
+}
+
+#[test]
+fn pi_agent_directory_file_urls_keep_their_native_encoding() {
+    let authored = if cfg!(windows) {
+        "file:///C:/Users/captured/.pi/custom%20agent%23test"
+    } else {
+        "file:///captured/home/.pi/custom%20agent%23test"
+    };
+    let mut environment = LocalHarnessEnvironment::new(BTreeMap::from([(
+        "PI_CODING_AGENT_DIR".to_owned(),
+        authored.to_owned(),
+    )]));
+    resolve_relative_home_overrides(&mut environment, Path::new("/invoking/dir")).assert_value();
+    assert_eq!(
+        environment.get("PI_CODING_AGENT_DIR").map(String::as_str),
+        Some(authored)
+    );
 }
 
 #[test]
