@@ -82,7 +82,10 @@ Checkpoints restore files and graph progress, not running services or agent conv
 
 Put shared executables in `$ZEROSHOT_TOOLS/bin` and project dependencies in the workspace.
 
-Before starting or parallelizing runs, consider the workspace's disk usage. Workspace snapshots recursively copy entries without applying `.gitignore`, so `target/`, `node_modules/`, and other large generated directories are included. Filesystem cloning or reflinks can reduce additional disk usage where supported; otherwise, a capture may need roughly another workspace's worth of free space. Warn users with limited disk space, and recommend cleaning bulky build artifacts or keeping them outside the workspace where practical.
+Snapshots include ignored directories such as `target/` and `node_modules/`. Without cloning or
+reflinks, allow space for another full workspace copy during staging, plus checkpoint storage.
+Before large or parallel runs on tight disks, warn users and suggest cleaning build artifacts or
+keeping generated directories outside the workspace where practical.
 
 Shell exports do not persist between hooks or agents; use `variables` for nonsecret values and
 `connections` for required secret field names. Hook connections and node connections are separate.
