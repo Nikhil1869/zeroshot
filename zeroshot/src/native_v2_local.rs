@@ -42,6 +42,7 @@ const MAX_GIT_OUTPUT_BYTES: usize = 16 * 1024;
 
 mod source;
 use source::resolved_git_source;
+pub(crate) use source::validate_remote_base_branch;
 mod workspace;
 pub(crate) use workspace::validate_workspace_state;
 use workspace::resolve_workspace;
@@ -72,6 +73,8 @@ pub enum LocalCompositionError {
         "could not verify target branch `{branch}` on the remote; check remote connectivity and credentials"
     )]
     RemoteBaseCheck { branch: String },
+    #[error("Git delivery credentials are invalid")]
+    DeliveryCredentials,
     #[error("current Git resolved source is invalid")]
     ResolvedSource,
     #[error("local run identity could not be assigned")]
@@ -337,124 +340,6 @@ fn git_output(
     }
     let value = String::from_utf8(output.stdout).map_err(|_| LocalCompositionError::Workspace)?;
     Ok(value.trim_end_matches(['\r', '\n']).to_owned())
-}
-
-/// Confirms that a PR/merge target branch exists on the selected remote before starting agents.
-/// The supervised Git transport distinguishes an absent ref from a failed remote observation.
-pub(crate) struct RemoteBaseBranchRequest<'a> {
-    pub source: Option<&'a openengine_cluster_protocol::ResolvedSource>,
-    pub workspace: &'a Path,
-    pub invoking_directory: &'a Path,
-    pub git_program: &'a Path,
-    pub state_root: &'a Path,
-    pub github_token: Option<&'a str>,
-    pub github_token_file: Option<&'a crate::native_v2_delivery::TrustedGitHubTokenFile>,
-    pub git_credentials: Option<&'a openengine_cluster_protocol::GitTransportCredentials>,
-}
-
-struct RemoteBaseRefRequest<'a> {
-    remote: &'a str,
-    branch: &'a str,
-    workspace: &'a Path,
-    invoking_directory: &'a Path,
-    git_program: &'a Path,
-    state_root: &'a Path,
-    github_token: Option<&'a str>,
-    git_credentials: Option<&'a openengine_cluster_protocol::GitTransportCredentials>,
-}
-fn read_preflight_token_file(
-    explicit_token: Option<&str>,
-    token_file: Option<&crate::native_v2_delivery::TrustedGitHubTokenFile>,
-) -> Result<Option<String>, LocalCompositionError> {
-    if explicit_token.is_some() {
-        return Ok(None);
-    }
-
-    token_file
-        .map(|file| {
-            file.read()
-                .map_err(|_| LocalCompositionError::GitHubTokenFile)
-        })
-        .transpose()
-}
-pub(crate) async fn validate_remote_base_branch(
-    request: RemoteBaseBranchRequest<'_>,
-) -> Result<(), LocalCompositionError> {
-    let source = request
-        .source
-        .ok_or(LocalCompositionError::DeliverySourceRequired)?;
-
-    let remote = crate::source_code_provider::adapters::core::source_remote(source);
-
-    // Read a token through the trusted abstraction when no explicit token exists.
-    let token_from_file =
-        read_preflight_token_file(request.github_token, request.github_token_file)?;
-
-    let github_token = request.github_token.or(token_from_file.as_deref());
-
-    validate_remote_base_ref(RemoteBaseRefRequest {
-        remote: &remote,
-        branch: source.branch.as_str(),
-        workspace: request.workspace,
-        invoking_directory: request.invoking_directory,
-        git_program: request.git_program,
-        state_root: request.state_root,
-        github_token,
-        git_credentials: request.git_credentials,
-    })
-    .await
-}
-
-async fn validate_remote_base_ref(
-    request: RemoteBaseRefRequest<'_>,
-) -> Result<(), LocalCompositionError> {
-    let RemoteBaseRefRequest {
-        remote,
-        branch,
-        workspace,
-        invoking_directory,
-        git_program,
-        state_root,
-        github_token,
-        git_credentials,
-    } = request;
-
-    let native_environment = capture_local_native_environment(invoking_directory)?;
-    let harness_environment = LocalHarnessEnvironment::new(native_environment.clone());
-
-    let home_directory =
-        current_user_home(&harness_environment).ok_or(LocalCompositionError::NativeEnvironment)?;
-
-    let private_directory = state_root.join("git-preflight");
-    prepare_private_directory(&private_directory)?;
-
-    let transport = crate::native_v2_delivery::transport::GitTransport::new(
-        crate::native_v2_delivery::transport::GitTransportConfig {
-            git_program: git_program.to_owned(),
-            workspace: workspace.to_owned(),
-            home_directory,
-            private_directory,
-            identity: None,
-            local_environment: Some(native_environment),
-            deadline: std::time::Duration::from_secs(10 * 60),
-        },
-        remote,
-    );
-
-    let credential = crate::native_v2_delivery::transport::source_credential(
-        github_token.unwrap_or(""),
-        git_credentials,
-    );
-
-    match transport.read_ref(branch, credential).await {
-        Ok(Some(_)) => Ok(()),
-        Ok(None) => Err(LocalCompositionError::MissingRemoteBase {
-            branch: branch.to_owned(),
-        }),
-        Err(_) => Err(LocalCompositionError::RemoteBaseCheck {
-            branch: branch.to_owned(),
-        }),
-    }
 }
 
 /// Builds a local-user process candidate rooted in the existing workspace.

@@ -207,59 +207,40 @@ impl LocalCliBackend {
         let prepared = self.prepare_run(request).await?;
         let digest = submission_digest(&prepared.submission).map_err(local_error)?;
 
-        // First check: return an already-accepted submission without network access.
-        {
-            let _submission_lock = self.acquire_submission_lock().await?;
-
-            if let Some(run_id) = self
-                .existing_submission(
-                    &prepared.submission.submission_key,
-                    &digest,
-                    &prepared.workspace,
-                )
-                .await?
-            {
-                return Ok(run_id);
-            }
-        } // Release the shared submission lock before remote I/O.
-
-        // Validate the remote target only for PR/merge delivery.
+        let existing = || {
+            self.existing_submission(
+                &prepared.submission.submission_key,
+                &digest,
+                &prepared.workspace,
+            )
+        };
         if crate::native_v2_admission::delivery_capabilities(&prepared.submission.graph.root)
             .contains(&crate::source_code_provider::SourceCapability::PullRequest)
         {
+            {
+                let _submission_lock = self.acquire_submission_lock().await?;
+                if let Some(run_id) = existing().await? {
+                    return Ok(run_id);
+                }
+            }
+            // Remote I/O must not hold the shared submission lock.
             crate::native_v2_local::validate_remote_base_branch(
-                crate::native_v2_local::RemoteBaseBranchRequest {
-                    source: prepared.submission.source.as_ref(),
-                    workspace: &prepared.workspace,
-                    invoking_directory: &self.current_directory,
-                    git_program: &self.git_program,
-                    state_root: &self.state_root,
-                    github_token: prepared.github_token.as_deref(),
-                    github_token_file: prepared.github_token_file.as_ref(),
-                    git_credentials: prepared.git_credentials.as_ref(),
-                },
+                &prepared,
+                &self.git_program,
+                &self.state_root,
             )
             .await
             .map_err(|error| NativeV2CliError::Usage(error.to_string()))?;
         }
 
-        // Reacquire the lock and check again: another process may have submitted
-        // the same request while remote validation was running.
+        // A concurrent submitter may have accepted this request during remote validation.
         let _submission_lock = self.acquire_submission_lock().await?;
-
-        if let Some(run_id) = self
-            .existing_submission(
-                &prepared.submission.submission_key,
-                &digest,
-                &prepared.workspace,
-            )
-            .await?
-        {
+        if let Some(run_id) = existing().await? {
             return Ok(run_id);
         }
-
         self.start_prepared_controller(prepared).await
     }
+
     async fn prepare_run(
         &self,
         mut request: PreparedRunRequest,

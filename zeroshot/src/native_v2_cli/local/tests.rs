@@ -18,6 +18,10 @@ use crate::native_v2_local::PreparedLocalRun;
 use crate::native_v2_supervisor::RunEnvironment;
 use crate::v2_run_ledger::CreateRun;
 
+#[cfg(unix)]
+#[path = "preflight_tests.rs"]
+mod preflight_tests;
+
 fn contract_backend(root: &Path) -> LocalCliBackend {
     LocalCliBackend::new(
         root.to_owned(),
