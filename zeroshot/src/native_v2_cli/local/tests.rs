@@ -917,8 +917,14 @@ async fn slow_remote_preflight_does_not_block_unrelated_submission() {
     .await;
     if reached_remote_check.is_err() {
         std::fs::write(&release_remote_check, b"release").assert_value();
-        let _ = tokio::time::timeout(Duration::from_secs(5), slow_submission).await;
-        panic!("PR submission never reached the blocked remote-ref check");
+
+        let slow_result_after_release =
+            tokio::time::timeout(Duration::from_secs(5), slow_submission).await;
+
+        panic!(
+            "PR submission never reached the blocked remote-ref check; \
+            result after releasing fixture: {slow_result_after_release:?}"
+        );
     }
 
     let unrelated_backend = LocalCliBackend::new(
