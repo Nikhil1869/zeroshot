@@ -165,7 +165,8 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
 - New local PR/merge submissions verify the remote target branch before controller startup,
   after checking for an existing submission. Remote I/O stays outside the shared submission lock;
   admission rechecks idempotency before launch. Preflight reuses the prepared native snapshot and
-  delivery binding's resolved credentials. Shared delivery credential helpers preserve declared
+  delivery binding's resolved credentials; native Git starts in the selected workspace so relative
+  search paths resolve consistently. Shared delivery credential helpers preserve declared
   GitHub token precedence and source-only Git authority; forge API tokens remain provider-owned.
 - Git checkout and push use credential-free HTTPS or SSH locators independently of a forge.
   The target image includes OpenSSH and a fixed root-owned libnss_wrapper for pinned SSH

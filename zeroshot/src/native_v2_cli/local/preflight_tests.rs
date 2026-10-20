@@ -346,3 +346,23 @@ async fn push_only_submission_does_not_check_for_a_remote_base() {
     );
     assert!(fixture.observations().is_empty());
 }
+
+#[tokio::test]
+async fn preflight_resolves_relative_search_paths_against_the_selected_workspace() {
+    let fixture = Fixture::new(MAIN_REF);
+    let mut prepared = fixture
+        .backend
+        .prepare_run(fixture.request(DeliveryMode::PullRequest))
+        .await
+        .assert_value();
+    let tools = prepared.workspace.join("preflight-tools");
+    std::fs::create_dir(&tools).assert_value();
+    std::os::unix::fs::symlink(&fixture.backend.git_program, tools.join("git")).assert_value();
+    prepared
+        .native_environment
+        .insert("PATH".to_owned(), "preflight-tools".to_owned());
+    validate_remote_base_branch(&prepared, Path::new("git"), &fixture.backend.state_root)
+        .await
+        .assert_value();
+    assert_eq!(fixture.observations(), ["refs/heads/main"]);
+}
