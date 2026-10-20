@@ -958,7 +958,7 @@ async fn slow_remote_preflight_does_not_block_unrelated_submission() {
         "unrelated submission did not progress to controller startup while remote validation was blocked: {unrelated_result:?}"
     );
     assert!(
-        matches!(slow_result, Err(NativeV2CliError::Usage(message)) if message.contains("remote does not have target branch `main`")),
+        matches!(slow_result, Err(NativeV2CliError::Usage(ref message)) if message.contains("remote does not have target branch `main`")),
         "the blocked remote fixture should report a missing target branch: {slow_result:?}"
     );
 }
