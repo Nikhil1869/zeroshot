@@ -1039,7 +1039,16 @@ fn preflight_token_file_is_read_and_fails_closed_when_unavailable() {
     let repo = crate::native_v2_candidate::test_support::TestGitRepository::delivery();
     let token_path = repo.root.child("github-token");
 
-    std::fs::write(&token_path, "test-token").assert_value();
+    use std::io::Write as _;
+
+    let mut token_output = crate::execution::platform::private_file(
+        &token_path,
+        crate::execution::platform::FileAccess::CreateNew,
+    )
+    .assert_value();
+
+    token_output.write_all(b"test-token").assert_value();
+    drop(token_output);
 
     let token_file =
         crate::native_v2_delivery::TrustedGitHubTokenFile::new(token_path.clone(), &repo.workspace)

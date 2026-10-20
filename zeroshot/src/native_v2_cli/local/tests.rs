@@ -865,6 +865,105 @@ async fn assert_local_start_deduplicates_before_controller_launch() {
 }
 
 #[cfg(unix)]
+#[tokio::test]
+async fn slow_remote_preflight_does_not_block_unrelated_submission() {
+    let root = TestDirectory::new("local-slow-remote-preflight");
+    let remote_workspace = root.child("remote-workspace");
+    let unrelated_workspace = root.child("unrelated-workspace");
+    std::fs::create_dir(&remote_workspace).assert_value();
+    std::fs::create_dir(&unrelated_workspace).assert_value();
+    initialize_local_repository(&remote_workspace);
+    initialize_local_repository(&unrelated_workspace);
+
+    let state = root.child("shared-state");
+    std::fs::create_dir(&state).assert_value();
+    let git_program = root.child("blocking-git");
+    let remote_check_started = root.child("remote-check-started");
+    let release_remote_check = root.child("release-remote-check");
+    openengine_cluster_testkit::fixture::write_executable(
+        &git_program,
+        format!(
+            "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = \"ls-remote\" ]; then\n    : > '{}'\n    while [ ! -e '{}' ]; do sleep 0.01; done\n    exit 0\n  fi\ndone\nexec /usr/bin/git \"$@\"\n",
+            remote_check_started.display(),
+            release_remote_check.display(),
+        ),
+        0o700,
+    )
+    .assert_value();
+
+    let slow_backend = LocalCliBackend::new(
+        state.clone(),
+        PathBuf::from("/bin/true"),
+        remote_workspace,
+        git_program,
+    )
+    .with_ready_timeout(Duration::from_millis(50));
+    let mut slow_request = prepared_request(
+        RunId::new("0199f33f-3b44-7d21-9000-0000000000b1"),
+        "slow-remote-preflight",
+    );
+    slow_request.intent.graph = full_graph(vec![
+        crate::native_v2_candidate::test_support::git_delivery_node(),
+        success_node(),
+    ]);
+
+    let slow_submission =
+        tokio::spawn(async move { slow_backend.start_controller(slow_request).await });
+    let reached_remote_check = tokio::time::timeout(Duration::from_secs(5), async {
+        while !remote_check_started.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    if reached_remote_check.is_err() {
+        std::fs::write(&release_remote_check, b"release").assert_value();
+        let _ = tokio::time::timeout(Duration::from_secs(5), slow_submission).await;
+        panic!("PR submission never reached the blocked remote-ref check");
+    }
+
+    let unrelated_backend = LocalCliBackend::new(
+        state,
+        PathBuf::from("/bin/true"),
+        unrelated_workspace,
+        PathBuf::from("git"),
+    )
+    .with_ready_timeout(Duration::from_millis(50));
+    let unrelated_request = prepared_request(
+        RunId::new("0199f33f-3b44-7d21-9000-0000000000b2"),
+        "unrelated-submission",
+    );
+    let unrelated_result = tokio::time::timeout(
+        Duration::from_secs(2),
+        unrelated_backend.start_controller(unrelated_request),
+    )
+    .await;
+    let remote_check_was_still_blocked = remote_check_started.exists()
+        && !release_remote_check.exists()
+        && !slow_submission.is_finished();
+
+    // Always unblock the child before asserting, so a failed regression test cannot leave it
+    // waiting on a fixture file until its ten-minute Git transport deadline.
+    std::fs::write(&release_remote_check, b"release").assert_value();
+    let slow_result = tokio::time::timeout(Duration::from_secs(5), slow_submission)
+        .await
+        .assert_value()
+        .assert_value();
+
+    assert!(
+        remote_check_was_still_blocked,
+        "the slow remote check unexpectedly finished before the unrelated submission"
+    );
+    assert!(
+        matches!(unrelated_result, Ok(Err(NativeV2CliError::Local(_)))),
+        "unrelated submission did not progress to controller startup while remote validation was blocked: {unrelated_result:?}"
+    );
+    assert!(
+        matches!(slow_result, Err(NativeV2CliError::Usage(message)) if message.contains("remote does not have target branch `main`")),
+        "the blocked remote fixture should report a missing target branch: {slow_result:?}"
+    );
+}
+
+#[cfg(unix)]
 async fn assert_successor_claim_and_submission_lock_edges(
     backend: &LocalCliBackend,
     root: &TestDirectory,

@@ -206,19 +206,24 @@ impl LocalCliBackend {
 
         let prepared = self.prepare_run(request).await?;
         let digest = submission_digest(&prepared.submission).map_err(local_error)?;
-        let _submission_lock = self.acquire_submission_lock().await?;
 
-        if let Some(run_id) = self
-            .existing_submission(
-                &prepared.submission.submission_key,
-                &digest,
-                &prepared.workspace,
-            )
-            .await?
+        // First check: return an already-accepted submission without network access.
         {
-            return Ok(run_id);
-        }
+            let _submission_lock = self.acquire_submission_lock().await?;
 
+            if let Some(run_id) = self
+                .existing_submission(
+                    &prepared.submission.submission_key,
+                    &digest,
+                    &prepared.workspace,
+                )
+                .await?
+            {
+                return Ok(run_id);
+            }
+        } // Release the shared submission lock before remote I/O.
+
+        // Validate the remote target only for PR/merge delivery.
         if crate::native_v2_admission::delivery_capabilities(&prepared.submission.graph.root)
             .contains(&crate::source_code_provider::SourceCapability::PullRequest)
         {
@@ -236,6 +241,21 @@ impl LocalCliBackend {
             )
             .await
             .map_err(|error| NativeV2CliError::Usage(error.to_string()))?;
+        }
+
+        // Reacquire the lock and check again: another process may have submitted
+        // the same request while remote validation was running.
+        let _submission_lock = self.acquire_submission_lock().await?;
+
+        if let Some(run_id) = self
+            .existing_submission(
+                &prepared.submission.submission_key,
+                &digest,
+                &prepared.workspace,
+            )
+            .await?
+        {
+            return Ok(run_id);
         }
 
         self.start_prepared_controller(prepared).await
