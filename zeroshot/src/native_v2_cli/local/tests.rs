@@ -169,12 +169,16 @@ fn initialize_local_repository(root: &Path) {
         assert!(status.success(), "git {arguments:?} failed");
     }
 
-    git(root, &["init", "--quiet", "--initial-branch=main"]);
+    git(root, &["init", "--quiet"]);
     git(root, &["config", "user.name", "Zeroshot Test"]);
     git(root, &["config", "user.email", "zeroshot@example.invalid"]);
+
     std::fs::write(root.join("README.md"), "fixture\n").assert_value();
+
     git(root, &["add", "README.md"]);
     git(root, &["commit", "--quiet", "-m", "fixture"]);
+    git(root, &["branch", "-M", "main"]);
+
     git(
         root,
         &[
@@ -185,7 +189,6 @@ fn initialize_local_repository(root: &Path) {
         ],
     );
 }
-
 #[test]
 fn local_storage_contract_validates_paths_and_private_artifacts() {
     let root = TestDirectory::new("lsc");
