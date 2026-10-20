@@ -906,6 +906,13 @@ async fn slow_remote_preflight_does_not_block_unrelated_submission() {
         crate::native_v2_candidate::test_support::git_delivery_node(),
         success_node(),
     ]);
+    slow_request.intent.runtime.nodes_mut().insert(
+        NodeName::new("deliver").assert_value(),
+        crate::native_v2_contract::NodeRuntimeBinding::GitDelivery {
+            connections: Default::default(),
+            pull_request_feedback: Default::default(),
+        },
+    );
 
     let slow_submission =
         tokio::spawn(async move { slow_backend.start_controller(slow_request).await });
