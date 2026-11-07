@@ -35,12 +35,14 @@ pub struct RunFailure {
     omitted: usize,
     complete: bool,
     context: Option<(EnumLabel, Box<FailureContext>)>,
+    reason: Option<EnumLabel>,
 }
 
 /// Writes the ordinary watch output while retaining its terminal failure context.
 pub(super) struct FailureOutput<'a, W> {
     output: &'a mut W,
     pub(super) context: Option<(EnumLabel, Box<FailureContext>)>,
+    pub(super) reason: Option<EnumLabel>,
 }
 
 impl<'a, W> FailureOutput<'a, W> {
@@ -48,24 +50,24 @@ impl<'a, W> FailureOutput<'a, W> {
         Self {
             output,
             context: None,
+            reason: None,
         }
     }
 
     pub(super) fn observe(&mut self, status: &CliRunStatus) {
         if let CliRunStatus::Target(RunStatus::Finished {
-            terminal_result:
-                TerminalResult::Failed {
-                    reason,
-                    context: Some(context),
-                },
+            terminal_result: TerminalResult::Failed { reason, context },
             ..
         }) = status
         {
-            self.context = Some((reason.clone(), context.clone()));
+            self.reason = Some(reason.clone());
+
+            if let Some(context) = context {
+                self.context = Some((reason.clone(), context.clone()));
+            }
         }
     }
 }
-
 impl<W: std::io::Write> DurableOutput for FailureOutput<'_, W> {
     fn watch_event(&mut self, event: CliRunWatchEventNotification) -> Result<(), NativeV2CliError> {
         self.observe(&event.status);
@@ -87,6 +89,7 @@ impl RunFailure {
             run_id,
             target: target.map(str::to_owned),
             complete: !context.1.incomplete,
+            reason: Some(context.0.clone()),
             context: Some(context),
             errors: VecDeque::new(),
             omitted: 0,
@@ -101,6 +104,7 @@ impl RunFailure {
             errors: VecDeque::new(),
             omitted: 0,
             complete: false,
+            reason: None,
             context: None,
         }
     }
@@ -115,14 +119,30 @@ impl RunFailure {
         B: NativeV2CliBackend,
         D: Future<Output = ()> + ?Sized,
     {
+        Self::read_with_reason(backend, target, run_id, None, detach).await
+    }
+
+    pub(super) async fn read_with_reason<B, D>(
+        backend: &B,
+        target: Option<&str>,
+        run_id: RunId,
+        reason: Option<EnumLabel>,
+        detach: Pin<&mut D>,
+    ) -> Self
+    where
+        B: NativeV2CliBackend,
+        D: Future<Output = ()> + ?Sized,
+    {
         let mut failure = Self {
             run_id: run_id.clone(),
             target: target.map(str::to_owned),
             errors: VecDeque::new(),
             omitted: 0,
             complete: false,
+            reason,
             context: None,
         };
+
         let follow = DurableFollow {
             backend,
             target,
@@ -131,13 +151,14 @@ impl RunFailure {
             initial_cursor: None,
             execution: None,
         };
+
         let read = follow_durable_with_detach(follow, detach, &mut failure);
         let read = tokio::time::timeout(ERROR_LOG_DEADLINE, read).await;
         failure.complete = matches!(read, Ok(Ok(CliOutcome::Completed)));
+
         failure
     }
 }
-
 impl DurableOutput for RunFailure {
     fn watch_event(
         &mut self,
@@ -161,12 +182,17 @@ impl DurableOutput for RunFailure {
 impl fmt::Display for RunFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("run finished unsuccessfully")?;
-        if let Some((reason, context)) = &self.context {
+
+        if let Some(reason) = &self.reason {
             write!(formatter, ": {}", reason.as_str())?;
+        }
+
+        if let Some((_, context)) = &self.context {
             if let Some(primary) = &context.primary {
                 formatter.write_str("\nFailure:")?;
                 write_diagnostic(formatter, primary)?;
             }
+
             if !context.recorded.is_empty() {
                 formatter.write_str("\nRecorded failures:")?;
                 for diagnostic in &context.recorded {
@@ -175,16 +201,19 @@ impl fmt::Display for RunFailure {
             }
         } else if !self.errors.is_empty() {
             let shown = self.errors.len();
+
             if self.omitted == 0 {
                 formatter.write_str("\nError logs:")?;
             } else {
                 let total = shown + self.omitted;
                 write!(formatter, "\nLatest {shown} of {total} error logs:")?;
             }
+
             for error in &self.errors {
                 write!(formatter, "\n  {}", error.as_str())?;
             }
         }
+
         if !self.complete {
             formatter.write_str(if self.context.is_some() {
                 "\nAdditional failure details may be missing; see the full run log."
@@ -192,14 +221,17 @@ impl fmt::Display for RunFailure {
                 "\nThe run log could not be read completely."
             })?;
         }
+
         write!(
             formatter,
             "\nFull run log: zeroshot logs {}",
             self.run_id.as_str()
         )?;
+
         if let Some(target) = &self.target {
             write!(formatter, " --target {target}")?;
         }
+
         Ok(())
     }
 }

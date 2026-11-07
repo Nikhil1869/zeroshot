@@ -22,21 +22,60 @@ async fn foreground_run_reports_a_terminal_failure_after_printing_it() {
     let files = FixtureFiles::new(graph(), json!({"task":"fail"}));
     let command = parse_native_v2_args(run_args(&files.graph, &files.input, &files.runtime, &[]))
         .assert_value();
+
     let backend = FakeBackend::with_failed_watch();
     let mut output = Vec::new();
+
     let error = execute_native_v2_cli(command, &backend, &mut NeverDetach, &mut output)
         .await
         .assert_error();
+
     assert!(matches!(error, NativeV2CliError::RunFailed(_)));
+
     assert_eq!(
         error.to_string(),
         "run finished unsuccessfully\nFull run log: zeroshot logs run-public --target prod"
     );
+
     assert!(
         String::from_utf8(output)
             .assert_value()
             .contains("\"reason\":\"worker_failed\"")
     );
+}
+
+#[tokio::test]
+async fn watch_reports_a_terminal_failure_after_printing_it() {
+    let backend = FakeBackend::with_failed_watch_and_error_logs(7);
+    let command =
+        parse_native_v2_args(args(&["watch", "run-public", "--target", "prod"])).assert_value();
+    let mut output = Vec::new();
+
+    let error = execute_native_v2_cli(command, &backend, &mut NeverDetach, &mut output)
+        .await
+        .assert_error();
+
+    assert!(matches!(error, NativeV2CliError::RunFailed(_)));
+
+    assert_eq!(
+        error.to_string(),
+        "run finished unsuccessfully: worker_failed\nLatest 5 of 7 error logs:\n  error 3\n  error 4\n  error 5\n  error 6\n  error 7\nFull run log: zeroshot logs run-public --target prod"
+    );
+
+    let logs_cursors = backend
+        .calls()
+        .into_iter()
+        .filter_map(|call| match call {
+            Call::Logs { from_cursor, .. } => Some(from_cursor),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(logs_cursors, [None, Some("v2:8".to_owned())]);
+
+    let output = String::from_utf8(output).assert_value();
+    assert!(output.contains("\"reason\":\"worker_failed\""));
+    assert!(!output.contains("error 7"));
 }
 
 #[tokio::test]

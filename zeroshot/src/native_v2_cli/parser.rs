@@ -12,6 +12,10 @@ use delegations::DelegationCliCommand;
 ///
 /// Single-result commands write JSON. Foreground `run`, `watch`, `logs`, and `attach` stream
 /// newline-delimited JSON (NDJSON).
+///
+/// Exit status:
+/// Successful or detached `run` and `watch` commands exit with status 0.
+/// If the observed run finishes unsuccessfully, `run` and `watch` exit with status 1.
 #[derive(Debug, Parser)]
 #[command(
     name = "zeroshot",

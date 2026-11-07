@@ -340,20 +340,50 @@ where
 {
     match command {
         NativeV2CliCommand::Watch(RunWatchCommand { run, after }) => {
-            follow_durable(
+            let target = run.target.as_deref();
+            let run_id = run.run_id.clone();
+
+            let detach = signal.wait();
+            tokio::pin!(detach);
+
+            let mut observed = failure::FailureOutput::new(output);
+
+            let outcome = follow_durable_with_detach(
                 DurableFollow {
                     backend,
-                    target: run.target.as_deref(),
-                    run_id: run.run_id,
+                    target,
+                    run_id: run_id.clone(),
                     kind: DurableFollowKind::Watch,
                     initial_cursor: after,
                     execution: None,
                 },
-                signal,
-                output,
+                detach.as_mut(),
+                &mut observed,
             )
-            .await
+            .await?;
+
+            if outcome == CliOutcome::Failed {
+                let failure = if let Some(context) = observed.context {
+                    RunFailure::from_context(run_id, target, context)
+                } else if let Some(reason) = observed.reason {
+                    RunFailure::read_with_reason(
+                        backend,
+                        target,
+                        run_id,
+                        Some(reason),
+                        detach.as_mut(),
+                    )
+                    .await
+                } else {
+                    RunFailure::read(backend, target, run_id, detach.as_mut()).await
+                };
+
+                return Err(NativeV2CliError::RunFailed(Box::new(failure)));
+            }
+
+            Ok(outcome)
         }
+
         NativeV2CliCommand::Logs(RunLogsCommand {
             run,
             after,
@@ -373,6 +403,7 @@ where
             )
             .await
         }
+
         NativeV2CliCommand::Attach { run, execution } => {
             follow_attach(
                 backend,
@@ -388,12 +419,12 @@ where
             )
             .await
         }
+
         _ => Err(NativeV2CliError::Usage(
             "expected a subscription run operation".to_owned(),
         )),
     }
 }
-
 async fn execute_run<B, S, W>(
     run: RunCommand,
     context: &CliExecutionContext<'_, B>,
