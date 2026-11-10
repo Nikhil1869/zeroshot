@@ -14,16 +14,20 @@ use openengine_cluster_protocol::{
     RunCheckpointsResult, RunResumeFrom, ConnectionDeleteRequest, ConnectionDeleteResult,
     ConnectionKey, ConnectionListRequest, ConnectionListResult, ConnectionMutationResult,
     ConnectionScope, ConnectionSetRequest, Cursor, EnvironmentVariableName, ExecutionRef,
-    IdempotencyKey, MergePlan, MergePlanId, MergePlanRunRequest, MergePlanSource,
+    IdempotencyKey, Stack, StackDelivery, StackId, StackRunRequest, StackSource,
     RunAttachEventNotification, RunAttachParams, RunConnectionRequirements, RunConnectionValues,
     RunForceParams, RunId, RunListParams, RunLogEventNotification, RunLogsParams, RunProfile,
     RunProfileDefaultRequest, RunProfileDefaultResult, RunProfileDeleteResult,
     RunProfileListRequest, RunProfileListResult, RunProfileMutationResult, RunProfileName,
     RunProfileSelector, RunProfileSetRequest, RunStatusParams, RunTitle, RunWatchParams,
-    ResolvedSource, SourceBranchId, SourceRepositoryId, SourceRevisionId, SubscriptionCloseReason,
+    ResolvedSource, SourceBranchId, SourceForgeBaseUrl, SourceForgeProviderId, SourceRepositoryId,
+    SourceRevisionId, SubscriptionCloseReason,
 };
 use thiserror::Error;
 
+/// Process entry point for the product-owned native memory callback.
+#[doc(hidden)]
+pub use crate::active_memory::hooks::run_hook_helper as run_active_memory_hook;
 pub use crate::native_v2_contract::RunSubmissionIntent as TargetRunIntent;
 use crate::native_v2_admission::NativeV2AdmissionError;
 use crate::native_v2_supervisor::RunEnvironmentError;
@@ -55,8 +59,12 @@ pub use diagnostic::{ERROR_FORMAT_ENV, JSON_ERROR_FORMAT, NativeV2CliDiagnostic}
 #[path = "native_v2_cli/parser.rs"]
 mod parser;
 
+mod delegations;
 mod profiles;
+pub use delegations::{DelegationAction, DelegationCommand, DelegationResult};
 pub(crate) use profiles::LocalRunProfileStore;
+#[cfg(unix)]
+pub(crate) use profiles::secure_existing_profile_store;
 #[cfg(feature = "ui")]
 pub(crate) use profiles::{profile_revision, ProfileSaveConflict};
 
@@ -73,7 +81,7 @@ mod update;
 
 pub use execution::{
     RunFailure, execute_native_v2_cli, try_execute_native_v2_preflight,
-    try_execute_native_v2_static,
+    try_execute_native_v2_static, try_execute_native_v2_static_with_terminal,
 };
 pub use parser::{Cli, parse_native_v2_args};
 
@@ -103,7 +111,7 @@ pub struct TargetServe {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectionRoute {
     pub target: Option<String>,
-    pub scope: ConnectionScope,
+    pub scope: Option<ConnectionScope>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -124,16 +132,46 @@ pub struct RunCommand {
     pub target: Option<String>,
     pub cwd: Option<PathBuf>,
     pub source_connection: Option<ConnectionKey>,
+    pub source_forge: Option<RunSourceForge>,
     pub title: RunTitle,
     pub selection: RunSelection,
     pub environment: Option<RunEnvironmentInput>,
-    pub input: PathBuf,
+    pub input: RunInput,
     pub repository: Option<RunRepository>,
     pub branch: Option<SourceBranchId>,
     pub revision: Option<SourceRevisionId>,
     pub detach: bool,
     pub validate_only: bool,
     pub submission_key: Option<IdempotencyKey>,
+}
+
+/// Explicit instance selection for a credential-free Git remote.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RunSourceForge {
+    pub provider: SourceForgeProviderId,
+    pub base_url: SourceForgeBaseUrl,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RunInput {
+    File(PathBuf),
+    TaskFrom(String),
+}
+
+impl From<PathBuf> for RunInput {
+    fn from(path: PathBuf) -> Self {
+        Self::File(path)
+    }
+}
+impl From<&str> for RunInput {
+    fn from(path: &str) -> Self {
+        Self::File(path.into())
+    }
+}
+impl From<String> for RunInput {
+    fn from(path: String) -> Self {
+        Self::File(path.into())
+    }
 }
 
 /// An explicit CLI source locator, before assigning a bounded repository identity.
@@ -204,22 +242,23 @@ impl fmt::Debug for PreparedRunRequest {
     }
 }
 
-/// CLI-materialized hosted merge plan with an explicit unresolved source selector.
+/// CLI-materialized hosted stack with an explicit unresolved source selector.
 #[derive(Clone, PartialEq)]
-pub struct PreparedMergePlanRequest {
+pub struct PreparedStackRequest {
     pub submission_key: IdempotencyKey,
     pub title: RunTitle,
     pub expires_at: String,
-    pub source: MergePlanSource,
+    pub delivery: StackDelivery,
+    pub source: StackSource,
     pub profile: RunProfileSelector,
-    pub runs: Vec<MergePlanRunRequest>,
+    pub runs: Vec<StackRunRequest>,
     pub environment: Option<openengine_cluster_protocol::RuntimeEnvironment>,
     pub connections: RunConnectionValues,
     pub github_token: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MergePlanSubmitCommand {
+pub struct StackSubmitCommand {
     pub target: String,
     pub file: PathBuf,
     pub detach: bool,
@@ -227,9 +266,9 @@ pub struct MergePlanSubmitCommand {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MergePlanSelector {
+pub struct StackSelector {
     pub target: String,
-    pub plan_id: MergePlanId,
+    pub stack_id: StackId,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -282,6 +321,7 @@ pub struct RunLogsCommand {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NativeV2CliCommand {
+    Memory(MemoryCommand),
     Help(String),
     Version,
     Acp {
@@ -293,6 +333,7 @@ pub enum NativeV2CliCommand {
         name: String,
     },
     TargetServe(TargetServe),
+    Delegation(DelegationCommand),
     Ui {
         listen: SocketAddr,
         target: Option<String>,
@@ -321,14 +362,15 @@ pub enum NativeV2CliCommand {
     TemplateShow {
         template: BuiltinGraphTemplate,
         delivery: TemplateDelivery,
+        json: bool,
     },
-    PlanValidate {
+    StackValidate {
         file: PathBuf,
     },
-    PlanSubmit(MergePlanSubmitCommand),
-    PlanStatus(MergePlanSelector),
-    PlanWatch(MergePlanSelector),
-    PlanForceStop(MergePlanSelector),
+    StackSubmit(StackSubmitCommand),
+    StackStatus(StackSelector),
+    StackWatch(StackSelector),
+    StackForceStop(StackSelector),
     Run(Box<RunCommand>),
     List {
         target: Option<String>,
@@ -347,6 +389,13 @@ pub enum NativeV2CliCommand {
 }
 
 impl NativeV2CliCommand {
+    fn is_management_operation(&self) -> bool {
+        self.is_connection_operation()
+            || self.is_profile_operation()
+            || self.is_target_operation()
+            || matches!(self, Self::Delegation(_))
+    }
+
     fn product_info(&self) -> Option<&str> {
         match self {
             Self::Help(help) => Some(help),
@@ -355,10 +404,13 @@ impl NativeV2CliCommand {
         }
     }
 
-    fn is_plan_operation(&self) -> bool {
+    fn is_stack_operation(&self) -> bool {
         matches!(
             self,
-            Self::PlanSubmit(_) | Self::PlanStatus(_) | Self::PlanWatch(_) | Self::PlanForceStop(_)
+            Self::StackSubmit(_)
+                | Self::StackStatus(_)
+                | Self::StackWatch(_)
+                | Self::StackForceStop(_)
         )
     }
 
@@ -460,9 +512,9 @@ pub enum NativeV2CliError {
         message: String,
     },
     #[error("{0}")]
-    RunFailed(RunFailure),
-    #[error("merge plan finished unsuccessfully")]
-    MergePlanFailed,
+    RunFailed(Box<RunFailure>),
+    #[error("stack finished unsuccessfully")]
+    StackFailed,
     #[error("could not write CLI output: {0}")]
     Output(#[from] std::io::Error),
     #[error("could not encode CLI output: {0}")]
@@ -506,6 +558,42 @@ pub trait NativeV2CliBackend: Send + Sync {
     async fn target_add(&self, request: TargetAdd) -> Result<(), NativeV2CliError>;
     async fn target_login(&self, name: &str) -> Result<(), NativeV2CliError>;
 
+    /// A secret-free namespace separating retry snapshots by execution authority.
+    /// Backends without a stable identity leave snapshots uncached.
+    async fn review_cache_namespace(
+        &self,
+        target: Option<&str>,
+    ) -> Result<Option<String>, NativeV2CliError> {
+        Ok(target.is_none().then(|| "local".to_owned()))
+    }
+
+    async fn resolve_review(
+        &self,
+        _target: Option<&str>,
+        _request: crate::native_v2_review::ReviewResolutionRequest,
+        _runtime: &openengine_cluster_protocol::RuntimePlan,
+    ) -> Result<crate::native_v2_review::PreparedReview, NativeV2CliError> {
+        Err(NativeV2CliError::Target(
+            "target does not advertise task resolution".to_owned(),
+        ))
+    }
+
+    async fn default_resource_scope(
+        &self,
+        _target: Option<&str>,
+    ) -> Result<ConnectionScope, NativeV2CliError> {
+        Ok(ConnectionScope::User)
+    }
+
+    async fn delegation(
+        &self,
+        _command: DelegationCommand,
+    ) -> Result<DelegationResult, NativeV2CliError> {
+        Err(NativeV2CliError::Target(
+            "target does not advertise delegation management".to_owned(),
+        ))
+    }
+
     async fn connection_list(
         &self,
         _target: Option<&str>,
@@ -544,6 +632,15 @@ pub trait NativeV2CliBackend: Send + Sync {
         Err(NativeV2CliError::Target(
             "target does not advertise profile management".to_owned(),
         ))
+    }
+
+    /// CLI presentation may carry local diagnostics without extending target protocol responses.
+    async fn profile_list_with_problems(
+        &self,
+        target: Option<&str>,
+        request: RunProfileListRequest,
+    ) -> Result<CliProfileListResult, NativeV2CliError> {
+        self.profile_list(target, request).await.map(Into::into)
     }
 
     async fn profile_show(
@@ -586,33 +683,33 @@ pub trait NativeV2CliBackend: Send + Sync {
         ))
     }
 
-    async fn merge_plan_submit(
+    async fn stack_submit(
         &self,
         _target: &str,
-        _request: PreparedMergePlanRequest,
-    ) -> Result<MergePlan, NativeV2CliError> {
+        _request: PreparedStackRequest,
+    ) -> Result<Stack, NativeV2CliError> {
         Err(NativeV2CliError::Target(
-            "target does not advertise merge plans".to_owned(),
+            "target does not advertise stacks".to_owned(),
         ))
     }
 
-    async fn merge_plan_status(
+    async fn stack_status(
         &self,
         _target: &str,
-        _plan_id: MergePlanId,
-    ) -> Result<MergePlan, NativeV2CliError> {
+        _stack_id: StackId,
+    ) -> Result<Stack, NativeV2CliError> {
         Err(NativeV2CliError::Target(
-            "target does not advertise merge plans".to_owned(),
+            "target does not advertise stacks".to_owned(),
         ))
     }
 
-    async fn merge_plan_force(
+    async fn stack_force(
         &self,
         _target: &str,
-        _plan_id: MergePlanId,
-    ) -> Result<MergePlan, NativeV2CliError> {
+        _stack_id: StackId,
+    ) -> Result<Stack, NativeV2CliError> {
         Err(NativeV2CliError::Target(
-            "target does not advertise merge plans".to_owned(),
+            "target does not advertise stacks".to_owned(),
         ))
     }
 
@@ -651,6 +748,13 @@ pub trait NativeV2CliBackend: Send + Sync {
         target: Option<&str>,
         params: RunForceParams,
     ) -> Result<CliRunForceResult, NativeV2CliError>;
+    /// Reject unsupported recovery selections before reading caller credentials.
+    async fn validate_resume_selection(
+        &self,
+        _command: &RunResumeCommand,
+    ) -> Result<(), NativeV2CliError> {
+        Ok(())
+    }
     async fn authorize_resume_connection_requirements(
         &self,
         target: Option<&str>,
@@ -698,3 +802,6 @@ impl NativeV2CliError {
         matches!(self, Self::Disconnected | Self::TargetTransport { .. })
     }
 }
+
+mod memory;
+pub use memory::MemoryCommand;

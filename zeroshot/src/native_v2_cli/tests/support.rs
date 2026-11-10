@@ -3,8 +3,8 @@ use std::sync::{Arc, Mutex};
 
 use openengine_cluster_protocol::{
     ConnectionDeleteRequest, ConnectionDeleteResult, ConnectionListRequest, ConnectionListResult,
-    ConnectionMutationResult, ConnectionSetRequest, ConnectionSummary, MergePlan, MergePlanState,
-    NodeName, PositiveInteger, RunAttachEventNotification, RunAttachParams, RunCheckpoint,
+    ConnectionMutationResult, ConnectionSetRequest, ConnectionSummary, Stack, StackState, NodeName,
+    PositiveInteger, RunAttachEventNotification, RunAttachParams, RunCheckpoint,
     RunCheckpointsParams, RunCheckpointsResult, RunConnectionRequirements, RunConnectionValues,
     RunDiscardWorkspaceParams, RunDiscardWorkspaceResult, RunForceParams, RunId, RunListParams,
     RunLogEventNotification, RunLogsParams, RunProfile, RunProfileDefaultRequest,
@@ -31,8 +31,21 @@ use failure::{error_logs, runtime_failure_status, runtime_failure_watch};
 mod lifecycle;
 use lifecycle::{permanent_reopen_watch, queued_watch};
 
+pub(in crate::native_v2_cli) fn prepared_review_fixture() -> crate::native_v2_review::PreparedReview
+{
+    crate::native_v2_review::PreparedReview {
+        initial_input:json!({"url":"https://github.com/acme/project/issues/42","context":{"title":"Proposal","body":"Assess this","reviewScope":{}}}),
+        source:serde_json::from_value(json!({"repository":"acme/project","branch":"main","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"})).assert_value(),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(in crate::native_v2_cli) enum Call {
+    ResolveReview {
+        target: Option<String>,
+        request: crate::native_v2_review::ReviewResolutionRequest,
+        runtime: RuntimePlan,
+    },
     TargetAdd {
         name: String,
         url: String,
@@ -215,9 +228,16 @@ pub(in crate::native_v2_cli) struct FakeBackend {
     error_logs: usize,
     pending_logs: bool,
     queued_lifecycle: bool,
-    terminal_plan_state: Option<MergePlanState>,
+    terminal_stack_state: Option<StackState>,
+    stack_template_delivery: Option<TemplateDelivery>,
+    submitted_stacks: Arc<Mutex<Vec<PreparedStackRequest>>>,
     resume_requirements: Option<RunConnectionRequirements>,
+    resume_source: Option<Value>,
     trusted_resume_requirements: Option<RunConnectionRequirements>,
+    resource_scope: Option<openengine_cluster_protocol::ConnectionScope>,
+    unavailable_machine_identity: bool,
+    review: Option<crate::native_v2_review::PreparedReview>,
+    review_file_change: Option<(std::path::PathBuf, String)>,
 }
 
 #[derive(Clone, Copy)]
@@ -227,6 +247,35 @@ pub(super) enum CursorCallKind {
 }
 
 impl FakeBackend {
+    pub(crate) fn with_review(review: crate::native_v2_review::PreparedReview) -> Self {
+        Self {
+            review: Some(review),
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn with_review_file_change(
+        mut self,
+        path: std::path::PathBuf,
+        contents: String,
+    ) -> Self {
+        self.review_file_change = Some((path, contents));
+        self
+    }
+    pub(in crate::native_v2_cli) fn with_unavailable_machine_identity() -> Self {
+        Self {
+            unavailable_machine_identity: true,
+            ..Self::default()
+        }
+    }
+
+    pub(in crate::native_v2_cli) fn with_organization_owner() -> Self {
+        Self {
+            resource_scope: Some(openengine_cluster_protocol::ConnectionScope::Org),
+            ..Self::default()
+        }
+    }
+
     pub(super) fn with_failed_submit() -> Self {
         Self {
             failed_submit: true,
@@ -289,11 +338,22 @@ impl FakeBackend {
         }
     }
 
-    pub(super) fn with_terminal_plan_state(state: MergePlanState) -> Self {
+    pub(super) fn with_terminal_stack_state(state: StackState) -> Self {
         Self {
-            terminal_plan_state: Some(state),
+            terminal_stack_state: Some(state),
             ..Self::default()
         }
+    }
+
+    pub(super) fn with_stack_profile(state: StackState, delivery: TemplateDelivery) -> Self {
+        Self {
+            stack_template_delivery: Some(delivery),
+            ..Self::with_terminal_stack_state(state)
+        }
+    }
+
+    pub(super) fn submitted_stacks(&self) -> Vec<PreparedStackRequest> {
+        self.submitted_stacks.lock().assert_value().clone()
     }
 
     pub(super) fn with_resume_requirements(requirements: RunConnectionRequirements) -> Self {
@@ -302,6 +362,11 @@ impl FakeBackend {
             trusted_resume_requirements: Some(requirements),
             ..Self::default()
         }
+    }
+
+    pub(super) fn with_resume_source(mut self, source: Value) -> Self {
+        self.resume_source = Some(source);
+        self
     }
 
     pub(super) fn with_untrusted_resume_requirements(
@@ -354,16 +419,14 @@ impl FakeBackend {
         self.calls.lock().assert_value().clone()
     }
 
-    fn terminal_plan(&self) -> Result<MergePlan, NativeV2CliError> {
-        self.terminal_plan_state
-            .map(terminal_merge_plan)
-            .ok_or_else(|| {
-                NativeV2CliError::Target("target does not advertise merge plans".to_owned())
-            })
+    fn terminal_stack_result(&self) -> Result<Stack, NativeV2CliError> {
+        self.terminal_stack_state
+            .map(terminal_stack)
+            .ok_or_else(|| NativeV2CliError::Target("target does not advertise stacks".to_owned()))
     }
 }
 
-fn merge_plan_profile() -> RunProfile {
+fn stack_profile(delivery: TemplateDelivery) -> RunProfile {
     let runtime = serde_json::from_str(
         r#"{
             "harness":"codex","provider":"openai","size":"medium","nodes":{
@@ -376,11 +439,11 @@ fn merge_plan_profile() -> RunProfile {
     )
     .assert_value();
     RunProfile {
-        id: "profile-plan".to_owned(),
+        id: "profile-stack".to_owned(),
         name: RunProfileName::new("software-change").assert_value(),
         scope: RunProfileScope::Org,
         graph: BuiltinGraphTemplate::SoftwareChange
-            .materialize(TemplateDelivery::Merge)
+            .materialize(delivery)
             .assert_value(),
         runtime,
         is_default: false,
@@ -411,9 +474,9 @@ fn connection_summary(
     }
 }
 
-fn terminal_merge_plan(state: MergePlanState) -> MergePlan {
+fn terminal_stack(state: StackState) -> Stack {
     serde_json::from_value(json!({
-        "planId":"plan-public",
+        "stackId":"stack-public",
         "title":"Release",
         "state":state,
         "repository":"open-engine/zeroshot",
@@ -431,6 +494,25 @@ impl NativeV2CliBackend for FakeBackend {
     type Logs = FakeSubscription<RunLogEventNotification>;
     type Attach = FakeSubscription<RunAttachEventNotification>;
 
+    async fn resolve_review(
+        &self,
+        target: Option<&str>,
+        request: crate::native_v2_review::ReviewResolutionRequest,
+        runtime: &openengine_cluster_protocol::RuntimePlan,
+    ) -> Result<crate::native_v2_review::PreparedReview, NativeV2CliError> {
+        self.calls.lock().assert_value().push(Call::ResolveReview {
+            target: target.map(str::to_owned),
+            request,
+            runtime: runtime.clone(),
+        });
+        if let Some((path, contents)) = &self.review_file_change {
+            std::fs::write(path, contents).assert_value();
+        }
+        self.review
+            .clone()
+            .ok_or_else(|| NativeV2CliError::Target("review fixture unavailable".into()))
+    }
+
     async fn target_add(&self, request: TargetAdd) -> Result<(), NativeV2CliError> {
         self.calls.lock().assert_value().push(Call::TargetAdd {
             name: request.name,
@@ -445,6 +527,20 @@ impl NativeV2CliBackend for FakeBackend {
             name: name.to_owned(),
         });
         Ok(())
+    }
+
+    async fn default_resource_scope(
+        &self,
+        _target: Option<&str>,
+    ) -> Result<openengine_cluster_protocol::ConnectionScope, NativeV2CliError> {
+        if self.unavailable_machine_identity {
+            return Err(NativeV2CliError::Target(
+                "machine identity unavailable".to_owned(),
+            ));
+        }
+        Ok(self
+            .resource_scope
+            .unwrap_or(openengine_cluster_protocol::ConnectionScope::User))
     }
 
     async fn connection_list(
@@ -510,6 +606,13 @@ impl NativeV2CliBackend for FakeBackend {
             target: target.map(str::to_owned),
             request: request.clone(),
         });
+        if self.resource_scope == Some(openengine_cluster_protocol::ConnectionScope::Org)
+            && request.scope == RunProfileScope::User
+        {
+            return Err(NativeV2CliError::Target(
+                "user profile scope is unavailable".to_owned(),
+            ));
+        }
         Ok(RunProfileListResult {
             profiles: [("alpha", true), ("beta", false)]
                 .into_iter()
@@ -528,8 +631,11 @@ impl NativeV2CliBackend for FakeBackend {
         target: Option<&str>,
         selector: RunProfileSelector,
     ) -> Result<RunProfile, NativeV2CliError> {
-        if self.terminal_plan_state.is_some() {
-            return Ok(merge_plan_profile());
+        if self.terminal_stack_state.is_some() {
+            return Ok(stack_profile(
+                self.stack_template_delivery
+                    .unwrap_or(TemplateDelivery::Merge),
+            ));
         }
         self.calls.lock().assert_value().push(Call::ProfileShow {
             target: target.map(str::to_owned),
@@ -586,28 +692,29 @@ impl NativeV2CliBackend for FakeBackend {
         })
     }
 
-    async fn merge_plan_submit(
+    async fn stack_submit(
         &self,
         _target: &str,
-        _request: PreparedMergePlanRequest,
-    ) -> Result<MergePlan, NativeV2CliError> {
-        self.terminal_plan()
+        request: PreparedStackRequest,
+    ) -> Result<Stack, NativeV2CliError> {
+        self.submitted_stacks.lock().assert_value().push(request);
+        self.terminal_stack_result()
     }
 
-    async fn merge_plan_status(
+    async fn stack_status(
         &self,
         _target: &str,
-        _plan_id: MergePlanId,
-    ) -> Result<MergePlan, NativeV2CliError> {
-        self.terminal_plan()
+        _stack_id: StackId,
+    ) -> Result<Stack, NativeV2CliError> {
+        self.terminal_stack_result()
     }
 
-    async fn merge_plan_force(
+    async fn stack_force(
         &self,
         _target: &str,
-        _plan_id: MergePlanId,
-    ) -> Result<MergePlan, NativeV2CliError> {
-        self.terminal_plan()
+        _stack_id: StackId,
+    ) -> Result<Stack, NativeV2CliError> {
+        self.terminal_stack_result()
     }
 
     async fn run_submit(
@@ -685,7 +792,7 @@ impl NativeV2CliBackend for FakeBackend {
             return serde_json::from_value(json!({
                 "runId":params.run_id,
                 "title":"Repair checkout",
-                "source":source(),
+                "source":self.resume_source.as_ref().cloned().unwrap_or_else(source),
                 "size":"medium",
                 "atCursor":"v2:3",
                 "status":{
@@ -995,4 +1102,19 @@ fn target_transport_error() -> NativeV2CliError {
         origin: "https://target.example".to_owned(),
         message: "target discovery failed: connection refused".to_owned(),
     }
+}
+
+pub(super) async fn execute_with_environment(
+    command: NativeV2CliCommand,
+    backend: &FakeBackend,
+    environment: &dyn Fn(&str) -> Option<OsString>,
+) -> Result<CliOutcome, NativeV2CliError> {
+    let context = crate::native_v2_cli::execution::CliExecutionContext::new(backend, environment);
+    crate::native_v2_cli::execution::execute_native_v2_cli_with_context(
+        command,
+        &context,
+        &mut NeverDetach,
+        &mut Vec::new(),
+    )
+    .await
 }

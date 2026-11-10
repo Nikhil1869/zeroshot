@@ -1,8 +1,10 @@
 # Zeroshot target image
 
 `ghcr.io/the-open-engine/zeroshot-target` is the canonical self-hosted target server image. It
-contains the native `zeroshot` executable plus pinned Codex, Claude, GitHub Copilot, and Pi
-harness CLIs.
+enables only core adapters and includes the native `zeroshot` executable plus their pinned harness
+CLIs. See [Harness adapters](../../docs/project/harness-adapters.md) for availability and provider
+support in local and target builds.
+
 The image uses Debian Trixie with package updates applied at build time. GitHub CLI is pinned
 separately to an upstream release, verified by checksum, and tested for delivery API pagination
 before publication. Git checkout and push support HTTPS and SSH. OpenSSH and libnss_wrapper
@@ -50,12 +52,12 @@ zeroshot target add local --url http://127.0.0.1:8080 --direct
 
 Runs require an exact committed Git source; local uncommitted files stay on the client.
 See [source selection and credentials](../../docs/concepts/targets.md#source-and-delivery-credentials)
-for HTTPS/SSH checkout and push, source connections, and GitHub PR/merge support.
+for HTTPS/SSH checkout and push, source connections, and GitHub/GitLab PR and merge support.
 
 Closing the browser leaves runs active.
 Stopping the container stops its runtime; on restart, interrupted runs are reconciled as lost,
 not restarted automatically. When recovery data is available, start a successor with
-`zeroshot resume RUN_ID --target local`. Completed histories remain readable. Private cloud target
+`zeroshot resume RUN_ID --target local`. Completed histories remain readable. Private Platform target
 containers do not expose the unauthenticated standalone UI.
 
 If the browser uses another port or an HTTPS reverse proxy, set `--public-origin` to that exact
@@ -101,7 +103,7 @@ The image includes Docker CLI, Buildx and Compose. To use Docker, provide access
 daemon, for example by mounting a socket with permissions that allow the run's workspace
 user to connect. A mounted daemon controls the machine hosting it; use a disposable or
 dedicated daemon. Workspace bind mounts in sibling containers require the workspace to
-exist at the same absolute path on that daemon's host. Cloud supplies this arrangement
+exist at the same absolute path on that daemon's host. Platform supplies this arrangement
 inside its disposable run machine.
 
 ## Build

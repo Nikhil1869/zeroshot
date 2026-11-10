@@ -1,10 +1,32 @@
 use super::*;
 
+fn validate_checkpoint_policy(
+    enabled: bool,
+    from: Option<&openengine_cluster_protocol::RunResumeFrom>,
+) -> Result<(), NativeV2CliError> {
+    if !enabled
+        && matches!(
+            from,
+            Some(openengine_cluster_protocol::RunResumeFrom::Checkpoint { .. })
+        )
+    {
+        return Err(local_message(
+            "workspace checkpoint restore is unavailable because workspaceCheckpoints is false",
+        ));
+    }
+    Ok(())
+}
+
 impl LocalCliBackend {
     async fn resume_local(
         &self,
         params: openengine_cluster_protocol::RunResumeParams,
     ) -> Result<openengine_cluster_protocol::RunResumeResult, NativeV2CliError> {
+        if params.commit_identity.is_some() {
+            return Err(local_message(
+                "local runs keep the default delivery commit identity",
+            ));
+        }
         let _submission_lock = self.acquire_submission_lock().await?;
         self.reconcile_local_resume_claim(&params.run_id).await?;
         let status = self
@@ -36,11 +58,16 @@ impl LocalCliBackend {
     fn checkpoint_selection(
         &self,
         params: &openengine_cluster_protocol::RunResumeParams,
+        enabled: bool,
     ) -> Result<Option<crate::native_v2_supervisor::checkpoints::CheckpointRestore>, NativeV2CliError>
     {
         use crate::native_v2_supervisor::checkpoints::{
             CheckpointRestore, CheckpointRestoreSelection, latest_available, restore_selection,
         };
+        validate_checkpoint_policy(enabled, params.from.as_ref())?;
+        if !enabled {
+            return Ok(None);
+        }
         let directory = self.paths(&params.run_id)?.storage().join("checkpoints");
         let selection = restore_selection(params.from.as_ref());
         if matches!(&selection, CheckpointRestoreSelection::Latest)
@@ -59,8 +86,9 @@ impl LocalCliBackend {
         params: openengine_cluster_protocol::RunResumeParams,
         mut recovery: LocalRecoveryDocument,
     ) -> Result<openengine_cluster_protocol::RunResumeResult, NativeV2CliError> {
+        let checkpoint =
+            self.checkpoint_selection(&params, recovery.submission.runtime.workspace_checkpoints)?;
         let prepared = self.prepare_successor(&params, &recovery).await?;
-        let checkpoint = self.checkpoint_selection(&params)?;
         recovery.successor_run_id = Some(params.successor_run_id.clone());
         self.write_recovery_document(&params.run_id, &recovery)?;
         if let Err(error) = self
@@ -88,12 +116,31 @@ impl LocalCliBackend {
     ) -> Result<PreparedLocalRun, NativeV2CliError> {
         crate::native_v2_local::validate_workspace_state(&recovery.workspace, &self.state_root)
             .map_err(|error| NativeV2CliError::Usage(error.to_string()))?;
-        let environment = LocalConnectionStore::new(self.state_root.clone())
-            .resolve_submission(&recovery.submission, &params.connections)?;
-        let git_credentials = environment.resolve_git_source().await?;
         let mut native_environment =
-            crate::native_v2_local::capture_local_native_environment(&self.current_directory)
-                .map_err(local_error)?;
+            native_forge::capture_native_environment(&self.current_directory)?;
+        let mut submission = recovery.submission.clone();
+        native_forge::materialize_local_access(
+            &mut submission,
+            native_forge::NativeContext {
+                environment: &native_environment,
+                directory: &recovery.workspace,
+            },
+            params.github_token.is_some(),
+        )?;
+        let store = LocalConnectionStore::new(self.state_root.clone());
+        let mut connections = params.connections.clone();
+        native_forge::fill_missing(
+            &submission,
+            &mut connections,
+            &store,
+            native_forge::NativeContext {
+                environment: &native_environment,
+                directory: &recovery.workspace,
+            },
+        )
+        .await?;
+        let environment = store.resolve_submission(&submission, &connections)?;
+        let git_credentials = environment.resolve_git_source().await?;
         let (github_token, github_token_file) = crate::native_v2_local::take_github_authority(
             &mut native_environment,
             params.github_token.clone(),
@@ -109,7 +156,7 @@ impl LocalCliBackend {
         Ok(PreparedLocalRun {
             run_id: params.successor_run_id.clone(),
             delivery_run_id: self.delivery_run_id(&params.run_id, recovery)?,
-            submission: recovery.submission.clone(),
+            submission,
             environment,
             github_token,
             github_token_file,
@@ -126,6 +173,19 @@ impl NativeV2CliBackend for LocalCliBackend {
     type Watch = ChannelSubscription<CliRunWatchEventNotification>;
     type Logs = ChannelSubscription<RunLogEventNotification>;
     type Attach = ChannelSubscription<RunAttachEventNotification>;
+
+    async fn resolve_review(
+        &self,
+        target: Option<&str>,
+        request: crate::native_v2_review::ReviewResolutionRequest,
+        _runtime: &openengine_cluster_protocol::RuntimePlan,
+    ) -> Result<crate::native_v2_review::PreparedReview, NativeV2CliError> {
+        require_local(target)?;
+        let token = super::review_token(&self.current_directory).await?;
+        crate::native_v2_review::resolve_review(request, &token)
+            .await
+            .map_err(|error| NativeV2CliError::Usage(error.to_string()))
+    }
 
     async fn target_add(&self, _request: TargetAdd) -> Result<(), NativeV2CliError> {
         Err(local_message(
@@ -171,6 +231,16 @@ impl NativeV2CliBackend for LocalCliBackend {
         target: Option<&str>,
         request: RunProfileListRequest,
     ) -> Result<RunProfileListResult, NativeV2CliError> {
+        self.profile_list_with_problems(target, request)
+            .await?
+            .into_protocol()
+    }
+
+    async fn profile_list_with_problems(
+        &self,
+        target: Option<&str>,
+        request: RunProfileListRequest,
+    ) -> Result<CliProfileListResult, NativeV2CliError> {
         require_local(target)?;
         LocalRunProfileStore::production()?.list(request)
     }
@@ -276,6 +346,18 @@ impl NativeV2CliBackend for LocalCliBackend {
     ) -> Result<CliRunForceResult, NativeV2CliError> {
         require_local(target)?;
         self.force_local(params).await.map(Into::into)
+    }
+
+    async fn validate_resume_selection(
+        &self,
+        command: &crate::native_v2_cli::RunResumeCommand,
+    ) -> Result<(), NativeV2CliError> {
+        require_local(command.run.target.as_deref())?;
+        let recovery = self.read_recovery_document(&command.run.run_id)?;
+        validate_checkpoint_policy(
+            recovery.submission.runtime.workspace_checkpoints,
+            command.from.as_ref(),
+        )
     }
 
     async fn run_checkpoints(

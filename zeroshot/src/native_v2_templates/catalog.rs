@@ -3,16 +3,9 @@
 use openengine_cluster_protocol::{GraphSpec, NodeName, SessionScope};
 use thiserror::Error;
 
-use crate::native_v2_contract::{
-    ConnectionKey, DeclaredConnections, DeclaredEnvironment, EnvironmentVariableName,
-    GITHUB_CONNECTION_KEY, NodeRuntimeBinding,
-};
-use crate::native_v2_delivery::GITHUB_TOKEN_ENV;
+use crate::native_v2_contract::{DeclaredConnections, NodeRuntimeBinding};
 
-use super::{
-    auto_research_graph, node_name, single_worker_graph, software_change_graph, static_value,
-    DELIVERY_NODE,
-};
+use super::{auto_research_graph, node_name, single_worker_graph, software_change_graph, DELIVERY_NODE};
 
 /// The deliberately small set of built-in graph templates.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -20,11 +13,20 @@ pub enum BuiltinGraphTemplate {
     SingleWorker,
     SoftwareChange,
     AutoResearch,
+    IssueReview,
+    PrReview,
+    CodeReview,
 }
 
 impl BuiltinGraphTemplate {
-    pub(crate) const ALL: [Self; 3] =
-        [Self::SingleWorker, Self::SoftwareChange, Self::AutoResearch];
+    pub(crate) const ALL: [Self; 6] = [
+        Self::SingleWorker,
+        Self::SoftwareChange,
+        Self::AutoResearch,
+        Self::IssueReview,
+        Self::PrReview,
+        Self::CodeReview,
+    ];
 
     #[must_use]
     pub(crate) const fn all() -> &'static [Self] {
@@ -37,6 +39,9 @@ impl BuiltinGraphTemplate {
             Self::SingleWorker => "single-worker",
             Self::SoftwareChange => "software-change",
             Self::AutoResearch => "auto-research",
+            Self::IssueReview => "issue-review",
+            Self::PrReview => "pr-review",
+            Self::CodeReview => "code-review",
         }
     }
 
@@ -46,15 +51,28 @@ impl BuiltinGraphTemplate {
             "single-worker" => Some(Self::SingleWorker),
             "software-change" => Some(Self::SoftwareChange),
             "auto-research" => Some(Self::AutoResearch),
+            "issue-review" => Some(Self::IssueReview),
+            "pr-review" => Some(Self::PrReview),
+            "code-review" => Some(Self::CodeReview),
             _ => None,
         }
     }
 
+    pub(crate) const fn default_delivery(self) -> TemplateDelivery {
+        match self {
+            Self::SoftwareChange => TemplateDelivery::PullRequest,
+            Self::IssueReview | Self::PrReview | Self::CodeReview => TemplateDelivery::Comment,
+            _ => TemplateDelivery::None,
+        }
+    }
+
     pub(crate) fn default_session_scope(self, node: &str) -> SessionScope {
-        if self == Self::SoftwareChange && node == "worker" {
-            SessionScope::NodeInstance
-        } else {
-            SessionScope::Execution
+        match (self, node) {
+            (Self::SoftwareChange, "worker")
+            | (Self::AutoResearch, "explorer" | "synthesizer" | "challenger" | "researcher") => {
+                SessionScope::NodeInstance
+            }
+            _ => SessionScope::Execution,
         }
     }
 
@@ -67,6 +85,9 @@ impl BuiltinGraphTemplate {
             Self::SingleWorker => single_worker_graph(),
             Self::SoftwareChange => software_change_graph(delivery),
             Self::AutoResearch => auto_research_graph(delivery),
+            Self::IssueReview => super::review::issue_review_graph(delivery),
+            Self::PrReview => super::pr_review::pr_review_graph(delivery),
+            Self::CodeReview => super::code_review::code_review_graph(delivery),
         }
     }
 
@@ -90,16 +111,24 @@ impl BuiltinGraphTemplate {
         if delivery == TemplateDelivery::None {
             return Ok(None);
         }
-        let connections = delivery_connections(delivery)?;
+        let connections = DeclaredConnections::empty();
         let name = match self {
             Self::AutoResearch => "checkpoint_delivery",
-            Self::SingleWorker | Self::SoftwareChange => DELIVERY_NODE,
+            Self::SingleWorker
+            | Self::SoftwareChange
+            | Self::IssueReview
+            | Self::PrReview
+            | Self::CodeReview => DELIVERY_NODE,
         };
         Ok(Some((
             node_name(name)?,
-            NodeRuntimeBinding::GitDelivery {
-                connections,
-                pull_request_feedback,
+            if delivery == TemplateDelivery::Comment {
+                NodeRuntimeBinding::CommentDelivery { connections }
+            } else {
+                NodeRuntimeBinding::GitDelivery {
+                    connections,
+                    pull_request_feedback,
+                }
             },
         )))
     }
@@ -107,10 +136,14 @@ impl BuiltinGraphTemplate {
     fn validate_delivery(self, delivery: TemplateDelivery) -> Result<(), BuiltinTemplateError> {
         let supported = match self {
             Self::SingleWorker => delivery == TemplateDelivery::None,
-            Self::SoftwareChange => true,
+            Self::SoftwareChange => delivery != TemplateDelivery::Comment,
             Self::AutoResearch => {
                 matches!(delivery, TemplateDelivery::None | TemplateDelivery::Push)
             }
+            Self::IssueReview => {
+                matches!(delivery, TemplateDelivery::None | TemplateDelivery::Comment)
+            }
+            Self::PrReview | Self::CodeReview => delivery == TemplateDelivery::Comment,
         };
         if supported {
             Ok(())
@@ -130,6 +163,7 @@ pub enum TemplateDelivery {
     Push,
     PullRequest,
     Merge,
+    Comment,
 }
 
 impl TemplateDelivery {
@@ -140,6 +174,7 @@ impl TemplateDelivery {
             Self::Push => "push",
             Self::PullRequest => "pull_request",
             Self::Merge => "merge",
+            Self::Comment => "comment",
         }
     }
 }
@@ -159,17 +194,4 @@ pub(crate) enum BuiltinTemplateError {
     },
     #[error("a built-in graph template contains an invalid static contract")]
     InvalidStaticContract,
-}
-
-fn delivery_connections(
-    delivery: TemplateDelivery,
-) -> Result<DeclaredConnections, BuiltinTemplateError> {
-    if delivery == TemplateDelivery::Push {
-        Ok(DeclaredConnections::empty())
-    } else {
-        let environment_name = static_value(EnvironmentVariableName::new(GITHUB_TOKEN_ENV))?;
-        let environment = static_value(DeclaredEnvironment::new([environment_name]))?;
-        let connection_key = static_value(ConnectionKey::new(GITHUB_CONNECTION_KEY))?;
-        static_value(DeclaredConnections::new([(connection_key, environment)]))
-    }
 }

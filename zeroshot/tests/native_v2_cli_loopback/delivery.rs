@@ -310,6 +310,9 @@ impl SessionFactory for DeliveryLane {
         environment: &ResolvedEnvironment,
     ) -> Result<Arc<dyn NodeSession>, NodeRunnerError> {
         match invocation.binding {
+            NodeRuntimeBinding::Script { .. }
+            | NodeRuntimeBinding::Decision { .. }
+            | NodeRuntimeBinding::CommentDelivery { .. } => Err(NodeRunnerError::InvalidRole),
             NodeRuntimeBinding::GitDelivery { .. } => {
                 SessionFactory::open(&self.delivery, invocation, environment).await
             }
@@ -364,7 +367,7 @@ impl CapsuleAllocator for DeliveryAllocator {
 
     async fn allocate(
         &self,
-        request: zeroshot_engine::native_v2_cloud::CapsuleAllocationRequest<'_>,
+        request: zeroshot_engine::native_v2_platform::CapsuleAllocationRequest<'_>,
     ) -> Result<AllocatedCapsule, CapsuleAllocationUnavailable> {
         let run_id = request.run_id;
         let admitted = request.admitted;
@@ -377,6 +380,7 @@ impl CapsuleAllocator for DeliveryAllocator {
                 delivery_run_id: run_id.clone(),
                 adopt_existing_delivery: false,
                 git_identity: None,
+                commit_identity: None,
                 workspace: self.fixture.workspace.clone(),
                 git_program: PathBuf::from("/usr/bin/git"),
                 target: DeliveryTarget::new(

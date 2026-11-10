@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use openengine_cluster_protocol::{
     GraphNode, GraphProfile, GraphSpec, NodeInstructions, NodeName, VerifierContract,
-    WorkerContract, WorkerRef, MAX_DECLARED_ENVIRONMENT_NAMES, RUNTIME_WORKER_ERRORS,
+    WorkerContract, WorkerRef, PayloadType, MAX_DECLARED_ENVIRONMENT_NAMES, RUNTIME_WORKER_ERRORS,
 };
 
 use super::{DeliveryPolicy, NativeV2AdmissionError, RuntimePlan, MAX_AGENT_VERIFIER_ATTEMPTS};
@@ -12,6 +12,9 @@ use crate::native_v2_contract::{
     GIT_DELIVERY_PR_WORKER_REF, GIT_DELIVERY_PUSH_WORKER_REF,
 };
 use crate::native_v2_delivery::{validate_delivery_contract, DeliveryMode};
+use crate::native_v2_comment_delivery::{
+    COMMENT_DELIVERY_WORKER_REF, comment_input_schema, validate_comment_contract,
+};
 use crate::native_v2_runner::NodeResponseContract;
 
 pub(super) fn validate_graph_input(
@@ -28,13 +31,31 @@ pub(super) fn validate_graph_input(
 pub(super) fn validate_executable_bindings(
     declarations: &[ExecutableDeclaration],
     runtime: &RuntimePlan,
-    delivery_policy: DeliveryPolicy,
+    context: super::NativeV2AdmissionContext<'_>,
 ) -> Result<(), NativeV2AdmissionError> {
+    context
+        .harnesses
+        .validate_runtime(runtime)
+        .map_err(|error| NativeV2AdmissionError::InvalidRuntime(error.to_string()))?;
+    runtime
+        .active_memory()
+        .validate()
+        .map_err(|error| NativeV2AdmissionError::InvalidEnvironment(error.to_string()))?;
+    runtime
+        .global_agents()
+        .postmortem
+        .validate()
+        .map_err(|error| NativeV2AdmissionError::InvalidEnvironment(error.to_string()))?;
     let bindings = runtime.nodes();
+    if let Some(node) = &runtime.global_agents().postmortem.source_node {
+        if !matches!(bindings.get(node), Some(NodeRuntimeBinding::Agent { .. })) {
+            return Err(NativeV2AdmissionError::MissingRuntimeBinding { node: node.clone() });
+        }
+    }
     validate_attempts(declarations)?;
     validate_binding_coverage(declarations, bindings)?;
     validate_binding_kinds(declarations, bindings)?;
-    validate_delivery_policy(delivery_policy, declarations)?;
+    validate_delivery_policy(context.delivery_policy, declarations)?;
     validate_declared_environment(runtime, None)
 }
 
@@ -64,7 +85,7 @@ pub(super) fn executable_runtime_roles(root: &GraphNode) -> Vec<(NodeName, bool)
     executable_declarations(root)
         .into_iter()
         .map(|declaration| {
-            let delivery = is_git_delivery_worker(&declaration.worker);
+            let delivery = is_trusted_delivery_worker(&declaration.worker);
             (declaration.name, delivery)
         })
         .collect()
@@ -166,6 +187,23 @@ fn validate_binding_kinds(
 ) -> Result<(), NativeV2AdmissionError> {
     for declaration in declarations {
         let binding = &bindings[&declaration.name];
+        binding.validate_model_limits().map_err(|error| {
+            NativeV2AdmissionError::InvalidRuntimeBinding {
+                node: declaration.name.clone(),
+                detail: error.to_string(),
+            }
+        })?;
+        if matches!(binding, NodeRuntimeBinding::Script { .. })
+            && (declaration.kind != LeafKind::Step || declaration.instructions.is_some())
+        {
+            return Err(NativeV2AdmissionError::InvalidRuntimeBinding {
+                node: declaration.name.clone(),
+                detail: "script bindings require a step without agent instructions".to_owned(),
+            });
+        }
+        if let NodeRuntimeBinding::Decision { .. } = binding {
+            validate_decision_declaration(declaration, binding)?;
+        }
         validate_binding_kind(declaration, binding)?;
         validate_instructions(declaration, binding)?;
     }
@@ -177,27 +215,43 @@ fn validate_binding_kind(
     binding: &NodeRuntimeBinding,
 ) -> Result<(), NativeV2AdmissionError> {
     if declaration.kind == LeafKind::Step
-        && matches!(binding, NodeRuntimeBinding::GitDelivery { .. })
+        && matches!(
+            binding,
+            NodeRuntimeBinding::GitDelivery { .. } | NodeRuntimeBinding::CommentDelivery { .. }
+        )
     {
         return Err(NativeV2AdmissionError::DeliveryMustBeVerifier {
             node: declaration.name.clone(),
         });
     }
-    match (is_git_delivery_worker(&declaration.worker), binding) {
-        (true, NodeRuntimeBinding::Agent { .. }) => {
-            Err(NativeV2AdmissionError::DeliveryWorkerRequiresBinding {
+    if declaration.worker.as_str() == COMMENT_DELIVERY_WORKER_REF {
+        if !matches!(binding, NodeRuntimeBinding::CommentDelivery { .. }) {
+            return Err(NativeV2AdmissionError::DeliveryWorkerRequiresBinding {
                 node: declaration.name.clone(),
                 worker: declaration.worker.clone(),
-            })
+            });
         }
+        return validate_comment_declaration(declaration);
+    }
+    if matches!(binding, NodeRuntimeBinding::CommentDelivery { .. }) {
+        return Err(NativeV2AdmissionError::UnsupportedDeliveryWorker {
+            node: declaration.name.clone(),
+            worker: declaration.worker.clone(),
+        });
+    }
+    match (is_git_delivery_worker(&declaration.worker), binding) {
+        (true, NodeRuntimeBinding::GitDelivery { .. }) => {
+            validate_delivery_declaration(declaration, binding)
+        }
+        (true, _) => Err(NativeV2AdmissionError::DeliveryWorkerRequiresBinding {
+            node: declaration.name.clone(),
+            worker: declaration.worker.clone(),
+        }),
         (false, NodeRuntimeBinding::GitDelivery { .. }) => {
             Err(NativeV2AdmissionError::UnsupportedDeliveryWorker {
                 node: declaration.name.clone(),
                 worker: declaration.worker.clone(),
             })
-        }
-        (true, NodeRuntimeBinding::GitDelivery { .. }) => {
-            validate_delivery_declaration(declaration, binding)
         }
         _ => Ok(()),
     }
@@ -208,16 +262,17 @@ fn validate_instructions(
     binding: &NodeRuntimeBinding,
 ) -> Result<(), NativeV2AdmissionError> {
     match (binding, &declaration.instructions) {
-        (NodeRuntimeBinding::Agent { .. }, None) => {
+        (NodeRuntimeBinding::Agent { .. } | NodeRuntimeBinding::Decision { .. }, None) => {
             Err(NativeV2AdmissionError::MissingAgentInstructions {
                 node: declaration.name.clone(),
             })
         }
-        (NodeRuntimeBinding::GitDelivery { .. }, Some(_)) => {
-            Err(NativeV2AdmissionError::DeliveryInstructionsForbidden {
-                node: declaration.name.clone(),
-            })
-        }
+        (
+            NodeRuntimeBinding::GitDelivery { .. } | NodeRuntimeBinding::CommentDelivery { .. },
+            Some(_),
+        ) => Err(NativeV2AdmissionError::DeliveryInstructionsForbidden {
+            node: declaration.name.clone(),
+        }),
         _ => Ok(()),
     }
 }
@@ -228,7 +283,7 @@ fn validate_delivery_policy(
 ) -> Result<(), NativeV2AdmissionError> {
     let found = declarations
         .iter()
-        .filter(|declaration| is_git_delivery_worker(&declaration.worker))
+        .filter(|declaration| is_trusted_delivery_worker(&declaration.worker))
         .count();
     let accepted = match policy {
         DeliveryPolicy::Optional => found <= 1,
@@ -238,6 +293,10 @@ fn validate_delivery_policy(
         return Err(NativeV2AdmissionError::DeliveryNodeCount { policy, found });
     }
     Ok(())
+}
+
+fn is_trusted_delivery_worker(worker: &WorkerRef) -> bool {
+    worker.as_str() == COMMENT_DELIVERY_WORKER_REF || is_git_delivery_worker(worker)
 }
 
 fn is_git_delivery_worker(worker: &WorkerRef) -> bool {
@@ -265,6 +324,12 @@ pub(crate) fn sole_delivery_node(admitted: &AdmittedRun) -> Option<(NodeName, De
 pub(crate) fn writer_nodes(admitted: &AdmittedRun) -> BTreeSet<NodeName> {
     executable_declarations(&admitted.graph.root)
         .into_iter()
+        .filter(|declaration| {
+            !matches!(
+                admitted.runtime.nodes().get(&declaration.name),
+                Some(NodeRuntimeBinding::Decision { .. })
+            )
+        })
         .map(|declaration| declaration.name)
         .collect()
 }
@@ -326,5 +391,65 @@ pub(super) fn validate_declared_environment(
             found: declared.len(),
         });
     }
+    Ok(())
+}
+
+fn validate_comment_declaration(
+    declaration: &ExecutableDeclaration,
+) -> Result<(), NativeV2AdmissionError> {
+    if comment_input_schema().ok().as_ref() != Some(&declaration.contract.input) {
+        return Err(NativeV2AdmissionError::InvalidDeliveryContract {
+            node: declaration.name.clone(),
+            worker: declaration.worker.clone(),
+        });
+    }
+    let verifier = declaration.contract.verifier.as_ref().ok_or_else(|| {
+        NativeV2AdmissionError::InvalidDeliveryContract {
+            node: declaration.name.clone(),
+            worker: declaration.worker.clone(),
+        }
+    })?;
+    let response = NodeResponseContract::Verifier {
+        output: declaration.contract.output.clone(),
+        signals: verifier.signals.clone(),
+        diagnostic: verifier.diagnostic.clone(),
+    };
+    validate_comment_contract(&response).map_err(|_| {
+        NativeV2AdmissionError::InvalidDeliveryContract {
+            node: declaration.name.clone(),
+            worker: declaration.worker.clone(),
+        }
+    })
+}
+
+fn validate_decision_declaration(
+    declaration: &ExecutableDeclaration,
+    binding: &NodeRuntimeBinding,
+) -> Result<(), NativeV2AdmissionError> {
+    let invalid = |detail: &str| NativeV2AdmissionError::InvalidRuntimeBinding {
+        node: declaration.name.clone(),
+        detail: detail.to_owned(),
+    };
+    let Some(verifier) = &declaration.contract.verifier else {
+        return Err(invalid("decision bindings require a verifier node"));
+    };
+    if declaration.attempts != 1 {
+        return Err(invalid("decision verifiers require attempts: 1"));
+    }
+    if !matches!(
+        declaration.contract.input,
+        PayloadType::Record { .. } | PayloadType::String | PayloadType::Array { .. }
+    ) {
+        return Err(invalid("decision state must be a string, record or array"));
+    }
+    crate::native_v2_candidate::decision::contract::validate_contract(
+        &NodeResponseContract::Verifier {
+            output: declaration.contract.output.clone(),
+            signals: verifier.signals.clone(),
+            diagnostic: verifier.diagnostic.clone(),
+        },
+        binding,
+    )
+    .map_err(|error| invalid(&error.to_string()))?;
     Ok(())
 }

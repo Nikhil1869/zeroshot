@@ -17,13 +17,16 @@ use sha2::{Digest, Sha256};
 use super::*;
 use super::controller::PortableCheckpointCleanup;
 use crate::native_v2_candidate::test_support::{full_graph, success_node};
-use crate::native_v2_cloud::CapsuleCleanup;
+use crate::native_v2_platform::CapsuleCleanup;
 use crate::native_v2_contract::{
     RunSubmission, RunTitle, SourceBranchId, SourceRepositoryId, SourceRevisionId, ResolvedSource,
 };
 use crate::native_v2_runner::{NodeHandle, NodeRunRequest, NodeRunnerError};
 use crate::native_v2_supervisor::RunRuntimeExit;
 use crate::v2_run_ledger::{CreateRun, CreateRunOutcome, RunLedger};
+
+#[path = "tests/primary_restart.rs"]
+mod primary_restart;
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
 
@@ -67,7 +70,7 @@ fn checkpoint_cleanup_fixture(
     (directory, repository, cleanup)
 }
 
-struct NeverDispatched;
+pub(super) struct NeverDispatched;
 
 #[async_trait]
 impl NodeRunner for NeverDispatched {
@@ -130,13 +133,16 @@ async fn checkpoint_scratch_gc_failure_does_not_reject_confirmed_runtime_cleanup
     );
 }
 
-fn submission(key: &str) -> RunSubmission {
+pub(super) fn submission(key: &str) -> RunSubmission {
     RunSubmission {
         environment: None,
         title: RunTitle::new("Portable controller test").assert_value_with("title"),
         graph: full_graph(vec![success_node()]),
         initial_input: Value::Null,
-        runtime: crate::native_v2_candidate::test_support::codex_runtime(BTreeMap::new()),
+        runtime: crate::native_v2_candidate::test_support::codex_runtime(
+            openengine_cluster_protocol::RunSize::Small,
+            BTreeMap::new(),
+        ),
         source: Some(ResolvedSource {
             remote: None,
 
@@ -150,7 +156,7 @@ fn submission(key: &str) -> RunSubmission {
     }
 }
 
-fn bootstrap(
+pub(super) fn bootstrap(
     run_id: RunId,
     submission: RunSubmission,
     workspace: PathBuf,
@@ -163,6 +169,7 @@ fn bootstrap(
     )
     .assert_value_with("exact empty environment");
     PortableControllerBootstrap {
+        memory_storage: None,
         git_credentials: None,
 
         checkpoint: None,
@@ -416,6 +423,7 @@ async fn observer_reconciles_process_loss_without_constructing_or_dispatching_a_
         status.status,
         RunStatus::Finished {
             terminal_result: TerminalResult::Failed {
+                context: None,
                 reason: openengine_cluster_protocol::EnumLabel::new("runtime_lost")
                     .assert_value_with("runtime-lost label"),
             },
@@ -443,7 +451,7 @@ async fn observer_reconciles_process_loss_without_constructing_or_dispatching_a_
     let client = ClusterClient::new(transport.as_ref());
     assert!(matches!(
         wait_terminal(&client, &run_id).await,
-        TerminalResult::Failed { reason } if reason.as_str() == "runtime_lost"
+        TerminalResult::Failed { reason, .. } if reason.as_str() == "runtime_lost"
     ));
     server_task.abort();
     assert!(server_task.await.assert_error().is_cancelled());
@@ -539,4 +547,74 @@ fn token_file_bootstrap_keeps_credentials_out_of_submission_and_consumes_private
     assert_eq!(restored.delivery_validator.unwrap().path(), validator_path);
     assert!(restored.native_environment.is_empty());
     assert!(!path.exists());
+}
+
+#[tokio::test]
+async fn controller_entry_reports_why_a_loaded_bootstrap_could_not_start() {
+    let root = TestDirectory::new("startup-failure");
+    let storage = root.child("state");
+    crate::execution::platform::create_private_directory(&storage)
+        .assert_value_with("create run storage");
+    // The workspace is absent, so the controller fails after consuming its bootstrap.
+    let mut prepared = bootstrap(
+        RunId::new("startup-failure"),
+        submission("startup-failure"),
+        root.child("missing-workspace"),
+        storage.clone(),
+    );
+    prepared.github_token = Some("startup-secret-token".to_owned());
+    let path = storage.join("controller.bootstrap.json");
+    write_bootstrap_file(&path, &prepared).assert_value_with("write bootstrap");
+
+    let error = run_controller_process(&path).await.assert_error();
+
+    assert!(!path.exists(), "bootstrap must be consumed");
+    let report = take_startup_failure(&PortableControllerPaths::new(&storage))
+        .assert_value_with("startup failure report");
+    assert!(
+        report.starts_with(&error.to_string()),
+        "report {report:?} must name {error}"
+    );
+    assert!(!report.contains("startup-secret-token"));
+}
+
+#[cfg(feature = "contributed-harnesses")]
+#[tokio::test]
+async fn local_portable_controller_admits_contributed_runtime_without_native_processes() {
+    let root = TestDirectory::new("contributed-runtime");
+    let workspace = root.child("workspace");
+    std::fs::create_dir(&workspace).assert_value();
+    let mut request = submission("local-contributed-runtime");
+    request.runtime.harness =
+        openengine_cluster_protocol::HarnessId::new("opencode").assert_value();
+    request.runtime.provider =
+        openengine_cluster_protocol::ProviderId::new("openai").assert_value();
+    let run_id = RunId::new("local-contributed-runtime");
+    let controller = PortableRunController::start(
+        bootstrap(run_id.clone(), request, workspace, root.child("state")),
+        |_| Ok::<_, std::convert::Infallible>(PortableRuntime::new(Arc::new(NeverDispatched))),
+    )
+    .await
+    .assert_value();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let status = controller
+                .inner
+                .status(RunStatusParams {
+                    run_id: run_id.clone(),
+                })
+                .await
+                .assert_value();
+            if let RunStatus::Finished {
+                terminal_result, ..
+            } = status.status
+            {
+                assert!(matches!(terminal_result, TerminalResult::Succeeded { .. }));
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .assert_value();
 }

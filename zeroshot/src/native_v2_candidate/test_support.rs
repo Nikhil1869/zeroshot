@@ -110,6 +110,7 @@ impl NodeRequestFixture<'_> {
         let environment = ResolvedEnvironment::exact(&self.binding, self.environment)
             .assert_value_with("resolve test environment");
         NodeRunRequest {
+            dispatch: Default::default(),
             invocation: NodeInvocation {
                 reference: ExecutionRef {
                     run_id: RunId::new(self.run_id),
@@ -166,7 +167,7 @@ pub(crate) fn git_delivery_node() -> Value {
         "kind":"verifier","name":"deliver","worker":GIT_DELIVERY_MERGE_V2_WORKER_REF,
         "input":{"kind":"null"},"output":delivery_result_schema(DeliveryMode::Merge)
             .assert_value_with("delivery result schema"),
-        "inputBindings":[],"writeBindings":[],"timeoutMs":1000,"attempts":1,
+        "inputBindings":[],"writeBindings":[],"timeoutMs":30000,"attempts":1,
         "signals":{"delivery":crate::native_v2_delivery::delivery_signal_labels(DeliveryMode::Merge)
             .assert_value_with("delivery signals")},
         "diagnostic":crate::native_v2_delivery::delivery_diagnostic_schema()
@@ -203,6 +204,26 @@ pub(crate) fn git_output(directory: &Path, arguments: &[&str]) -> String {
 
 pub(crate) fn path_text(path: &Path) -> &str {
     path.to_str().assert_value_with("test path is UTF-8")
+}
+
+/// A GitHub App bot author, as a host would select it for delivered commits.
+pub(crate) const BOT_AUTHOR: &str =
+    "zeroshot-app[bot] <326899010+zeroshot-app[bot]@users.noreply.github.com>";
+
+pub(crate) fn bot_commit_identity() -> openengine_cluster_protocol::CommitIdentity {
+    openengine_cluster_protocol::CommitIdentity::new(
+        "zeroshot-app[bot]",
+        "326899010+zeroshot-app[bot]@users.noreply.github.com",
+    )
+    .assert_value()
+}
+
+/// Author and committer of one commit, as `name <email>|name <email>`.
+pub(crate) fn commit_authorship(directory: &Path, revision: &str) -> String {
+    git_output(
+        directory,
+        &["show", "-s", "--format=%an <%ae>|%cn <%ce>", revision],
+    )
 }
 
 pub(crate) struct TestGitRepository {
@@ -324,27 +345,62 @@ pub(crate) fn allocation_request<'a>(
     run_id: &'a RunId,
     admitted: &'a AdmittedRun,
     github_token: Option<&'a str>,
-) -> crate::native_v2_cloud::CapsuleAllocationRequest<'a> {
-    crate::native_v2_cloud::CapsuleAllocationRequest {
+) -> crate::native_v2_platform::CapsuleAllocationRequest<'a> {
+    crate::native_v2_platform::CapsuleAllocationRequest {
         git_credentials: None,
+        commit_identity: None,
 
         run_id,
         admitted,
         github_token,
-        preparation: crate::native_v2_cloud::CapsulePreparation::quiet(&admitted.runtime)
+        preparation: crate::native_v2_platform::CapsulePreparation::quiet(&admitted.runtime)
             .assert_value(),
     }
 }
 
 pub(crate) fn codex_runtime(
+    size: openengine_cluster_protocol::RunSize,
     nodes: std::collections::BTreeMap<
         openengine_cluster_protocol::NodeName,
         crate::native_v2_contract::NodeRuntimeBinding,
     >,
 ) -> crate::native_v2_contract::RuntimePlan {
-    crate::native_v2_contract::RuntimePlan::Codex {
-        provider: openengine_cluster_protocol::CodexProvider::OpenAi,
-        size: openengine_cluster_protocol::RunSize::Small,
+    crate::native_v2_contract::RuntimePlan::new(
+        openengine_cluster_protocol::RuntimeLane::new(
+            "codex",
+            (openengine_cluster_protocol::CodexProvider::OpenAi).name(),
+        )
+        .assert_value(),
+        size,
         nodes,
-    }
+    )
+}
+
+/// Shell fragment used by process fixtures to record only the public execution labels.
+#[cfg(unix)]
+pub(crate) const CAPTURE_EXECUTION_ENVIRONMENT: &str = r#"
+printf '%s\n' "$ZEROSHOT_RUN_ID" "$ZEROSHOT_NODE_NAME" "$ZEROSHOT_NODE_KIND" \
+  "$ZEROSHOT_NODE_INSTANCE_ID" "$ZEROSHOT_EXECUTION_REF" \
+  "$ZEROSHOT_NODE_ATTEMPT" "$ZEROSHOT_NODE_ITERATION" >> execution-context
+"#;
+
+#[cfg(unix)]
+pub(crate) fn assert_execution_environment(
+    actual: &str,
+    reference: &ExecutionRef,
+    dispatch: crate::native_v2_runner::NodeDispatchMetadata,
+    kind: &str,
+) {
+    assert_eq!(
+        actual,
+        format!(
+            "{}\n{}\n{kind}\n{}\n{}\n{}\n{}\n",
+            reference.run_id.as_str(),
+            reference.node.as_str(),
+            reference.node_instance,
+            reference.public_execution().assert_value().as_str(),
+            dispatch.attempt,
+            dispatch.iteration
+        )
+    );
 }

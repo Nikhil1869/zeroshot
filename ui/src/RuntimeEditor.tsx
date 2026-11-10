@@ -1,20 +1,20 @@
+import { isDeliveryKind, scriptCommandLabel } from './workers';
+import { DecisionControls } from './DecisionControls';
 import { useState } from 'react';
 import { allNodes, bindingFor, clone, executable, type Document, type Runtime } from './domain';
 import { Field } from './Field';
 import { ModelPicker } from './ModelPicker';
 import { modelGroups } from './models';
 import { effectiveLane } from './runtime-readiness';
-
-const harnessLabels = new Map([
-  ['codex', 'Codex'],
-  ['claude', 'Claude Code'],
-  ['copilot', 'GitHub Copilot'],
-  ['pi', 'Pi'],
-]);
+import type { HarnessOption } from './api';
+import type { MachineOption } from './machines';
+import { RunSizePicker } from './RunSizePicker';
 
 export function RuntimeEditor(p: {
   document: Document;
   schema: any;
+  harnesses?: readonly HarnessOption[];
+  machines?: readonly MachineOption[];
   /** JSON path of the field the last validation rejected, e.g. `runtime.nodes.work.model`. */
   invalidField?: string;
   /** The runtime `invalidField` was found in; fields the draft changed since then are not flagged. */
@@ -38,22 +38,16 @@ export function RuntimeEditor(p: {
   // A shared model field is meaningful only when all agents use the same harness and provider.
   const [showPerAgent, setPerAgent] = useState(!shared);
   const perAgent = mixedLanes || showPerAgent;
-  const variants = p.schema?.oneOf ?? p.schema?.anyOf ?? [];
-  const harnesses = variants
-    .map((v: any) => v.properties?.harness?.const ?? v.properties?.harness?.enum?.[0])
-    .filter(Boolean);
-  const variant = variants.find(
-    (v: any) =>
-      (v.properties?.harness?.const ?? v.properties?.harness?.enum?.[0]) === doc.runtime.harness
-  );
-  const providerRef = variant?.properties?.provider?.$ref?.split('/').pop();
+  const harnesses = p.harnesses ?? legacySchemaHarnesses(p.schema);
+  const selectedHarness = harnesses.find((entry) => entry.id === doc.runtime.harness);
+  const providers = selectedHarness?.providers ?? [];
+  const unavailableHarness = !!doc.runtime.harness && !selectedHarness;
+  const unavailableProvider = !!doc.runtime.provider && !providers.includes(doc.runtime.provider);
   const settingChanged = (key: string) => !!p.validated && doc.runtime[key] !== p.validated[key];
   const modelChanged = (name: string) =>
     !!p.validated && model(name) !== (bindingFor(p.validated, name)?.model ?? '');
   const invalid = (field: string, changed: boolean) =>
     (!changed && p.invalidField === `runtime.${field}`) || undefined;
-  const providers =
-    p.schema?.$defs?.[providerRef]?.enum ?? variant?.properties?.provider?.enum ?? [];
   function runtimeChange(key: string, value: string) {
     const next = clone(doc);
     next.runtime[key] = value;
@@ -88,7 +82,7 @@ export function RuntimeEditor(p: {
   };
   // With one shared model, only nodes that still need a worker get their own row.
   const rows = nodes.filter(
-    (n) => perAgent || !['agent', 'git_delivery'].includes(kind(n.name) ?? '')
+    (n) => perAgent || !['agent', 'git_delivery', 'comment_delivery'].includes(kind(n.name) ?? '')
   );
   return (
     <>
@@ -100,9 +94,14 @@ export function RuntimeEditor(p: {
           onChange={(e) => runtimeChange('harness', e.target.value)}
         >
           <option value="">Choose harness</option>
-          {harnesses.map((h: string) => (
-            <option key={h} value={h}>
-              {harnessLabels.get(h) ?? h}
+          {unavailableHarness && (
+            <option value={doc.runtime.harness} disabled>
+              {doc.runtime.harness} (unavailable)
+            </option>
+          )}
+          {harnesses.map((entry) => (
+            <option key={entry.id} value={entry.id}>
+              {entry.label}
             </option>
           ))}
         </select>
@@ -114,6 +113,11 @@ export function RuntimeEditor(p: {
           onChange={(e) => runtimeChange('provider', e.target.value)}
         >
           <option value="">Choose provider</option>
+          {unavailableProvider && (
+            <option value={doc.runtime.provider} disabled>
+              {doc.runtime.provider} (unavailable)
+            </option>
+          )}
           {providers.map((v: string) => (
             <option key={v} value={v}>
               {v}
@@ -121,17 +125,13 @@ export function RuntimeEditor(p: {
           ))}
         </select>
       </Field>
-      <Field label="Run size">
-        <select
-          value={doc.runtime.size}
-          aria-invalid={invalid('size', settingChanged('size'))}
-          onChange={(e) => runtimeChange('size', e.target.value)}
-        >
-          {(p.schema?.$defs?.RunSize?.enum ?? []).map((s: string) => (
-            <option key={s}>{s}</option>
-          ))}
-        </select>
-      </Field>
+      <RunSizePicker
+        value={doc.runtime.size}
+        schema={p.schema}
+        machines={p.machines}
+        invalid={invalid('size', settingChanged('size'))}
+        onChange={(value) => runtimeChange('size', value)}
+      />
       <div className="section-rule" />
       <div className="section-title model-heading">
         <span>{perAgent ? 'Agent models' : 'Model'}</span>
@@ -157,8 +157,23 @@ export function RuntimeEditor(p: {
       {rows.map((n) => (
         <div key={n.name} className="runtime-node">
           <span className="mono">{n.name}</span>
-          {kind(n.name) === 'git_delivery' ? (
-            <small>Git delivery</small>
+          {isDeliveryKind(kind(n.name)) ? (
+            <small>
+              {kind(n.name) === 'comment_delivery' ? 'Comment delivery' : 'Git delivery'}
+            </small>
+          ) : kind(n.name) === 'script' ? (
+            <small>Script: {scriptCommandLabel(bindingFor(doc.runtime, n.name)?.command)}</small>
+          ) : kind(n.name) === 'decision' ? (
+            <DecisionControls
+              node={n.name}
+              binding={bindingFor(doc.runtime, n.name)!}
+              onChange={(key, value) => {
+                const next = clone(doc);
+                if (value === '') delete next.runtime.nodes[n.name][key];
+                else next.runtime.nodes[n.name][key] = value;
+                p.edit(next, `binding.${n.name}.${key}`);
+              }}
+            />
           ) : kind(n.name) === 'agent' ? (
             picker([n.name], `Model for ${n.name}`)
           ) : (
@@ -176,4 +191,22 @@ function listNames(names: string[]) {
   if (names.length === 1) return names[0];
   if (names.length > 4) return `${names.slice(0, 3).join(', ')} and ${names.length - 3} more`;
   return `${names.slice(0, -1).join(', ')} and ${names.at(-1)}`;
+}
+
+// Version 1 hosts predating the explicit catalog advertised choices through enum variants.
+function legacySchemaHarnesses(schema: any): HarnessOption[] {
+  const variants = schema?.oneOf ?? schema?.anyOf ?? [];
+  if (!Array.isArray(variants)) return [];
+  return variants.flatMap((variant: any) => {
+    const properties = variant?.properties;
+    const id = properties?.harness?.const ?? properties?.harness?.enum?.[0];
+    if (typeof id !== 'string' || !id) return [];
+    const provider = properties?.provider;
+    const reference = typeof provider?.$ref === 'string' ? provider.$ref.split('/').pop() : '';
+    const values = schema?.$defs?.[reference]?.enum ?? provider?.enum ?? [];
+    const providers = Array.isArray(values)
+      ? values.filter((value): value is string => typeof value === 'string' && !!value)
+      : [];
+    return [{ id, label: id, providers }];
+  });
 }

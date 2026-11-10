@@ -18,6 +18,10 @@ use crate::native_v2_local::PreparedLocalRun;
 use crate::native_v2_supervisor::RunEnvironment;
 use crate::v2_run_ledger::CreateRun;
 
+#[cfg(unix)]
+#[path = "preflight_tests.rs"]
+mod preflight_tests;
+
 fn contract_backend(root: &Path) -> LocalCliBackend {
     LocalCliBackend::new(
         root.to_owned(),
@@ -72,6 +76,7 @@ fn contract_status(submission: &RunSubmission, run_id: RunId, failed: bool) -> R
         status: if failed {
             RunStatus::Finished {
                 terminal_result: TerminalResult::Failed {
+                    context: None,
                     reason: EnumLabel::new("runtime_failed").assert_value(),
                 },
                 metadata: Default::default(),
@@ -168,12 +173,16 @@ fn initialize_local_repository(root: &Path) {
         assert!(status.success(), "git {arguments:?} failed");
     }
 
-    git(root, &["init", "--quiet", "--initial-branch=main"]);
+    git(root, &["init", "--quiet"]);
     git(root, &["config", "user.name", "Zeroshot Test"]);
     git(root, &["config", "user.email", "zeroshot@example.invalid"]);
+
     std::fs::write(root.join("README.md"), "fixture\n").assert_value();
+
     git(root, &["add", "README.md"]);
     git(root, &["commit", "--quiet", "-m", "fixture"]);
+    git(root, &["branch", "-M", "main"]);
+
     git(
         root,
         &[
@@ -184,7 +193,6 @@ fn initialize_local_repository(root: &Path) {
         ],
     );
 }
-
 #[test]
 fn local_storage_contract_validates_paths_and_private_artifacts() {
     let root = TestDirectory::new("lsc");
@@ -545,6 +553,7 @@ async fn local_bootstrap_and_resume_failures_leave_recoverable_state() {
         .start_local_successor(
             RunResumeParams {
                 git_credentials: None,
+                commit_identity: None,
 
                 run_id: original.clone(),
                 successor_run_id: successor.clone(),
@@ -718,6 +727,21 @@ async fn local_stale_state_and_readiness_fail_closed() {
                 .to_string()
                 .contains("exited before becoming ready")
         );
+        crate::execution::process::write_new_file(
+            &paths.startup_failure(),
+            b"portable controller I/O failed: restic is unavailable",
+            0o600,
+        )
+        .assert_value();
+        assert_eq!(
+            wait_for_controller(&mut exited, &paths, &run_id, Duration::ZERO)
+                .await
+                .assert_error()
+                .to_string(),
+            "local controller operation failed: controller exited before becoming ready: \
+             portable controller I/O failed: restic is unavailable"
+        );
+        assert!(!paths.startup_failure().exists());
 
         let mut waiting = tokio::process::Command::new("sh")
             .args(["-c", "read _"])
@@ -845,6 +869,119 @@ async fn assert_local_start_deduplicates_before_controller_launch() {
             .await
             .assert_value()
             .is_none()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn slow_remote_preflight_does_not_block_unrelated_submission() {
+    let root = TestDirectory::new("local-slow-remote-preflight");
+    let remote_workspace = root.child("remote-workspace");
+    let unrelated_workspace = root.child("unrelated-workspace");
+    std::fs::create_dir(&remote_workspace).assert_value();
+    std::fs::create_dir(&unrelated_workspace).assert_value();
+    initialize_local_repository(&remote_workspace);
+    initialize_local_repository(&unrelated_workspace);
+
+    let state = root.child("shared-state");
+    std::fs::create_dir(&state).assert_value();
+    let git_program = root.child("blocking-git");
+    let remote_check_started = root.child("remote-check-started");
+    let release_remote_check = root.child("release-remote-check");
+    openengine_cluster_testkit::fixture::write_executable(
+        &git_program,
+        format!(
+            "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = \"ls-remote\" ]; then\n    : > '{}'\n    while [ ! -e '{}' ]; do sleep 0.01; done\n    exit 0\n  fi\ndone\nexec /usr/bin/git \"$@\"\n",
+            remote_check_started.display(),
+            release_remote_check.display(),
+        ),
+        0o700,
+    )
+    .assert_value();
+
+    let slow_backend = LocalCliBackend::new(
+        state.clone(),
+        PathBuf::from("/bin/true"),
+        remote_workspace,
+        git_program,
+    )
+    .with_ready_timeout(Duration::from_millis(50));
+    let mut slow_request = prepared_request(
+        RunId::new("0199f33f-3b44-7d21-9000-0000000000b1"),
+        "slow-remote-preflight",
+    );
+    slow_request.intent.graph = full_graph(vec![
+        crate::native_v2_candidate::test_support::git_delivery_node(),
+        success_node(),
+    ]);
+    slow_request.intent.runtime.nodes_mut().insert(
+        NodeName::new("deliver").assert_value(),
+        crate::native_v2_contract::NodeRuntimeBinding::GitDelivery {
+            connections: Default::default(),
+            pull_request_feedback: Default::default(),
+        },
+    );
+
+    let slow_request = preflight_tests::with_declared_github_token(slow_request);
+    let slow_submission =
+        tokio::spawn(async move { slow_backend.start_controller(slow_request).await });
+    let reached_remote_check = tokio::time::timeout(Duration::from_secs(5), async {
+        while !remote_check_started.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    if reached_remote_check.is_err() {
+        std::fs::write(&release_remote_check, b"release").assert_value();
+
+        let slow_result_after_release =
+            tokio::time::timeout(Duration::from_secs(5), slow_submission).await;
+
+        panic!(
+            "PR submission never reached the blocked remote-ref check; \
+            result after releasing fixture: {slow_result_after_release:?}"
+        );
+    }
+
+    let unrelated_backend = LocalCliBackend::new(
+        state,
+        PathBuf::from("/bin/true"),
+        unrelated_workspace,
+        PathBuf::from("git"),
+    )
+    .with_ready_timeout(Duration::from_millis(50));
+    let unrelated_request = prepared_request(
+        RunId::new("0199f33f-3b44-7d21-9000-0000000000b2"),
+        "unrelated-submission",
+    );
+    let unrelated_result = tokio::time::timeout(
+        Duration::from_secs(2),
+        unrelated_backend.start_controller(unrelated_request),
+    )
+    .await;
+    let remote_check_was_still_blocked = remote_check_started.exists()
+        && !release_remote_check.exists()
+        && !slow_submission.is_finished();
+
+    // Always unblock the child before asserting, so a failed regression test cannot leave it
+    // waiting on a fixture file until its ten-minute Git transport deadline.
+    std::fs::write(&release_remote_check, b"release").assert_value();
+    let slow_result = tokio::time::timeout(Duration::from_secs(5), slow_submission)
+        .await
+        .assert_value()
+        .assert_value();
+
+    assert!(
+        remote_check_was_still_blocked,
+        "the slow remote check unexpectedly finished before the unrelated submission"
+    );
+    assert!(
+        matches!(unrelated_result, Ok(Err(NativeV2CliError::Local(_)))),
+        "unrelated submission did not progress to controller startup while remote validation was blocked: {unrelated_result:?}"
+    );
+    assert!(
+        matches!(slow_result, Err(NativeV2CliError::Usage(ref message)) if message.contains("remote does not have target branch `main`")),
+        "the blocked remote fixture should report a missing target branch: {slow_result:?}"
     );
 }
 
@@ -978,4 +1115,149 @@ async fn assert_zero_deadline_cleanup_and_recovery_claim_edges() {
 async fn wave11_cli_contract_local_deduplication_and_zero_deadline_cleanup_are_exact() {
     assert_local_start_deduplicates_before_controller_launch().await;
     assert_zero_deadline_cleanup_and_recovery_claim_edges().await;
+}
+
+#[test]
+fn local_review_tokens_are_bounded_and_lease_paths_stay_private() {
+    assert!(checked_review_token(String::new()).is_err());
+    assert!(checked_review_token("token\0suffix".to_owned()).is_err());
+    assert!(checked_review_token("t".repeat(4097)).is_err());
+    assert_eq!(
+        checked_review_token("t".repeat(4096)).assert_value(),
+        "t".repeat(4096)
+    );
+
+    let root = TestDirectory::new("local-review-token");
+    let state = root.child("state");
+    let workspace = root.child("workspace");
+    std::fs::create_dir(&workspace).assert_value();
+    let lease = local_workspace_lease_path(&state, &workspace).assert_value();
+    assert!(lease.starts_with(state.join("workspaces")));
+    assert_eq!(
+        local_workspace_lease_path(&state, &workspace).assert_value(),
+        lease,
+        "one workspace must always map to the same lease path"
+    );
+
+    let run_id = RunId::new("0199f33f-3b44-7d21-9000-0000000000ff");
+    let storage = create_local_run_storage(&state, &run_id).assert_value();
+    assert_eq!(storage, state.join("runs").join(run_id.as_str()));
+    assert!(storage.is_dir());
+    assert!(create_local_run_storage(&state, &RunId::new("invalid-local-run")).is_err());
+}
+
+#[test]
+fn local_bootstrap_scavenging_only_removes_stale_regular_files() {
+    let root = TestDirectory::new("local-bootstrap-scavenge");
+    let missing = root.child("missing-bootstrap");
+    remove_stale_bootstrap(&missing, Duration::ZERO).assert_value();
+
+    let fresh = root.child("fresh-bootstrap");
+    std::fs::write(&fresh, b"token").assert_value();
+    remove_stale_bootstrap(&fresh, Duration::from_secs(3600)).assert_value();
+    assert!(fresh.is_file(), "a recent bootstrap is still in use");
+    remove_stale_bootstrap(&fresh, Duration::ZERO).assert_value();
+    assert!(!fresh.exists(), "an aged bootstrap is reclaimed");
+
+    let directory = root.child("bootstrap-directory");
+    std::fs::create_dir(&directory).assert_value();
+    remove_stale_bootstrap(&directory, Duration::ZERO).assert_value();
+    assert!(directory.is_dir(), "directories are never reclaimed");
+
+    #[cfg(unix)]
+    {
+        let target = root.child("bootstrap-target");
+        std::fs::write(&target, b"token").assert_value();
+        let link = root.child("bootstrap-link");
+        std::os::unix::fs::symlink(&target, &link).assert_value();
+        remove_stale_bootstrap(&link, Duration::ZERO).assert_value();
+        assert!(link.symlink_metadata().is_ok(), "links are never followed");
+        assert!(target.is_file());
+    }
+}
+
+#[test]
+fn local_backend_guards_named_targets_and_controller_handoff_errors() {
+    require_local(None).assert_value();
+    assert!(require_local(Some("named-target")).is_err());
+
+    assert!(retryable_controller_handoff(&PortableControllerError::Io(
+        std::io::Error::other("busy")
+    )));
+    assert!(retryable_controller_handoff(
+        &PortableControllerError::Lease(ControllerLeaseError::Held)
+    ));
+    assert!(!retryable_controller_handoff(
+        &PortableControllerError::Readiness
+    ));
+    assert!(local_error("detail").to_string().contains("detail"));
+    assert!(
+        local_io(std::io::Error::other("io"))
+            .to_string()
+            .contains("io")
+    );
+}
+
+#[test]
+fn local_recovery_claims_are_exclusive_until_released() {
+    let root = TestDirectory::new("local-recovery-claim-contract");
+    let backend = contract_backend(root.path());
+    let run_id = RunId::new("0199f33f-3b44-7d21-9000-0000000000aa");
+    backend.create_run_storage(&run_id).assert_value();
+    assert_eq!(
+        backend.recovery_path(&run_id).assert_value(),
+        root.path()
+            .join("runs")
+            .join(run_id.as_str())
+            .join(RECOVERY_FILE)
+    );
+    assert!(
+        backend
+            .recovery_workspace_is_unclaimed(&run_id)
+            .assert_value()
+    );
+
+    let claim = backend.claim_recovery_workspace(&run_id).assert_value();
+    assert!(
+        !backend
+            .recovery_workspace_is_unclaimed(&run_id)
+            .assert_value()
+    );
+    drop(claim);
+    assert!(
+        backend
+            .recovery_workspace_is_unclaimed(&run_id)
+            .assert_value()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn local_controller_readiness_reports_exit_and_deadline() {
+    let root = TestDirectory::new("local-controller-readiness");
+    let run_id = RunId::new("0199f33f-3b44-7d21-9000-0000000000bb");
+
+    let exited = PortableControllerPaths::new(root.child("exited"));
+    let mut child = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg("exit 7")
+        .spawn()
+        .assert_value();
+    let error = wait_for_controller(&mut child, &exited, &run_id, Duration::from_secs(30))
+        .await
+        .expect_err("an exited controller never becomes ready");
+    assert!(error.to_string().contains("exited before becoming ready"));
+
+    let waiting = PortableControllerPaths::new(root.child("waiting"));
+    let mut child = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg("sleep 60")
+        .spawn()
+        .assert_value();
+    let error = wait_for_controller(&mut child, &waiting, &run_id, Duration::from_millis(50))
+        .await
+        .expect_err("a live controller must publish readiness before the deadline");
+    assert!(error.to_string().contains("before the deadline"));
+    child.kill().await.assert_value();
+    child.wait().await.assert_value();
 }

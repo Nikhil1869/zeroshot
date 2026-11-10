@@ -35,8 +35,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use openengine_cluster_protocol::RunId;
-use openengine_cluster_protocol::{EnumLabel, FieldName, WorkerErrorCode, WorkerOutcome, WorkerRef};
+use openengine_cluster_protocol::{
+    EnumLabel, FailureDiagnosticKind, FieldName, RunId, WorkerErrorCode, WorkerOutcome, WorkerRef,
+};
 use serde_json::{Map, Value, json};
 
 use crate::native_v2_contract::{
@@ -230,6 +231,9 @@ pub struct NativeV2DeliveryConfig {
     pub adopt_existing_delivery: bool,
     /// Pinned workspace owner for hosted Git; local execution inherits the caller.
     pub git_identity: Option<crate::execution::process::HostedProcessIdentity>,
+    /// Host-selected author and committer of delivered commits; absent keeps
+    /// `Zeroshot <delivery@zeroshot.invalid>`.
+    pub commit_identity: Option<openengine_cluster_protocol::CommitIdentity>,
     pub workspace: PathBuf,
     pub git_program: PathBuf,
     pub target: DeliveryTarget,
@@ -265,6 +269,7 @@ impl NativeV2DeliveryConfig {
             adopt_existing_delivery: lineage.adopt_existing_delivery,
             workspace,
             git_identity: Some(identity),
+            commit_identity: None,
             git_program: PathBuf::from("/usr/bin/git"),
             target,
             poll: DeliveryPollPolicy::default(),
@@ -283,11 +288,69 @@ fn forge_credential<'a>(environment: &'a ResolvedEnvironment, field: &str) -> Op
     (!token.trim().is_empty() && token.len() <= MAX_TOKEN_BYTES).then_some(token)
 }
 
+/// Selects and validates the declared GitHub Git token before trusted local authority.
+pub(crate) fn github_git_token<'a>(
+    environment: &'a ResolvedEnvironment,
+    trusted: Option<&'a str>,
+) -> Result<Option<&'a str>, crate::native_v2_runner::EnvironmentRefreshError> {
+    let name = EnvironmentVariableName::new(GITHUB_TOKEN_ENV)
+        .map_err(|_| crate::native_v2_runner::EnvironmentRefreshError::InvalidResponse)?;
+    environment
+        .get(&name)
+        .or(trusted)
+        .map(|token| {
+            validate_github_delivery_token(token)?;
+            Ok(token)
+        })
+        .transpose()
+}
+
+/// Source-only credentials outrank trusted host credentials and fields on the delivery binding.
+pub(crate) fn resolved_git_credentials(
+    environment: &ResolvedEnvironment,
+    trusted: Option<&openengine_cluster_protocol::GitTransportCredentials>,
+) -> Result<
+    Option<openengine_cluster_protocol::GitTransportCredentials>,
+    crate::native_v2_runner::EnvironmentRefreshError,
+> {
+    if let Some(credentials) = environment.source_git_credentials().or(trusted) {
+        return Ok(Some(credentials.clone()));
+    }
+    git_credentials(environment)
+}
+
+fn git_credentials(
+    environment: &ResolvedEnvironment,
+) -> Result<
+    Option<openengine_cluster_protocol::GitTransportCredentials>,
+    crate::native_v2_runner::EnvironmentRefreshError,
+> {
+    use crate::native_v2_runner::EnvironmentRefreshError;
+    let values: BTreeMap<_, _> = environment
+        .iter()
+        .filter(|(name, _)| {
+            matches!(
+                name.as_str(),
+                "GIT_USERNAME" | "GIT_PASSWORD" | "GIT_SSH_PRIVATE_KEY" | "GIT_SSH_KNOWN_HOSTS"
+            )
+        })
+        .map(|(name, value)| (name.clone(), value.to_owned()))
+        .collect();
+    if values.is_empty() {
+        return Ok(None);
+    }
+    let values = openengine_cluster_protocol::StaticConnectionValues::new(values)
+        .map_err(|_| EnvironmentRefreshError::InvalidResponse)?;
+    openengine_cluster_protocol::GitTransportCredentials::from_connection_values(&values)
+        .map_err(|_| EnvironmentRefreshError::InvalidResponse)
+}
+
 struct DeliveryResult<'a> {
     mode: DeliveryMode,
     outcome: &'a str,
     review: &'a SourceReviewReceipt,
     merge_revision: Option<&'a str>,
+    links: Option<Map<String, Value>>,
 }
 
 fn delivery_outcome(
@@ -433,6 +496,9 @@ fn delivery_result(result: &DeliveryResult<'_>) -> Value {
             Value::String(result.merge_revision.unwrap_or_default().to_owned()),
         );
     }
+    if let Some(links) = &result.links {
+        fields.insert("links".to_owned(), Value::Object(links.clone()));
+    }
     Value::Object(fields)
 }
 
@@ -452,10 +518,15 @@ fn valid_observation(review: &SourceReviewReceipt, observation: &SourceReviewObs
         && observation.head_revision == review.head_revision
 }
 
-fn delivery_branch(run_id: &str) -> String {
+/// Head branch that Git delivery pushes for a delivery run and opens its pull request from.
+///
+/// The branch depends only on the delivery run ID, which recovery successors inherit from the
+/// root attempt, so first delivery, preflight, and every resumed attempt use the same branch.
+#[must_use]
+pub fn delivery_head_branch(delivery_run_id: &RunId) -> String {
     use sha2::{Digest, Sha256};
 
-    let digest = Sha256::digest(run_id.as_bytes());
+    let digest = Sha256::digest(delivery_run_id.as_str().as_bytes());
     let suffix = digest
         .get(..10)
         .unwrap_or(digest.as_slice())

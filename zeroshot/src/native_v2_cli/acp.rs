@@ -13,8 +13,8 @@ use acp::Client as _;
 use async_trait::async_trait;
 use openengine_cluster_protocol::{
     FieldName, GraphNode, IdempotencyKey, PayloadType, RunConnectionValues, RunId, RunProfile,
-    RunProfileName, RunProfileScope, RunProfileSelector, RunSubmission, RunTitle, RuntimeLane,
-    RuntimePlan, SessionScope, TerminalResult,
+    RunProfileName, RunProfileScope, RunProfileSelector, RunSubmission, RunTitle, RuntimePlan,
+    SessionScope, TerminalResult,
 };
 use serde_json::{json, Map, Value};
 use thiserror::Error;
@@ -25,7 +25,7 @@ use crate::native_v2_admission::{DeliveryPolicy, NativeV2Admission, NativeV2Admi
 use crate::native_v2_candidate::{ProviderAccessPlacement, materialize_provider_access};
 use crate::native_v2_cli::local::{create_local_run_storage, local_workspace_lease_path};
 use crate::native_v2_cli::{default_local_state_root, LocalRunProfileStore, NativeV2CliError};
-use crate::native_v2_cloud::{submission_digest, NativeV2CloudError};
+use crate::native_v2_platform::{submission_digest, NativeV2PlatformError};
 use crate::native_v2_contract::NodeRuntimeBinding;
 use crate::native_v2_local::{
     build_local_owner_process_candidate, local_resolved_source, LocalCompositionError,
@@ -63,7 +63,7 @@ pub enum AcpServeError {
     #[error(transparent)]
     Environment(#[from] RunEnvironmentError),
     #[error(transparent)]
-    Cloud(#[from] NativeV2CloudError),
+    Platform(#[from] NativeV2PlatformError),
     #[error(transparent)]
     Ledger(#[from] RunLedgerError),
     #[error(transparent)]
@@ -547,6 +547,7 @@ impl AcpSession {
             )?)
             .await?;
         let runner = build_local_owner_process_candidate(LocalProcessCandidateRequest {
+            memory_storage: None,
             admitted: &admitted,
             delivery_run_id: seed_run_id,
             adopt_existing_delivery: false,
@@ -808,7 +809,7 @@ impl TurnResult {
                 raw_output: output,
                 stop_reason: acp::StopReason::EndTurn,
             }),
-            TerminalResult::Failed { reason } => Ok(Self {
+            TerminalResult::Failed { reason, .. } => Ok(Self {
                 run_id,
                 raw_output: json!({ "failed": reason.as_str() }),
                 message: Some(format!("Zeroshot run failed: {}", reason.as_str())),
@@ -825,7 +826,7 @@ impl TurnResult {
 fn terminal_value(terminal: TerminalResult) -> Value {
     match terminal {
         TerminalResult::Succeeded { output } => output,
-        TerminalResult::Failed { reason } => json!({ "failed": reason.as_str() }),
+        TerminalResult::Failed { reason, .. } => json!({ "failed": reason.as_str() }),
     }
 }
 
@@ -871,16 +872,6 @@ fn submission(
 
 async fn validate_profile(profile: &RunProfile) -> Result<(), AcpServeError> {
     validate_task_type(&profile.graph.initial_input)?;
-    if profile
-        .runtime
-        .lanes()
-        .iter()
-        .any(|lane| matches!(lane, RuntimeLane::Copilot { .. } | RuntimeLane::Pi { .. }))
-    {
-        return Err(AcpServeError::Profile(
-            "only Codex and Claude lanes are supported",
-        ));
-    }
     let mut success_count = 0;
     validate_node(&profile.graph.root, &mut success_count)?;
     if success_count == 0 {

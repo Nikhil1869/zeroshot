@@ -24,7 +24,7 @@ use tokio_tungstenite::tungstenite::http::header::{AUTHORIZATION, HeaderValue};
 
 use super::*;
 use super::private_access::encode_lower;
-use crate::native_v2_cloud::{
+use crate::native_v2_platform::{
     AllocatedCapsule, CapsuleAllocationUnavailable, CapsuleAllocator, CapsuleCleanupUnavailable,
     CapsuleDestroyed, ControllerClaimUnavailable, ExclusiveControllerClaim,
 };
@@ -40,6 +40,12 @@ mod lifecycle;
 
 #[path = "tests/history.rs"]
 mod history;
+
+#[path = "tests/tasks.rs"]
+mod tasks;
+
+#[path = "tests/resume_refusals.rs"]
+mod resume_refusals;
 
 struct Claim;
 impl ExclusiveControllerClaim for Claim {}
@@ -57,9 +63,9 @@ impl CapsuleAllocator for NoAllocation {
 
     async fn allocate(
         &self,
-        request: crate::native_v2_cloud::CapsuleAllocationRequest<'_>,
+        request: crate::native_v2_platform::CapsuleAllocationRequest<'_>,
     ) -> Result<AllocatedCapsule, CapsuleAllocationUnavailable> {
-        let crate::native_v2_cloud::CapsuleAllocationRequest {
+        let crate::native_v2_platform::CapsuleAllocationRequest {
             run_id: _run_id,
             admitted: _admitted,
             github_token: _github_token,
@@ -77,8 +83,8 @@ impl CapsuleAllocator for NoAllocation {
     }
 }
 
-async fn test_controller() -> Result<Arc<NativeV2CloudController>, TargetAuthorityError> {
-    NativeV2CloudController::new(Arc::new(FakeRunLedger::new()), Arc::new(NoAllocation))
+async fn test_controller() -> Result<Arc<NativeV2PlatformController>, TargetAuthorityError> {
+    NativeV2PlatformController::new(Arc::new(FakeRunLedger::new()), Arc::new(NoAllocation))
         .await
         .map(Arc::new)
         .map_err(|error| TargetAuthorityError::unavailable(error.to_string()))
@@ -91,6 +97,7 @@ struct FakeFactory {
     submissions: AtomicUsize,
     active_submissions: AtomicUsize,
     max_active_submissions: AtomicUsize,
+    commit_identities: std::sync::Mutex<Vec<Option<openengine_cluster_protocol::CommitIdentity>>>,
 }
 
 #[async_trait]
@@ -103,14 +110,14 @@ impl TargetControllerFactory for FakeFactory {
         self.workspace_checkpoints
     }
 
-    async fn create(&self) -> Result<Arc<NativeV2CloudController>, TargetAuthorityError> {
+    async fn create(&self) -> Result<Arc<NativeV2PlatformController>, TargetAuthorityError> {
         self.controllers.fetch_add(1, Ordering::SeqCst);
         test_controller().await
     }
 
     async fn submit(
         &self,
-        _controller: &NativeV2CloudController,
+        _controller: &NativeV2PlatformController,
         request: TargetRunRequest,
     ) -> Result<TargetRunReceipt, TargetAuthorityError> {
         let active = self.active_submissions.fetch_add(1, Ordering::SeqCst) + 1;
@@ -119,6 +126,10 @@ impl TargetControllerFactory for FakeFactory {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         self.active_submissions.fetch_sub(1, Ordering::SeqCst);
         self.submissions.fetch_add(1, Ordering::SeqCst);
+        self.commit_identities
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(request.commit_identity);
         Ok(TargetRunReceipt {
             run_id: request.run_id,
         })
@@ -131,13 +142,13 @@ struct RejectingFactory;
 
 #[async_trait]
 impl TargetControllerFactory for RejectingFactory {
-    async fn create(&self) -> Result<Arc<NativeV2CloudController>, TargetAuthorityError> {
+    async fn create(&self) -> Result<Arc<NativeV2PlatformController>, TargetAuthorityError> {
         test_controller().await
     }
 
     async fn submit(
         &self,
-        _controller: &NativeV2CloudController,
+        _controller: &NativeV2PlatformController,
         _request: TargetRunRequest,
     ) -> Result<TargetRunReceipt, TargetAuthorityError> {
         Err(TargetAuthorityError::invalid(
@@ -227,7 +238,10 @@ fn request() -> TargetRunRequest {
             title: RunTitle::new("Target authority test").assert_value(),
             graph: graph_fixture("worker", json!({"kind": "null"})),
             initial_input: Value::Null,
-            runtime: crate::native_v2_candidate::test_support::codex_runtime(BTreeMap::new()),
+            runtime: crate::native_v2_candidate::test_support::codex_runtime(
+                openengine_cluster_protocol::RunSize::Small,
+                BTreeMap::new(),
+            ),
             source: Some(ResolvedSource {
                 repository: SourceRepositoryId::new("owner/repo").assert_value(),
                 branch: SourceBranchId::new("main").assert_value(),
@@ -240,6 +254,7 @@ fn request() -> TargetRunRequest {
         connections: BTreeMap::new(),
         connection_resolver: None,
         github_token: None,
+        commit_identity: None,
         git_credentials: None,
     }
 }
@@ -349,6 +364,59 @@ async fn malformed_and_unknown_http_requests_return_structured_problems() {
     .await
     .assert_problem(404, "request.not_found", "target route was not found");
 
+    task.abort();
+}
+
+#[tokio::test]
+async fn run_admission_rejects_unsafe_commit_identities_before_submission() {
+    let factory = Arc::new(FakeFactory::default());
+    let (address, _, task) = direct_test_server(factory.clone()).await;
+    let bot = crate::native_v2_candidate::test_support::bot_commit_identity();
+    let submit = |identity: Value| {
+        let mut body = serde_json::to_value(request()).assert_value();
+        body["commitIdentity"] = identity;
+        let encoded = serde_json::to_vec(&body).assert_value();
+        async move {
+            http(
+                address,
+                TestHttpRequest::body("POST", RUN_PATH, None, &encoded),
+            )
+            .await
+        }
+    };
+    let oversized = "x".repeat(257);
+    for value in [
+        "",
+        " ",
+        ",;",
+        "bell\u{7}",
+        "line\nbreak",
+        "open<",
+        "close>",
+        oversized.as_str(),
+    ] {
+        for identity in [
+            json!({"name": value, "email": bot.email()}),
+            json!({"name": bot.name(), "email": value}),
+        ] {
+            submit(identity).await.assert_problem(
+                400,
+                "request.invalid",
+                "target run request is malformed",
+            );
+        }
+    }
+    assert_eq!(factory.submissions.load(Ordering::SeqCst), 0);
+
+    let accepted = submit(json!({"name": bot.name(), "email": bot.email()})).await;
+    assert_eq!(accepted.status, 200);
+    assert_eq!(
+        *factory
+            .commit_identities
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        vec![Some(bot)]
+    );
     task.abort();
 }
 
@@ -472,6 +540,7 @@ async fn target_oecp_routes_workspace_recovery_methods_to_the_controller() {
                 connection_resolver: None,
                 github_token: None,
                 git_credentials: None,
+                commit_identity: None,
             })
             .await
             .expect_err("unsupported checkpoint resume must be rejected"),
@@ -494,6 +563,7 @@ async fn target_oecp_routes_workspace_recovery_methods_to_the_controller() {
                 connection_resolver: None,
                 github_token: None,
                 git_credentials: None,
+                commit_identity: None,
             })
             .await
             .expect_err("missing run must be rejected by controller");
@@ -514,6 +584,7 @@ async fn target_oecp_routes_workspace_recovery_methods_to_the_controller() {
             connection_resolver: None,
             github_token: None,
             git_credentials: None,
+            commit_identity: None,
         },
         RunResumeParams {
             run_id: run_id(),
@@ -523,6 +594,7 @@ async fn target_oecp_routes_workspace_recovery_methods_to_the_controller() {
             connection_resolver: None,
             github_token: None,
             git_credentials: None,
+            commit_identity: None,
         },
     ] {
         let error = client
@@ -861,6 +933,7 @@ async fn assert_workspace_recovery(endpoint: &str, bearer: Option<&str>, adverti
                 connection_resolver: None,
                 github_token: None,
                 git_credentials: None,
+                commit_identity: None,
             })
             .await
             .expect_err("missing run must be rejected"),

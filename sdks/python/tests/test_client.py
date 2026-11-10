@@ -16,14 +16,15 @@ from zeroshot import (
     HostedTarget,
     InvalidRequestError,
     LocalTarget,
-    MergePlanRequest,
-    MergePlanRun,
     Preset,
     RunFailedError,
     RunRequest,
     RunResult,
     RuntimePlan,
     RunWaitTimeout,
+    StackDelivery,
+    StackRequest,
+    StackRun,
     TargetError,
     UniformRuntime,
 )
@@ -36,6 +37,27 @@ def runtime() -> UniformRuntime:
         model="gpt-5.6-luna",
         effort="max",
     )
+
+
+def test_uniform_runtime_preserves_memory_controls_without_aliasing() -> None:
+    settings = {"postmortem": {"enabled": False}}
+    selected = UniformRuntime(
+        harness="pi",
+        provider="bedrock",
+        model="caller-model",
+        active_memory={"repository": False, "graph": True, "budgetBytes": 512},
+        global_agents=settings,
+        workspace_checkpoints=False,
+    )
+    encoded = selected.to_dict()
+    assert encoded["activeMemory"] == {"repository": False, "graph": True, "budgetBytes": 512}
+    assert encoded["workspaceCheckpoints"] is False
+    assert encoded["globalAgents"] == settings
+    settings["postmortem"]["enabled"] = True
+    assert encoded["globalAgents"] == {"postmortem": {"enabled": False}}
+    assert "workspaceCheckpoints" not in runtime().to_dict()
+    assert "activeMemory" not in runtime().to_dict()
+    assert "globalAgents" not in runtime().to_dict()
 
 
 def test_uniform_runtime_requires_an_explicit_harness() -> None:
@@ -63,7 +85,7 @@ def test_submission_keeps_opening_folder_after_chdir(
     target = {
         "local": LocalTarget(workspace),
         "direct": DirectTarget("http://127.0.0.1:8080", workspace=workspace),
-        "hosted": HostedTarget("cloud"),
+        "hosted": HostedTarget("platform"),
     }[target_kind]
     monkeypatch.chdir(launcher)
 
@@ -247,9 +269,38 @@ def test_uniform_runtime_encodes_exact_connection_requirements() -> None:
     }
 
 
+def test_uniform_runtime_encodes_model_limits_only_when_set() -> None:
+    selected = UniformRuntime(
+        harness="pi",
+        provider="gateway",
+        model="caller-model",
+        context_window=1_000_000,
+        max_tokens=32_000,
+    )
+
+    encoded = selected.to_dict()
+    assert encoded["contextWindow"] == 1_000_000
+    assert encoded["maxTokens"] == 32_000
+    defaults = runtime().to_dict()
+    assert "contextWindow" not in defaults
+    assert "maxTokens" not in defaults
+
+
 def test_custom_graph_and_runtime_are_forwarded_unchanged(fake_native: Path) -> None:
     graph = {"profile": "openengine.graph.full/v1", "root": {"kind": "succeed"}}
-    runtime_plan = {"harness": "codex", "provider": "openai", "size": "tiny", "nodes": {}}
+    runtime_plan = {
+        "harness": "claude",
+        "provider": "anthropic",
+        "size": "tiny",
+        "nodes": {
+            "writer": {"kind": "agent", "model": "opaque"},
+            "reviewer": {
+                "kind": "agent",
+                "model": "opaque",
+                "harnessConfig": {"args": ["--tools", "Read,Grep,Glob"]},
+            },
+        },
+    }
     request = RunRequest(
         title="Exact request",
         graph=GraphSpec.from_dict(graph),
@@ -304,12 +355,35 @@ def test_presets_are_read_from_executable(fake_native: Path) -> None:
     ] in arguments
 
 
+@pytest.mark.parametrize("delivery", [None, "none", "push", "pull_request", "merge"])
+def test_preset_defaults_are_native_and_explicit_delivery_is_preserved(
+    fake_native: Path, delivery: str | None
+) -> None:
+    async def exercise() -> None:
+        async with Client(
+            preset=Preset("software-change", delivery=delivery), runtime=runtime()
+        ) as client:
+            await client.get_preset("software-change", delivery=delivery)
+            await client.submit("inspect it")
+
+    asyncio.run(exercise())
+    arguments = [item["args"] for item in read_invocations(fake_native)]
+    selected = [
+        item for item in arguments if item[:2] == ["template", "show"] or item[:1] == ["run"]
+    ]
+    assert len(selected) == 3
+    for item in selected:
+        if delivery is None:
+            assert "--delivery" not in item
+        else:
+            assert item[item.index("--delivery") + 1] == delivery
+
+
 def test_preset_can_disable_pull_request_feedback(fake_native: Path) -> None:
     async def exercise() -> None:
         async with Client(
             preset=Preset(
                 "software-change",
-                delivery="pull_request",
                 pull_request_feedback="ignore",
             ),
             runtime=runtime(),
@@ -406,104 +480,111 @@ def test_failed_result_has_opt_in_exception_projection() -> None:
     assert caught.value.result is result
 
 
+@pytest.mark.parametrize("delivery", ["merge", "stacked_pull_requests"])
 @pytest.mark.parametrize("submission_key", ["release-1", ""])
-def test_hosted_plan_submission_uses_one_strict_manifest(
+def test_hosted_stack_submission_uses_one_strict_manifest(
     fake_native: Path,
     submission_key: str,
+    delivery: StackDelivery,
 ) -> None:
-    request = MergePlanRequest(
+    request = StackRequest(
         title="Release",
         repository="owner/repo",
         branch="main",
         profile="org:software-change",
+        delivery=delivery,
         expires_at="2026-09-11T00:00:00Z",
         runs={
-            "build": MergePlanRun(input={"task": "build"}),
-            "integrate": MergePlanRun(input={"task": "integrate"}, needs=("build",)),
+            "build": StackRun(input={"task": "build"}),
+            "integrate": StackRun(input={"task": "integrate"}, needs=("build",)),
         },
         submission_key=submission_key,
     )
 
     async def exercise() -> None:
-        async with Client(target=HostedTarget("cloud")) as client:
-            plan = await client.submit_plan(request)
-            assert plan.id == "01900000-0000-7000-8000-000000000010"
+        async with Client(target=HostedTarget("platform")) as client:
+            stack = await client.submit_stack(request)
+            assert stack.id == "01900000-0000-7000-8000-000000000010"
 
     asyncio.run(exercise())
     invocations = read_invocations(fake_native)
     assert [item["args"][:2] for item in invocations] == [
-        ["plan", "validate"],
-        ["plan", "submit"],
+        ["stack", "validate"],
+        ["stack", "submit"],
     ]
     expected = {
-        "schema": "zeroshot.merge-plan/v1",
+        "schema": "zeroshot.stack/v1",
         "title": "Release",
         "source": {"repository": "owner/repo", "branch": "main"},
         "profile": "org:software-change",
+        "delivery": delivery,
         "expiresAt": "2026-09-11T00:00:00Z",
         "runs": {
             "build": {"input": {"task": "build"}},
             "integrate": {"input": {"task": "integrate"}, "needs": ["build"]},
         },
     }
-    assert all(item["plan"] == expected for item in invocations)
+    assert all(item["stack"] == expected for item in invocations)
     submitted = invocations[1]["args"]
-    assert submitted[submitted.index("--target") + 1] == "cloud"
+    assert submitted[submitted.index("--target") + 1] == "platform"
     assert submitted[submitted.index("--submission-key") + 1] == submission_key
     assert "--detach" in submitted
 
 
-def test_hosted_plan_handle_observes_waits_and_force_stops(fake_native: Path) -> None:
+def test_hosted_stack_handle_observes_waits_and_force_stops(fake_native: Path) -> None:
     async def exercise() -> None:
-        async with Client(target=HostedTarget("cloud")) as client:
-            plan = client.get_plan("01900000-0000-7000-8000-000000000010")
-            status = await plan.status()
+        async with Client(target=HostedTarget("platform")) as client:
+            stack = client.get_stack("01900000-0000-7000-8000-000000000010")
+            status = await stack.status()
+            assert status.stack_id == stack.id
             assert status.state == "queued"
             assert status.runs[0].waiting_reason == "queue_capacity"
-            snapshots = [item async for item in plan.watch()]
+            assert status.runs[0].source_branch is None
+            snapshots = [item async for item in stack.watch()]
             assert [item.state for item in snapshots] == ["running", "succeeded"]
-            terminal = await plan.wait(wait_timeout=2)
+            assert snapshots[0].runs[0].source_branch == "main"
+            terminal = await stack.wait(wait_timeout=2)
             assert terminal.succeeded
-            stopped = await plan.force_stop()
+            stopped = await stack.force_stop()
             assert stopped.state == "cancelled"
 
     asyncio.run(exercise())
     arguments = [item["args"] for item in read_invocations(fake_native)]
-    assert all(args[args.index("--target") + 1] == "cloud" for args in arguments)
-    assert any(args[:2] == ["plan", "status"] for args in arguments)
-    assert any(args[:2] == ["plan", "watch"] for args in arguments)
-    assert any(args[:2] == ["plan", "force-stop"] for args in arguments)
+    assert all(args[args.index("--target") + 1] == "platform" for args in arguments)
+    assert any(args[:2] == ["stack", "status"] for args in arguments)
+    assert any(args[:2] == ["stack", "watch"] for args in arguments)
+    assert any(args[:2] == ["stack", "force-stop"] for args in arguments)
 
 
 @pytest.mark.parametrize("state", ["failed", "cancelled", "expired"])
-def test_hosted_plan_watch_accepts_terminal_status_before_cli_failure(
+def test_hosted_stack_watch_accepts_terminal_status_before_cli_failure(
     fake_native: Path,
     monkeypatch: pytest.MonkeyPatch,
     state: str,
 ) -> None:
-    monkeypatch.setenv("FAKE_PLAN_WATCH_TERMINAL", state)
+    monkeypatch.setenv("FAKE_STACK_WATCH_TERMINAL", state)
 
     async def exercise() -> None:
-        async with Client(target=HostedTarget("cloud")) as client:
-            plan = client.get_plan("01900000-0000-7000-8000-000000000010")
-            statuses = [status.state async for status in plan.watch()]
+        async with Client(target=HostedTarget("platform")) as client:
+            stack = client.get_stack("01900000-0000-7000-8000-000000000010")
+            statuses = [status.state async for status in stack.watch()]
             assert statuses == ["running", state]
 
     asyncio.run(exercise())
 
 
-def test_hosted_plan_watch_propagates_preterminal_cli_failure(
+def test_hosted_stack_watch_propagates_preterminal_cli_failure(
     fake_native: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("FAKE_PLAN_WATCH_FAIL_BEFORE_TERMINAL", "1")
+    monkeypatch.setenv("FAKE_STACK_WATCH_FAIL_BEFORE_TERMINAL", "1")
 
     async def exercise() -> None:
         observed = []
-        async with Client(target=HostedTarget("cloud")) as client:
-            plan = client.get_plan("01900000-0000-7000-8000-000000000010")
+        async with Client(target=HostedTarget("platform")) as client:
+            stack = client.get_stack("01900000-0000-7000-8000-000000000010")
             with pytest.raises(TargetError, match="failed before terminal") as caught:
-                async for status in plan.watch():
+                async for status in stack.watch():
                     observed.append(status.state)
         assert caught.value.exit_code == 1
         assert observed == ["running"]
@@ -511,39 +592,54 @@ def test_hosted_plan_watch_propagates_preterminal_cli_failure(
     asyncio.run(exercise())
 
 
-def test_hosted_plan_watch_propagates_unexpected_failure_after_success(
+def test_hosted_stack_watch_propagates_unexpected_failure_after_success(
     fake_native: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("FAKE_PLAN_WATCH_EXIT_NONZERO", "1")
+    monkeypatch.setenv("FAKE_STACK_WATCH_EXIT_NONZERO", "1")
 
     async def exercise() -> None:
         observed = []
-        async with Client(target=HostedTarget("cloud")) as client:
-            plan = client.get_plan("01900000-0000-7000-8000-000000000010")
-            with pytest.raises(TargetError, match="finished unsuccessfully"):
-                async for status in plan.watch():
+        async with Client(target=HostedTarget("platform")) as client:
+            stack = client.get_stack("01900000-0000-7000-8000-000000000010")
+            with pytest.raises(TargetError, match="stack finished unsuccessfully"):
+                async for status in stack.watch():
                     observed.append(status.state)
         assert observed == ["running", "succeeded"]
 
     asyncio.run(exercise())
 
 
-def test_merge_plan_requires_a_hosted_target(fake_native: Path) -> None:
-    request = MergePlanRequest(
+def test_stack_requires_a_hosted_target(fake_native: Path) -> None:
+    request = StackRequest(
         title="Release",
         repository="owner/repo",
         branch="main",
         profile="org:software-change",
+        delivery="merge",
         expires_at="2026-09-11T00:00:00Z",
-        runs={"build": MergePlanRun(input={"task": "build"})},
+        runs={"build": StackRun(input={"task": "build"})},
     )
 
     async def exercise() -> None:
         async with Client() as client:
+            with pytest.raises(InvalidRequestError, match="stacks require a named hosted target"):
+                await client.submit_stack(request)
             with pytest.raises(InvalidRequestError) as caught:
-                await client.submit_plan(request)
+                client.get_stack("01900000-0000-7000-8000-000000000010")
             assert caught.value.code == "target.hosted_required"
 
     asyncio.run(exercise())
     assert read_invocations(fake_native) == []
+
+
+def test_uniform_runtime_passes_native_configuration_without_shared_mutable_values() -> None:
+    config = {"args": ["--tools", "Read,Grep,Glob"]}
+    selected = UniformRuntime(
+        harness="claude", provider="anthropic", model="opaque", harness_config=config
+    )
+    encoded = selected.to_dict()
+    assert encoded["harnessConfig"] == config
+    config["args"] = ["changed"]
+    assert encoded["harnessConfig"] == {"args": ["--tools", "Read,Grep,Glob"]}
+    assert "harnessConfig" not in runtime().to_dict()

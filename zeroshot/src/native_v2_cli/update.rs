@@ -25,6 +25,12 @@ const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
 const MAX_SKILL_BYTES: usize = 1024 * 1024;
 const MAX_ARCHIVE_BYTES: usize = 256 * 1024 * 1024;
 const SKILL_ASSET: &str = "zeroshot-skill.md";
+const SKILL_ASSETS: [(&str, &str); 4] = [
+    ("zeroshot", SKILL_ASSET),
+    ("zeroshot-memory-init", "zeroshot-memory-init-skill.md"),
+    ("zeroshot-graph-design", "zeroshot-graph-design-skill.md"),
+    ("zeroshot-plan", "zeroshot-plan-skill.md"),
+];
 const RESTIC_VERSION: &str = "0.19.1";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -65,7 +71,7 @@ struct UpdateResult {
 
 struct ReleaseUpdate {
     executables: Option<ReleaseExecutables>,
-    skill: skill::PreparedSkill,
+    skills: Vec<skill::PreparedSkill>,
 }
 
 struct ReleaseExecutables {
@@ -104,7 +110,7 @@ async fn apply_release(
     if let Some(executables) = release.executables {
         install(&executables, latest)?;
     }
-    let skill_updated = release.skill.install()?;
+    let skill_updated = install_skills(&release.skills)?;
     Ok((updated, skill_updated))
 }
 
@@ -178,8 +184,7 @@ async fn download_release_at(
         base_url,
         manifest: &manifest,
     };
-    let skill_contents = release.download(SKILL_ASSET, MAX_SKILL_BYTES).await?;
-    let skill = skill::prepare(skill_contents)?;
+    let skills = download_skills(&release).await?;
     let executables = if latest > current {
         let (target, executable, restic) = release_target()?;
         let filename = format!("zeroshot-v{latest}-{target}.tar.gz");
@@ -197,7 +202,42 @@ async fn download_release_at(
     } else {
         None
     };
-    Ok(ReleaseUpdate { executables, skill })
+    Ok(ReleaseUpdate {
+        executables,
+        skills,
+    })
+}
+
+async fn download_skills(
+    release: &VerifiedRelease<'_>,
+) -> Result<Vec<skill::PreparedSkill>, NativeV2CliError> {
+    if std::env::var_os("ZEROSHOT_SKIP_SKILLS").as_deref() == Some(std::ffi::OsStr::new("1")) {
+        return Ok(Vec::new());
+    }
+    let mut skills = Vec::new();
+    for (name, filename) in SKILL_ASSETS {
+        skills.push(skill::prepare_named(
+            name,
+            release.download(filename, MAX_SKILL_BYTES).await?,
+        )?);
+    }
+    Ok(skills)
+}
+
+fn install_skills(skills: &[skill::PreparedSkill]) -> Result<bool, NativeV2CliError> {
+    let mut changed = false;
+    let mut failures = Vec::new();
+    for skill in skills {
+        match skill.install() {
+            Ok(updated) => changed |= updated,
+            Err(error) => failures.push(error.to_string()),
+        }
+    }
+    if failures.is_empty() {
+        Ok(changed)
+    } else {
+        Err(update_error(failures.join("; ")))
+    }
 }
 
 struct VerifiedRelease<'a> {

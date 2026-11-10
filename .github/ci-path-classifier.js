@@ -4,7 +4,10 @@ const fs = require('node:fs');
 
 const SHARED_PATHS = new Set([
   '.github/ci-path-classifier.js',
+  '.github/select-ci-lanes.sh',
   '.github/workflows/ci.yml',
+  '.github/workflows/coverage.yml',
+  '.github/workflows/opcore.yml',
   '.github/workflows/release.yml',
 ]);
 
@@ -28,6 +31,7 @@ const NPM_PREFIXES = ['npm/zeroshot/'];
 const NPM_PATHS = new Set();
 
 const DOCS_PREFIXES = ['docs/'];
+const README_PATHS = new Set(['README.md']);
 const DOCS_PATHS = new Set([
   '.github/workflows/docs.yml',
   'mkdocs.yml',
@@ -45,20 +49,27 @@ const TOOLING_PATHS = new Set([
   'CHANGELOG.md',
   'CONTRIBUTING.md',
   'PUBLISHING.md',
-  'README.md',
   'commitlint.config.js',
 ]);
 
 const MULTI_LANE_PATHS = new Map([
   ['.github/workflows/release-python.yml', ['python', 'tooling']],
   ['distribution/zeroshot-targets.json', ['native', 'npm']],
+  // stack-manifests.test.js validates the guide's and the zeroshot-plan skill's stack manifests;
+  // native changes, including the stack validator, already select the tooling lane that runs it.
+  ['docs/guides/stacks.md', ['docs', 'tooling']],
   ['docs/reference/cluster/api.md', ['native', 'docs']],
   ['docs/zeroshot-cli.html', ['native', 'docs']],
   ['docs/zeroshot-cli.md', ['native', 'docs']],
   ['eslint.config.mjs', ['tooling', 'npm']],
+  // docs-agent-contract.test.js checks the package's product description and README.
+  ['npm/zeroshot/README.md', ['npm', 'docs']],
+  ['npm/zeroshot/package.json', ['npm', 'docs']],
+  ['npm/zeroshot/skills/zeroshot-plan/SKILL.md', ['npm', 'tooling']],
   ['package-lock.json', ['tooling', 'npm']],
   ['package.json', ['tooling', 'npm']],
   ['scripts/distribution.js', ['native', 'npm']],
+  ['tests/tooling/docs-agent-contract.test.js', ['tooling', 'docs']],
   ['tests/tooling/distribution.test.js', ['npm']],
   ['tests/tooling/npm-package-install.test.js', ['npm']],
   ['tests/tooling/npm-shim.test.js', ['npm']],
@@ -76,6 +87,7 @@ function normalizePath(pathname) {
 }
 
 const SINGLE_LANES = [
+  ['readme', README_PATHS, []],
   ['python', PYTHON_PATHS, PYTHON_PREFIXES],
   ['native', NATIVE_PATHS, NATIVE_PREFIXES],
   ['npm', NPM_PATHS, NPM_PREFIXES],
@@ -112,7 +124,15 @@ function selectsLane(selected, shared, kinds) {
 }
 
 function classifyPaths(paths) {
-  const ownership = { native: [], python: [], tooling: [], npm: [], docs: [], shared: [] };
+  const ownership = {
+    native: [],
+    python: [],
+    tooling: [],
+    npm: [],
+    docs: [],
+    readme: [],
+    shared: [],
+  };
   const selected = new Set();
 
   for (const pathname of paths) {
@@ -122,7 +142,16 @@ function classifyPaths(paths) {
   }
 
   if (selected.size === 0) {
-    return { native: true, python: true, tooling: true, npm: true, docs: true, ownership };
+    return {
+      native: true,
+      python: true,
+      tooling: true,
+      npm: true,
+      docs: true,
+      readme: true,
+      readmeOnly: false,
+      ownership,
+    };
   }
   const shared = selected.has('shared');
   return {
@@ -131,6 +160,8 @@ function classifyPaths(paths) {
     tooling: selectsLane(selected, shared, ['tooling', 'native']),
     npm: selectsLane(selected, shared, ['npm']),
     docs: selectsLane(selected, shared, ['docs', 'python']),
+    readme: selectsLane(selected, shared, ['readme']),
+    readmeOnly: selected.size === 1 && selected.has('readme'),
     ownership,
   };
 }
@@ -144,14 +175,15 @@ function changedPathsFromStdin() {
 
 function main() {
   const result = classifyPaths(changedPathsFromStdin());
-  const { native, python, tooling, npm, docs, shared } = result.ownership;
+  const { native, python, tooling, npm, docs, readme, shared } = result.ownership;
   process.stdout.write(
     `native=${result.native}\npython=${result.python}\ntooling=${result.tooling}\n` +
-      `npm=${result.npm}\ndocs=${result.docs}\n`
+      `npm=${result.npm}\ndocs=${result.docs}\n` +
+      `readme=${result.readme}\nreadme_only=${result.readmeOnly}\n`
   );
   process.stderr.write(
     `CI ownership: native=${native.length}, python=${python.length}, ` +
-      `tooling=${tooling.length}, npm=${npm.length}, docs=${docs.length}, ` +
+      `tooling=${tooling.length}, npm=${npm.length}, docs=${docs.length}, readme=${readme.length}, ` +
       `shared=${shared.length}\n`
   );
 }

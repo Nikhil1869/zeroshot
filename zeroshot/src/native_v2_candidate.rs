@@ -1,6 +1,6 @@
 //! Composition root for the integrated native-v2 capsule candidate.
 //!
-//! The cloud controller owns admission, durability, observation, and runtime allocation. Inside
+//! The platform controller owns admission, durability, observation, and runtime allocation. Inside
 //! one allocated capsule this module binds one agent adapter per runtime lane together with the
 //! trusted Git delivery lane and hands the resulting runner to the private capsule transport.
 
@@ -9,20 +9,21 @@ mod provider_access;
 pub(crate) use provider_access::{ProviderAccessPlacement, materialize_provider_access};
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use openengine_cluster_protocol::GitTransportCredentials;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use thiserror::Error;
 
-use crate::native_v2_claude::{ClaudeAdapter, ClaudeAdapterConfig, ClaudeAdapterConfigError};
-use crate::native_v2_codex::{NativeV2CodexAdapter, NativeV2CodexConfig};
-use crate::native_v2_copilot::{CopilotAdapter, CopilotConfig};
-use crate::native_v2_pi::{PiAdapter, PiAdapterConfigError, PiConfig};
-use crate::native_v2_contract::{
-    AdmittedRun, CopilotProvider, NodeInvocation, NodeRuntimeBinding, RuntimeLane,
+use crate::native_v2_comment_delivery::{
+    NativeV2CommentDeliveryAdapter, NativeV2CommentDeliveryConfig, CommentPublicationStore,
 };
+use crate::source_code_provider::SourceCommentAuthority;
+use crate::source_code_provider::adapters::core::{
+    SourceDeliveryFactoryError, SourceDeliveryFactoryRequest, delivery_authority,
+};
+use crate::native_v2_contract::{AdmittedRun, NodeInvocation, NodeRuntimeBinding, RuntimeLane};
 use crate::native_v2_delivery::validation::TrustedDeliveryValidator;
 use crate::native_v2_delivery::{
     SourceDeliveryAuthority, NativeV2DeliveryAdapter, NativeV2DeliveryConfig,
@@ -33,6 +34,11 @@ use crate::native_v2_runner::{
     ResolvedEnvironment, SessionFactory,
 };
 
+pub(crate) mod decision;
+mod script;
+mod stateless;
+mod timing;
+
 #[cfg(test)]
 #[path = "native_v2_candidate/tests.rs"]
 mod tests;
@@ -40,47 +46,23 @@ mod tests;
 #[cfg(test)]
 pub(crate) mod test_support;
 
-/// Configuration of one lane's agent adapter: a harness and the provider it is fixed to.
-pub enum NativeV2HarnessConfig {
-    Copilot(CopilotConfig),
-    Codex(NativeV2CodexConfig),
-    Claude(ClaudeAdapterConfig),
-    Pi(PiConfig),
-}
+pub use crate::harnesses::HarnessConfig as NativeV2HarnessConfig;
 
-impl NativeV2HarnessConfig {
-    #[must_use]
-    pub fn lane(&self) -> RuntimeLane {
-        match self {
-            Self::Copilot(_) => RuntimeLane::Copilot {
-                provider: CopilotProvider::Github,
-            },
-            Self::Codex(config) => RuntimeLane::Codex {
-                provider: config.provider,
-            },
-            Self::Claude(config) => RuntimeLane::Claude {
-                provider: config.provider,
-            },
-            Self::Pi(config) => RuntimeLane::Pi {
-                provider: config.provider,
-            },
-        }
-    }
-
-    fn workspace(&self) -> &Path {
-        match self {
-            Self::Copilot(config) => &config.workspace,
-            Self::Codex(config) => &config.workspace,
-            Self::Claude(config) => &config.workspace,
-            Self::Pi(config) => &config.workspace,
-        }
-    }
-}
+// Library embedders may supply a host-owned recall capability; storage and orchestration stay internal.
+pub use crate::active_memory::hooks::{ActiveMemoryHooks, ActiveMemorySource, HookQuery};
 
 pub struct NativeV2CandidateConfig {
+    pub active_memory: Option<Arc<ActiveMemoryHooks>>,
     pub lanes: Vec<NativeV2HarnessConfig>,
     pub workspace: PathBuf,
     pub delivery: Option<NativeV2CandidateDelivery>,
+    pub comment_delivery: Option<NativeV2CandidateCommentDelivery>,
+}
+
+pub struct NativeV2CandidateCommentDelivery {
+    pub config: NativeV2CommentDeliveryConfig,
+    pub authority: Arc<dyn SourceCommentAuthority>,
+    pub store: Arc<dyn CommentPublicationStore>,
 }
 
 /// All delivery authority is present together, only when the graph declares delivery.
@@ -88,6 +70,23 @@ pub struct NativeV2CandidateDelivery {
     pub config: NativeV2DeliveryConfig,
     pub authority: Arc<dyn SourceDeliveryAuthority>,
     pub git_credentials: Option<GitTransportCredentials>,
+}
+
+impl NativeV2CandidateDelivery {
+    /// Builds the source authority from `config`, so its commit identity authors both workspace
+    /// commits and every merge the shared transport creates.
+    pub(crate) fn new(
+        config: NativeV2DeliveryConfig,
+        source: SourceDeliveryFactoryRequest<'_>,
+        git_credentials: Option<GitTransportCredentials>,
+    ) -> Result<Self, SourceDeliveryFactoryError> {
+        let authority = delivery_authority(source, config.commit_identity.as_ref())?;
+        Ok(Self {
+            config,
+            authority,
+            git_credentials,
+        })
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -121,10 +120,10 @@ pub enum NativeV2CandidateError {
     RuntimeMismatch,
     #[error("agent and delivery adapters must use the same run workspace")]
     WorkspaceMismatch,
+    #[error("script bindings currently require local execution")]
+    ScriptLocalOnly,
     #[error(transparent)]
-    Claude(#[from] ClaudeAdapterConfigError),
-    #[error(transparent)]
-    Pi(#[from] PiAdapterConfigError),
+    Harness(#[from] crate::harnesses::HarnessError),
     #[error(transparent)]
     Runner(#[from] NodeRunnerError),
 }
@@ -193,12 +192,16 @@ pub fn build_local_native_v2_candidate_with_github_token(
 pub(crate) fn build_local_owner_native_v2_candidate(
     admitted: &AdmittedRun,
     config: NativeV2CandidateConfig,
+    local_git_environment: BTreeMap<String, String>,
 ) -> Result<NativeNodeRunner, NativeV2CandidateError> {
     build_candidate(
         admitted,
         config,
         CandidatePlacement::Local(SessionBoundary::Owner),
-        TrustedDeliveryCapabilities::default(),
+        TrustedDeliveryCapabilities {
+            local_git_environment: Some(local_git_environment),
+            ..Default::default()
+        },
     )
 }
 
@@ -207,6 +210,8 @@ pub(crate) struct TrustedDeliveryCapabilities {
     pub(crate) token: Option<Arc<str>>,
     pub(crate) token_file: Option<TrustedGitHubTokenFile>,
     pub(crate) validator: Option<TrustedDeliveryValidator>,
+    // Private bootstrap context, never part of authored or durable candidate configuration.
+    pub(crate) local_git_environment: Option<BTreeMap<String, String>>,
 }
 
 pub(crate) fn build_local_native_v2_candidate_with_authority(
@@ -229,65 +234,132 @@ fn build_candidate(
     trusted: TrustedDeliveryCapabilities,
 ) -> Result<NativeNodeRunner, NativeV2CandidateError> {
     validate_config(admitted, &config)?;
+    let scripts = if admitted
+        .runtime
+        .nodes()
+        .values()
+        .any(|binding| matches!(binding, NodeRuntimeBinding::Script { .. }))
+    {
+        if !placement.is_local() {
+            return Err(NativeV2CandidateError::ScriptLocalOnly);
+        }
+        Some(script::ScriptAdapter::new(
+            config.workspace.clone(),
+            trusted.local_git_environment.as_ref(),
+        ))
+    } else {
+        None
+    };
     let NativeV2CandidateConfig {
-        lanes, delivery, ..
+        lanes,
+        delivery,
+        active_memory,
+        comment_delivery,
+        ..
     } = config;
+    let source_is_github_com = admitted.source.as_ref().is_some_and(is_github_com_source);
+    let comment_is_github_com = comment_delivery.as_ref().is_some_and(|delivery| {
+        crate::source_code_provider::adapters::core::comment_destination(
+            &delivery.config.expected_url,
+        )
+        .is_ok_and(|destination| {
+            destination.provider.id().as_str()
+                == crate::source_code_provider::adapters::core::GITHUB_PROVIDER_ID
+                && destination.base_url.as_deref() == Some("https://github.com")
+        })
+    });
     let delivery = delivery.map(|delivery| {
         Arc::new(
             NativeV2DeliveryAdapter::new(delivery.config, delivery.authority)
-                .with_trusted_github_token(trusted.token)
-                .with_trusted_github_token_file(trusted.token_file)
+                .with_local_git_environment(
+                    trusted
+                        .local_git_environment
+                        .filter(|_| placement.is_local()),
+                )
+                .with_trusted_github_token(
+                    source_is_github_com
+                        .then(|| trusted.token.clone())
+                        .flatten(),
+                )
+                .with_trusted_github_token_file(
+                    source_is_github_com
+                        .then(|| trusted.token_file.clone())
+                        .flatten(),
+                )
                 .with_trusted_delivery_validator(trusted.validator)
                 .with_git_credentials(delivery.git_credentials),
         )
     });
-    let agents = lane_agents(lanes, placement)?;
-    assemble_runner(admitted, agents, delivery, placement)
+    let agents = lane_agents(lanes, placement, active_memory)?;
+    let comment_delivery = comment_delivery.map(|delivery| {
+        Arc::new(
+            NativeV2CommentDeliveryAdapter::new(
+                delivery.config,
+                delivery.authority,
+                delivery.store,
+            )
+            .with_trusted_github_token(comment_is_github_com.then_some(trusted.token).flatten())
+            .with_trusted_github_token_file(
+                comment_is_github_com
+                    .then_some(trusted.token_file)
+                    .flatten(),
+            ),
+        )
+    });
+    assemble_runner(
+        admitted,
+        agents,
+        CandidateBindings {
+            git: delivery,
+            comment: comment_delivery,
+            scripts,
+        },
+        placement,
+    )
+}
+
+pub(crate) fn is_github_com_source(source: &crate::native_v2_contract::ResolvedSource) -> bool {
+    let Some(remote) = &source.remote else {
+        return true;
+    };
+    remote.forge.as_ref().is_some_and(|forge| {
+        forge.provider.as_str() == crate::source_code_provider::adapters::core::GITHUB_PROVIDER_ID
+            && forge
+                .base_url
+                .as_ref()
+                .is_none_or(|base| base.as_str() == "https://github.com")
+    })
 }
 
 fn lane_agents(
     lanes: Vec<NativeV2HarnessConfig>,
     placement: CandidatePlacement,
+    memory: Option<Arc<crate::active_memory::hooks::ActiveMemoryHooks>>,
 ) -> Result<BTreeMap<RuntimeLane, CandidateAgents>, NativeV2CandidateError> {
     lanes
         .into_iter()
-        .map(|harness| Ok((harness.lane(), build_lane_agents(harness, placement)?)))
+        .map(|harness| {
+            Ok((
+                harness.lane(),
+                build_lane_agents(harness, placement, memory.clone())?,
+            ))
+        })
         .collect()
 }
 
 fn build_lane_agents(
     harness: NativeV2HarnessConfig,
     placement: CandidatePlacement,
+    memory: Option<Arc<crate::active_memory::hooks::ActiveMemoryHooks>>,
 ) -> Result<CandidateAgents, NativeV2CandidateError> {
-    Ok(match harness {
-        NativeV2HarnessConfig::Copilot(config) => {
-            CandidateAgents::new(Arc::new(if placement.is_local() {
-                CopilotAdapter::new_local(config)
-            } else {
-                CopilotAdapter::new(config)
-            }))
-        }
-        NativeV2HarnessConfig::Codex(config) => {
-            CandidateAgents::new(Arc::new(if placement.is_local() {
-                NativeV2CodexAdapter::new_local(config)
-            } else {
-                NativeV2CodexAdapter::new(config)
-            }))
-        }
-        NativeV2HarnessConfig::Claude(config) => {
-            CandidateAgents::new(Arc::new(if placement.is_local() {
-                ClaudeAdapter::new_local(config)?
-            } else {
-                ClaudeAdapter::new(config)?
-            }))
-        }
-        NativeV2HarnessConfig::Pi(config) => {
-            CandidateAgents::new(Arc::new(if placement.is_local() {
-                PiAdapter::new_local(config)?
-            } else {
-                PiAdapter::new(config)?
-            }))
-        }
+    if harness.context.host.is_local() != placement.is_local() {
+        return Err(NativeV2CandidateError::RuntimeMismatch);
+    }
+    let adapter = harness.build(memory.clone())?;
+    Ok(CandidateAgents {
+        driver: adapter.driver,
+        sessions: adapter.sessions,
+        memory,
     })
 }
 
@@ -320,7 +392,14 @@ fn validate_config(
         .nodes()
         .values()
         .any(|binding| matches!(binding, NodeRuntimeBinding::GitDelivery { .. }));
-    if declares_delivery != config.delivery.is_some() {
+    let declares_comment = admitted
+        .runtime
+        .nodes()
+        .values()
+        .any(|binding| matches!(binding, NodeRuntimeBinding::CommentDelivery { .. }));
+    if declares_delivery != config.delivery.is_some()
+        || declares_comment != config.comment_delivery.is_some()
+    {
         return Err(NativeV2CandidateError::RuntimeMismatch);
     }
     Ok(())
@@ -329,13 +408,22 @@ fn validate_config(
 fn assemble_runner(
     admitted: &AdmittedRun,
     agents: BTreeMap<RuntimeLane, CandidateAgents>,
-    delivery: Option<Arc<NativeV2DeliveryAdapter>>,
+    deliveries: CandidateBindings,
     placement: CandidatePlacement,
 ) -> Result<NativeNodeRunner, NativeV2CandidateError> {
     let routes = Arc::new(CandidateNodeLane {
         default_lane: admitted.runtime.lane(),
         agents,
-        delivery,
+        delivery: deliveries.git,
+        comment_delivery: deliveries.comment,
+        scripts: deliveries.scripts,
+        decisions: admitted
+            .runtime
+            .nodes()
+            .values()
+            .any(|binding| matches!(binding, NodeRuntimeBinding::Decision { .. }))
+            .then(crate::native_v2_candidate::decision::DecisionAdapter::new)
+            .transpose()?,
     });
     Ok(match placement.session_boundary() {
         SessionBoundary::Run => NativeNodeRunner::new(admitted, routes.clone(), routes)?,
@@ -345,29 +433,27 @@ fn assemble_runner(
     })
 }
 
+struct CandidateBindings {
+    scripts: Option<script::ScriptAdapter>,
+    git: Option<Arc<NativeV2DeliveryAdapter>>,
+    comment: Option<Arc<NativeV2CommentDeliveryAdapter>>,
+}
+
 struct CandidateAgents {
     driver: Arc<dyn NodeDriver>,
     sessions: Arc<dyn SessionFactory>,
-}
-
-impl CandidateAgents {
-    fn new<T>(agent: Arc<T>) -> Self
-    where
-        T: NodeDriver + SessionFactory + 'static,
-    {
-        Self {
-            driver: agent.clone(),
-            sessions: agent,
-        }
-    }
+    memory: Option<Arc<crate::active_memory::hooks::ActiveMemoryHooks>>,
 }
 
 /// Routes only by the admitted closed binding: agent nodes use their effective lane's adapter,
 /// never another lane's, and the graph-visible delivery verifier uses trusted Git delivery.
 struct CandidateNodeLane {
+    scripts: Option<script::ScriptAdapter>,
+    decisions: Option<crate::native_v2_candidate::decision::DecisionAdapter>,
     default_lane: RuntimeLane,
     agents: BTreeMap<RuntimeLane, CandidateAgents>,
     delivery: Option<Arc<NativeV2DeliveryAdapter>>,
+    comment_delivery: Option<Arc<NativeV2CommentDeliveryAdapter>>,
 }
 
 impl CandidateNodeLane {
@@ -378,11 +464,58 @@ impl CandidateNodeLane {
         match binding {
             NodeRuntimeBinding::Agent { lane, .. } => self
                 .agents
-                .get(&lane.unwrap_or(self.default_lane))
+                .get(&lane.clone().unwrap_or_else(|| self.default_lane.clone()))
                 .ok_or(NodeRunnerError::Driver),
-            NodeRuntimeBinding::GitDelivery { .. } => Err(NodeRunnerError::Driver),
+            NodeRuntimeBinding::Script { .. }
+            | NodeRuntimeBinding::Decision { .. }
+            | NodeRuntimeBinding::GitDelivery { .. }
+            | NodeRuntimeBinding::CommentDelivery { .. } => Err(NodeRunnerError::Driver),
         }
     }
+}
+
+impl CandidateNodeLane {
+    async fn run_agent(
+        &self,
+        invocation: DriverInvocation,
+        control: DriverControl,
+    ) -> Result<openengine_cluster_protocol::WorkerOutcome, NodeRunnerError> {
+        let agents = self.agents_for(&invocation.node.binding)?;
+        let result = agents.driver.run(invocation, control).await;
+        if result.is_err()
+            || matches!(
+                result,
+                Ok(openengine_cluster_protocol::WorkerOutcome::Error { .. })
+            )
+        {
+            if let Some(memory) = &agents.memory {
+                memory.execution_failed();
+            }
+        }
+        result
+    }
+}
+
+async fn open_binding<T: SessionFactory>(
+    adapter: Option<&T>,
+    invocation: &NodeInvocation,
+    environment: &ResolvedEnvironment,
+) -> Result<Arc<dyn NodeSession>, NodeRunnerError> {
+    adapter
+        .ok_or(NodeRunnerError::Driver)?
+        .open(invocation, environment)
+        .await
+}
+
+async fn run_binding<T: NodeDriver>(
+    adapter: Option<&T>,
+    invocation: DriverInvocation,
+    control: DriverControl,
+) -> Result<openengine_cluster_protocol::WorkerOutcome, NodeRunnerError> {
+    adapter
+        .ok_or(NodeRunnerError::Driver)?
+        .run(invocation, control)
+        .await
 }
 
 #[async_trait]
@@ -399,12 +532,17 @@ impl SessionFactory for CandidateNodeLane {
                     .open(invocation, environment)
                     .await
             }
+            NodeRuntimeBinding::Script { .. } => {
+                open_binding(self.scripts.as_ref(), invocation, environment).await
+            }
+            NodeRuntimeBinding::Decision { .. } => {
+                open_binding(self.decisions.as_ref(), invocation, environment).await
+            }
+            NodeRuntimeBinding::CommentDelivery { .. } => {
+                open_binding(self.comment_delivery.as_deref(), invocation, environment).await
+            }
             NodeRuntimeBinding::GitDelivery { .. } => {
-                self.delivery
-                    .as_ref()
-                    .ok_or(NodeRunnerError::Driver)?
-                    .open(invocation, environment)
-                    .await
+                open_binding(self.delivery.as_deref(), invocation, environment).await
             }
         }
     }
@@ -418,16 +556,18 @@ impl NodeDriver for CandidateNodeLane {
         control: DriverControl,
     ) -> Result<openengine_cluster_protocol::WorkerOutcome, NodeRunnerError> {
         match &invocation.node.binding {
-            NodeRuntimeBinding::Agent { .. } => {
-                let agents = self.agents_for(&invocation.node.binding)?;
-                agents.driver.run(invocation, control).await
+            NodeRuntimeBinding::Agent { .. } => self.run_agent(invocation, control).await,
+            NodeRuntimeBinding::Script { .. } => {
+                run_binding(self.scripts.as_ref(), invocation, control).await
+            }
+            NodeRuntimeBinding::Decision { .. } => {
+                run_binding(self.decisions.as_ref(), invocation, control).await
+            }
+            NodeRuntimeBinding::CommentDelivery { .. } => {
+                run_binding(self.comment_delivery.as_deref(), invocation, control).await
             }
             NodeRuntimeBinding::GitDelivery { .. } => {
-                self.delivery
-                    .as_ref()
-                    .ok_or(NodeRunnerError::Driver)?
-                    .run(invocation, control)
-                    .await
+                run_binding(self.delivery.as_deref(), invocation, control).await
             }
         }
     }

@@ -1,9 +1,7 @@
 //! One supervised Git transport for source admission, checkout, and exact-SHA publication.
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
-use std::path::PathBuf;
-#[cfg(test)]
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::Command;
@@ -12,12 +10,16 @@ use crate::execution::process::HostedProcessIdentity;
 use crate::native_v2_target_authority::{NewOperatorDiagnostic, OperatorDiagnosticStore};
 use crate::source_code_provider::{SourceDeliveryCredential, SourceDeliveryError, valid_git_revision};
 use super::command::{
-    GitCommandFailure, GitCommandOutput, capture_sensitive, local_git_command_with_identity,
+    GitCommandContext, GitCommandFailure, GitCommandOutput, capture_sensitive, git_command,
 };
 
 mod authentication;
+mod conflict;
 mod materialization;
 mod reconcile;
+mod target;
+pub(crate) use target::reconcile_target;
+pub(crate) use conflict::materialize_conflict;
 pub(crate) use materialization::GitMaterializationTarget;
 pub(crate) use reconcile::reconcile as reconcile_head;
 use authentication::GitAuthentication;
@@ -56,6 +58,8 @@ impl std::fmt::Debug for GitTransportConfig {
 pub struct GitTransport {
     config: Arc<GitTransportConfig>,
     remote: OsString,
+    commit_identity: Option<openengine_cluster_protocol::CommitIdentity>,
+    checkout_references: Vec<String>,
     diagnostics: Option<(
         openengine_cluster_protocol::RunId,
         Arc<OperatorDiagnosticStore>,
@@ -73,8 +77,24 @@ impl GitTransport {
         Self {
             config: Arc::new(config),
             remote: remote.as_ref().to_owned(),
+            commit_identity: None,
+            checkout_references: Vec::new(),
             diagnostics: None,
         }
+    }
+
+    /// Selects the author and committer of every commit this transport's workspace Git creates.
+    #[must_use]
+    pub(crate) fn with_commit_identity(
+        mut self,
+        identity: Option<openengine_cluster_protocol::CommitIdentity>,
+    ) -> Self {
+        self.commit_identity = identity;
+        self
+    }
+
+    pub(crate) fn commit_identity(&self) -> Option<&openengine_cluster_protocol::CommitIdentity> {
+        self.commit_identity.as_ref()
     }
 
     #[must_use]
@@ -85,6 +105,21 @@ impl GitTransport {
     ) -> Self {
         self.diagnostics = Some((run_id, store));
         self
+    }
+
+    pub(crate) fn with_checkout_references(
+        mut self,
+        references: Vec<String>,
+    ) -> Result<Self, SourceDeliveryError> {
+        if references.len() > 2
+            || references
+                .iter()
+                .any(|reference| !valid_checkout_reference(reference))
+        {
+            return Err(SourceDeliveryError::Rejected);
+        }
+        self.checkout_references = references;
+        Ok(self)
     }
 
     #[must_use]
@@ -195,6 +230,35 @@ impl GitTransport {
     ) -> Result<(), SourceDeliveryError> {
         let CheckoutRequest { branch, revision } = source;
         require_identity(branch, revision)?;
+        self.initialize_checkout(revision, credential, deadline)
+            .await?;
+        let branch_ref = format!("refs/heads/{branch}");
+        let mut references = vec!["fetch", "--no-tags", "--", "origin", &branch_ref, revision];
+        references.extend(self.checkout_references.iter().map(String::as_str));
+        self.success_before(&references, credential, deadline)
+            .await?;
+        self.retain_review_base(&self.checkout_references, credential, deadline)
+            .await?;
+        self.success_before(&["checkout", "--detach", revision], credential, deadline)
+            .await?;
+        let head = self
+            .success_before(&["rev-parse", "HEAD"], credential, deadline)
+            .await?;
+        if head.stdout_truncated() || head.stdout().trim() != revision {
+            return Err(SourceDeliveryError::identity(format!(
+                "checkout revision mismatch: expected {revision}, observed {}",
+                head.diagnostic().stdout.trim()
+            )));
+        }
+        Ok(())
+    }
+
+    async fn initialize_checkout(
+        &self,
+        revision: &str,
+        credential: SourceDeliveryCredential<'_>,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), SourceDeliveryError> {
         self.success_before(
             &["init", "--quiet", object_format(revision)],
             credential,
@@ -212,29 +276,46 @@ impl GitTransport {
             deadline,
         )
         .await?;
-        self.success_before(
-            &[
-                "fetch",
-                "--no-tags",
-                "--",
-                "origin",
-                &format!("refs/heads/{branch}"),
-                revision,
-            ],
-            credential,
-            deadline,
-        )
-        .await?;
-        self.success_before(&["checkout", "--detach", revision], credential, deadline)
+        Ok(())
+    }
+
+    pub(crate) async fn fetch_review_references(
+        &self,
+        references: &[String],
+        credential: SourceDeliveryCredential<'_>,
+    ) -> Result<(), SourceDeliveryError> {
+        if references.len() > 2
+            || references
+                .iter()
+                .any(|reference| !valid_checkout_reference(reference))
+        {
+            return Err(SourceDeliveryError::Rejected);
+        }
+        let deadline = tokio::time::Instant::now() + self.config.deadline;
+        let remote = self.remote.to_str().ok_or(SourceDeliveryError::Rejected)?;
+        let mut args = vec!["fetch", "--no-tags", "--", remote];
+        args.extend(references.iter().map(String::as_str));
+        self.success_before(&args, credential, deadline).await?;
+        self.retain_review_base(references, credential, deadline)
+            .await
+    }
+
+    async fn retain_review_base(
+        &self,
+        references: &[String],
+        credential: SourceDeliveryCredential<'_>,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), SourceDeliveryError> {
+        if let Some(revision) = references
+            .iter()
+            .find(|reference| super::valid_revision(reference))
+        {
+            self.success_before(
+                &["update-ref", "refs/zeroshot/review/base", revision],
+                credential,
+                deadline,
+            )
             .await?;
-        let head = self
-            .success_before(&["rev-parse", "HEAD"], credential, deadline)
-            .await?;
-        if head.stdout_truncated() || head.stdout().trim() != revision {
-            return Err(SourceDeliveryError::identity(format!(
-                "checkout revision mismatch: expected {revision}, observed {}",
-                head.diagnostic().stdout.trim()
-            )));
         }
         Ok(())
     }
@@ -321,7 +402,7 @@ impl GitTransport {
         credential: SourceDeliveryCredential<'_>,
         deadline: Duration,
     ) -> Result<GitCommandOutput, GitCommandFailure> {
-        let mut command = self.command();
+        let mut command = self.command(&self.config.workspace);
         let authentication = GitAuthentication::prepare(&self.config, &self.remote, credential)
             .map_err(|error| super::command::preparation_failure(&command, error))?;
         if arguments.first().is_some_and(|operation| {
@@ -336,31 +417,25 @@ impl GitTransport {
     pub(crate) fn workspace_git(&self) -> super::git::SystemGit {
         super::git::SystemGit::new(self.config.git_program.clone())
             .with_identity(self.config.identity)
+            .with_local_environment(self.config.local_environment.clone())
+            .with_commit_identity(self.commit_identity.clone())
     }
 
-    fn command(&self) -> Command {
-        let mut command = local_git_command_with_identity(
+    pub(crate) fn command(&self, workspace: &Path) -> Command {
+        let mut command = git_command(
             &self.config.git_program,
-            &self.config.workspace,
-            self.config.identity,
+            workspace,
+            GitCommandContext {
+                identity: self.config.identity,
+                local_environment: self.config.local_environment.as_ref(),
+                commit_identity: self.commit_identity.as_ref(),
+            },
         );
-        if let Some(environment) = &self.config.local_environment {
-            command.envs(environment);
-            for variable in ["GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL"] {
-                if !environment.contains_key(variable) {
-                    command.env_remove(variable);
-                }
-            }
-        } else {
+        if self.config.local_environment.is_none() {
             command
                 .env("HOME", &self.config.home_directory)
                 .env("PATH", "/usr/bin:/bin");
         }
-        remove_repository_environment(command.as_std_mut());
-        command
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GCM_INTERACTIVE", "never")
-            .env("SSH_ASKPASS_REQUIRE", "never");
         command
     }
 
@@ -445,20 +520,17 @@ pub(crate) const fn object_format(revision: &str) -> &'static str {
     }
 }
 
-/// Repository-selection controls never override an engine-selected workspace. Native Git
-/// configuration and authentication settings continue to apply inside that workspace.
-pub(crate) fn remove_repository_environment(command: &mut std::process::Command) {
-    for variable in [
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_COMMON_DIR",
-        "GIT_INDEX_FILE",
-        "GIT_OBJECT_DIRECTORY",
-        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-        "GIT_CEILING_DIRECTORIES",
-        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
-        "GIT_NAMESPACE",
-    ] {
-        command.env_remove(variable);
+fn valid_checkout_reference(value: &str) -> bool {
+    if super::valid_revision(value) {
+        return true;
     }
+    value
+        .strip_prefix("refs/pull/")
+        .and_then(|value| value.strip_suffix("/head"))
+        .is_some_and(|number| {
+            !number.starts_with('0')
+                && !number.is_empty()
+                && number.len() <= 20
+                && number.bytes().all(|byte| byte.is_ascii_digit())
+        })
 }

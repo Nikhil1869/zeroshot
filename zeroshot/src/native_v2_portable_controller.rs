@@ -29,7 +29,8 @@ pub(crate) use lease::workspace_lease_path;
 pub use process::{load_bootstrap_file, read_ready, wait_ready, write_bootstrap_file};
 pub use process::{
     PortableControllerServer, PortableControllerTransport, connect_transport,
-    guard_controller_process, run_controller_process,
+    guard_controller_process, record_unloaded_startup_failure, run_controller_process,
+    take_startup_failure,
 };
 
 #[cfg(test)]
@@ -87,6 +88,12 @@ impl PortableControllerPaths {
         self.storage.join("controller.ready.json")
     }
 
+    /// Bounded reason a controller exited before readiness; the waiting CLI consumes it.
+    #[must_use]
+    pub fn startup_failure(&self) -> PathBuf {
+        self.storage.join("controller.startup-failure.txt")
+    }
+
     #[must_use]
     pub fn ledger(&self) -> PathBuf {
         self.storage.join("runs.sqlite3")
@@ -123,6 +130,8 @@ pub struct PortableControllerBootstrap {
     pub workspace: PathBuf,
     pub workspace_lease: PathBuf,
     pub checkpoint_repository: PathBuf,
+    /// Host-owned shared memory; omitted by embedders that have not configured a namespace.
+    pub memory_storage: Option<PathBuf>,
     pub storage: PathBuf,
     pub delivery_policy: DeliveryPolicy,
 }
@@ -181,6 +190,8 @@ pub enum PortableControllerError {
     Readiness,
     #[error("portable controller durable identity does not match bootstrap")]
     DurableIdentity,
+    #[error("workspace checkpoint restore is unavailable because workspaceCheckpoints is false")]
+    CheckpointsDisabled,
     #[error("portable runtime could not be constructed")]
     RuntimeUnavailable,
     #[error("portable controller could not install its console control guard")]
@@ -194,7 +205,7 @@ pub enum PortableControllerError {
     #[error(transparent)]
     Ledger(#[from] crate::v2_run_ledger::RunLedgerError),
     #[error(transparent)]
-    Controller(#[from] crate::native_v2_cloud::NativeV2CloudError),
+    Controller(#[from] crate::native_v2_platform::NativeV2PlatformError),
     #[error("portable controller I/O failed")]
     Io(#[source] io::Error),
 }

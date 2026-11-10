@@ -10,8 +10,9 @@ use std::fmt;
 
 use async_trait::async_trait;
 use openengine_cluster_protocol::{
-    Cursor, IdempotencyKey, Phase, PositiveInteger, RunId, RunSize, RunTitle, Sha256Digest,
-    ResolvedSource, TerminalResult, TokenUsage, UnixTimestampMillis, WorkerOutcome,
+    Cursor, FailureContext, FailureDiagnosticKind, IdempotencyKey, Phase, PositiveInteger, RunId,
+    RunSize, RunTitle, Sha256Digest, ResolvedSource, TerminalResult, TokenUsage,
+    UnixTimestampMillis, WorkerOutcome,
 };
 use serde::de;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -28,7 +29,10 @@ pub mod sqlite;
 #[path = "v2_run_ledger/state.rs"]
 mod state;
 
-pub(crate) use state::{apply_event, cursor_for, cursor_sequence, initial_cursor, validate_create};
+pub(crate) use state::{
+    apply_event, cursor_for, cursor_sequence, initial_cursor, prepare_event, validate_create,
+    validate_event,
+};
 
 pub const INITIAL_CURSOR: &str = "v2:0";
 pub const MAX_ADMITTED_RUN_BYTES: usize = 2 * 1024 * 1024;
@@ -109,43 +113,87 @@ pub struct RunSnapshot {
     pub executions: BTreeMap<ExecutionId, NodeSnapshot>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub execution_seed: Vec<crate::full_v1_reducer::DurableExecution>,
+    /// The delivery-checked main outcome is durable before optional run-global work starts.
+    /// This does not make the run terminal: cleanup and any auxiliary usage still precede that.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_graph: Option<PrimaryGraphCompletion>,
     pub terminal: Option<TerminalResult>,
     pub token_usage: Option<TokenUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_context: Option<Box<FailureContext>>,
 }
 
 impl RunSnapshot {
     #[must_use]
     pub fn admitted(run_id: RunId, admitted: &AdmittedRun) -> Self {
+        Self::empty(
+            run_id,
+            admitted.title.clone(),
+            admitted.source.clone(),
+            admitted.runtime.size(),
+        )
+    }
+
+    /// Returns immutable metadata and the empty projection used to replay durable events.
+    #[must_use]
+    pub fn replay_seed(&self) -> Self {
+        Self::empty(
+            self.run_id.clone(),
+            self.title.clone(),
+            self.source.clone(),
+            self.size,
+        )
+    }
+
+    fn empty(
+        run_id: RunId,
+        title: RunTitle,
+        source: Option<ResolvedSource>,
+        size: RunSize,
+    ) -> Self {
         Self {
             run_id,
-            title: admitted.title.clone(),
-            source: admitted.source.clone(),
-            size: admitted.runtime.size(),
+            title,
+            source,
+            size,
             cursor: initial_cursor(),
             phase: RunPhase::Admitted,
             force_stop_requested: false,
             executions: BTreeMap::new(),
             execution_seed: Vec::new(),
+            primary_graph: None,
             terminal: None,
             token_usage: None,
+            failure_context: None,
         }
     }
 
-    /// Returns the immutable metadata and empty projection used to replay durable events.
-    #[must_use]
-    pub fn replay_seed(&self) -> Self {
-        Self {
-            run_id: self.run_id.clone(),
-            title: self.title.clone(),
-            source: self.source.clone(),
-            size: self.size,
-            cursor: initial_cursor(),
-            phase: RunPhase::Admitted,
-            force_stop_requested: false,
-            executions: BTreeMap::new(),
-            execution_seed: Vec::new(),
-            terminal: None,
-            token_usage: None,
+    pub(crate) fn delivery_receipt(&self) -> Option<Value> {
+        let execution = self.primary_graph.as_ref()?.delivery_execution?;
+        self.execution_output(execution).cloned()
+    }
+
+    fn execution_output(&self, execution: ExecutionId) -> Option<&Value> {
+        let outcome = if let Some(node) = self.executions.get(&execution) {
+            let NodeState::Completed { outcome, .. } = &node.state else {
+                return None;
+            };
+            outcome
+        } else {
+            let prior = self
+                .execution_seed
+                .iter()
+                .find(|prior| prior.execution == execution)?;
+            let crate::full_v1_reducer::DurableExecutionState::Settled { outcome, .. } =
+                &prior.state
+            else {
+                return None;
+            };
+            outcome
+        };
+        match outcome {
+            WorkerOutcome::Verifier { output, .. } => Some(output),
+            _ => None,
         }
     }
 
@@ -158,6 +206,16 @@ impl RunSnapshot {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct PrimaryGraphCompletion {
+    pub result: TerminalResult,
+    /// Until terminal finalization, a controller crash may hide unreported auxiliary usage.
+    pub auxiliary_pending: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_execution: Option<ExecutionId>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct NodeSnapshot {
     pub reference: ExecutionRef,
     pub occurrence: StructuralOccurrence,
@@ -165,6 +223,8 @@ pub struct NodeSnapshot {
     pub input: Value,
     pub started_at: Cursor,
     pub state: NodeState,
+    #[serde(default)]
+    pub failure_diagnostic: bool,
 }
 
 impl NodeSnapshot {
@@ -217,10 +277,23 @@ pub enum RunEvent {
         timestamp: UnixTimestampMillis,
         stream: SafeLogStream,
         line: SafeLogLine,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        diagnostic: Option<FailureDiagnosticKind>,
     },
     TokenUsageObserved {
         execution: ExecutionId,
         usage: Option<TokenUsageDelta>,
+    },
+    /// Provider usage from a run-global agent, outside reducer execution history.
+    RunTokenUsageObserved {
+        usage: Option<TokenUsageDelta>,
+    },
+    /// Irrevocable main outcome, separate from optional global work and runtime cleanup.
+    PrimaryGraphCompleted {
+        result: TerminalResult,
+        auxiliary_pending: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delivery_execution: Option<ExecutionId>,
     },
     ForceStopRequested,
     Terminal {

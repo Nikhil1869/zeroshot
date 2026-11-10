@@ -237,40 +237,82 @@ fn ui_defaults_to_local_history_and_accepts_a_named_target() {
 }
 
 #[test]
-fn parser_exposes_the_closed_hosted_plan_surface() {
+fn parser_exposes_the_closed_hosted_stack_surface() {
+    let validate = parse_native_v2_args(args(&["stack", "validate", "stack.json"])).assert_value();
+    assert!(matches!(
+        validate,
+        NativeV2CliCommand::StackValidate { file } if file == Path::new("stack.json")
+    ));
+
     let submit = parse_native_v2_args(args(&[
-        "plan",
+        "stack",
         "submit",
-        "plan.json",
+        "stack.json",
         "--target",
         "prod",
         "--submission-key",
-        "plan-retry-1",
+        "stack-retry-1",
         "--detach",
     ]))
     .assert_value();
-    let NativeV2CliCommand::PlanSubmit(submit) = submit else {
-        panic!("expected plan submit command");
+    let NativeV2CliCommand::StackSubmit(submit) = submit else {
+        panic!("expected stack submit command");
     };
-    assert_eq!(submit.file, PathBuf::from("plan.json"));
+    assert_eq!(submit.file, PathBuf::from("stack.json"));
     assert_eq!(submit.target, "prod");
-    assert_eq!(submit.submission_key.as_str(), "plan-retry-1");
+    assert_eq!(submit.submission_key.as_str(), "stack-retry-1");
     assert!(submit.detach);
 
-    let status = parse_native_v2_args(args(&["plan", "status", "plan-7", "--target", "prod"]))
-        .assert_value();
-    assert!(matches!(
-        status,
-        NativeV2CliCommand::PlanStatus(MergePlanSelector { target, plan_id })
-            if target == "prod" && plan_id.as_str() == "plan-7"
-    ));
+    for operation in ["status", "watch", "force-stop"] {
+        let command =
+            parse_native_v2_args(args(&["stack", operation, "stack-7", "--target", "prod"]))
+                .assert_value();
+        let selector = match (operation, command) {
+            ("status", NativeV2CliCommand::StackStatus(selector))
+            | ("watch", NativeV2CliCommand::StackWatch(selector))
+            | ("force-stop", NativeV2CliCommand::StackForceStop(selector)) => selector,
+            (operation, _) => panic!("unexpected command for stack {operation}"),
+        };
+        assert_eq!(
+            selector,
+            StackSelector {
+                target: "prod".to_owned(),
+                stack_id: openengine_cluster_protocol::StackId::new("stack-7"),
+            }
+        );
+    }
 
     for invalid in [
-        &["plan", "submit", "plan.json", "--target", "prod"][..],
-        &["plan", "submit", "plan.json", "--submission-key", "key"][..],
-        &["plan", "watch", "plan-7"][..],
+        &["stack", "submit", "stack.json", "--target", "prod"][..],
+        &["stack", "submit", "stack.json", "--submission-key", "key"][..],
+        &["stack", "watch", "stack-7"][..],
+        &["stack", "status", "", "--target", "prod"][..],
     ] {
         assert!(parse_native_v2_args(args(invalid)).is_err());
+    }
+}
+
+#[test]
+fn parser_no_longer_accepts_the_retired_plan_command() {
+    for retired in [
+        &["plan", "validate", "plan.json"][..],
+        &[
+            "plan",
+            "submit",
+            "plan.json",
+            "--target",
+            "prod",
+            "--submission-key",
+            "key",
+        ][..],
+        &["plan", "status", "plan-7", "--target", "prod"][..],
+        &["plan", "watch", "plan-7", "--target", "prod"][..],
+        &["plan", "force-stop", "plan-7", "--target", "prod"][..],
+    ] {
+        assert!(
+            parse_native_v2_args(args(retired)).is_err(),
+            "{retired:?} must be rejected"
+        );
     }
 }
 
@@ -451,7 +493,6 @@ fn explicit_template_delivery_is_parsed_and_validated_by_rust() {
         "Repair checkout",
         "--template",
         "software-change",
-        "--pr",
         "--no-pr-feedback",
         "--input",
         "input.json",
@@ -479,7 +520,11 @@ fn explicit_template_delivery_is_parsed_and_validated_by_rust() {
         "--no-pr-feedback",
     ]))
     .assert_error();
-    assert!(error.to_string().contains("requires --pr or --ship"));
+    assert!(
+        error
+            .to_string()
+            .contains("requires pull-request or merge delivery")
+    );
 }
 
 #[test]
@@ -554,6 +599,7 @@ fn parser_exposes_the_builtin_templates_and_closed_delivery_choice() {
         NativeV2CliCommand::TemplateShow {
             template: BuiltinGraphTemplate::SoftwareChange,
             delivery: TemplateDelivery::Merge,
+            json: false,
         }
     );
     assert_eq!(
@@ -561,6 +607,7 @@ fn parser_exposes_the_builtin_templates_and_closed_delivery_choice() {
         NativeV2CliCommand::TemplateShow {
             template: BuiltinGraphTemplate::AutoResearch,
             delivery: TemplateDelivery::Push,
+            json: false,
         }
     );
     assert!(parse_native_v2_args(args(&["template", "show", "auto-research", "--pr"])).is_err());
@@ -819,7 +866,7 @@ fn target_add_requires_an_explicit_direct_flag() {
     let hosted = parse_native_v2_args(args(&[
         "target",
         "add",
-        "cloud",
+        "platform",
         "--url",
         "https://target.example",
     ]))
@@ -951,4 +998,51 @@ fn repository_overrides_use_transport_bounds_and_reject_credential_bearing_locat
         assert!(!error.contains("canary"));
     }
     assert!(parse(&format!("{prefix}{}", "r".repeat(2049 - prefix.len()))).is_err());
+}
+
+#[test]
+fn source_instance_flags_preserve_opaque_provider_and_require_a_canonical_pair() {
+    let parse = |flags: &[&str]| {
+        let mut arguments = vec![
+            "run",
+            "--title",
+            "Instance selection",
+            "--input",
+            "input.json",
+            "--profile",
+            "local:worker",
+        ];
+        arguments.extend_from_slice(flags);
+        parse_native_v2_args(args(&arguments))
+    };
+    let run = run_command(
+        parse(&[
+            "--source-provider",
+            "source.future",
+            "--source-base-url",
+            "https://forge.example.test/git",
+        ])
+        .assert_value(),
+    );
+    let selected = run.source_forge.assert_value();
+    assert_eq!(selected.provider.as_str(), "source.future");
+    assert_eq!(selected.base_url.as_str(), "https://forge.example.test/git");
+    for flags in [
+        &["--source-provider", "source.github"][..],
+        &["--source-base-url", "https://forge.example.test"][..],
+        &[
+            "--source-provider",
+            "source.gitlab",
+            "--source-base-url",
+            "http://forge.example.test",
+        ][..],
+        &[
+            "--source-provider",
+            "source.gitlab",
+            "--source-base-url",
+            "https://forge.example.test/",
+        ][..],
+    ] {
+        assert!(parse(flags).is_err());
+    }
 }

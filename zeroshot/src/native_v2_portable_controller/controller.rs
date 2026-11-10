@@ -12,10 +12,10 @@ use openengine_cluster_server::BackendError;
 use tokio::sync::{Mutex, watch};
 
 use crate::native_v2_admission::NativeV2Admission;
-use crate::native_v2_cloud::{
+use crate::native_v2_platform::{
     AllocatedCapsule, CapsuleAllocationUnavailable, CapsuleAllocator, CapsuleCleanup,
     CapsuleCleanupUnavailable, CapsuleDestroyed, ControllerClaimUnavailable,
-    ExclusiveControllerClaim, NativeV2CloudController,
+    ExclusiveControllerClaim, NativeV2PlatformController,
 };
 use crate::native_v2_contract::AdmittedRun;
 use crate::native_v2_supervisor::{RunEnvironment, RunRuntimeExit};
@@ -37,7 +37,7 @@ const WORKSPACE_MONITOR_INTERVAL: Duration = Duration::from_millis(100);
 #[derive(Clone)]
 pub struct PortableRunController {
     run_id: RunId,
-    pub(super) inner: Arc<NativeV2CloudController>,
+    pub(super) inner: Arc<NativeV2PlatformController>,
     paths: PortableControllerPaths,
     _lease: Arc<ControllerLease>,
     _workspace_lease: Option<Arc<ControllerLease>>,
@@ -90,7 +90,11 @@ impl PortableRunController {
             lease.clone(),
             paths.storage().join("checkpoints"),
         ));
-        let inner = Arc::new(NativeV2CloudController::new(ledger, allocator).await?);
+        let inner = Arc::new(
+            NativeV2PlatformController::new(ledger, allocator)
+                .await?
+                .with_harness_registry(crate::harnesses::HarnessRegistry::local()),
+        );
         Ok(Self {
             run_id,
             inner,
@@ -117,12 +121,13 @@ impl PortableRunController {
             prepared.paths.storage().join("checkpoints"),
         ));
         let inner = Arc::new(
-            NativeV2CloudController::new_with_delivery_policy(
+            NativeV2PlatformController::new_with_delivery_policy(
                 prepared.ledger,
                 allocator.clone(),
                 bootstrap.delivery_policy,
             )
-            .await?,
+            .await?
+            .with_harness_registry(crate::harnesses::HarnessRegistry::local()),
         );
         let receipt = inner
             .submit_with_exact_environment(
@@ -300,36 +305,58 @@ where
     if !workspace_identity.is_current(&bootstrap.workspace) {
         return Err(PortableControllerError::Workspace);
     }
-    let execution_seed = match &bootstrap.checkpoint {
-        Some(selection) => {
-            crate::native_v2_supervisor::checkpoints::restore(selection, &bootstrap.workspace)
-                .await
-                .map_err(|error| PortableControllerError::Io(error.0))?
-        }
-        None => Vec::new(),
-    };
+    let execution_seed = restore_execution_seed(bootstrap).await?;
+    crate::native_v2_review::prepare_local_checkout(&prepared.admitted, bootstrap).await?;
     let mut runtime = runtime_factory(&prepared.admitted)
         .map_err(|_| PortableControllerError::RuntimeUnavailable)?;
     runtime.execution_seed = execution_seed;
-    runtime.cleanup = Arc::new(PortableCheckpointCleanup {
-        inner: runtime.cleanup,
-        directory: prepared.paths.storage().join("checkpoints"),
-        repository: bootstrap.checkpoint_repository.clone(),
-    });
-    runtime.checkpoints = Some(Arc::new(
-        crate::native_v2_supervisor::checkpoints::ResticCheckpointStore::new(
-            prepared.paths.storage().join("checkpoints"),
-            bootstrap.checkpoint_repository.clone(),
-            bootstrap.workspace.clone(),
-            crate::native_v2_admission::writer_nodes(&prepared.admitted),
-        )
-        .map_err(|error| PortableControllerError::Io(error.0))?,
-    ));
+    let runtime = configure_workspace_checkpoints(prepared, bootstrap, runtime)?;
     Ok(PreparedRuntime {
         runtime: Some(runtime),
         workspace_identity: Some(workspace_identity),
         workspace_lease: Some(workspace_lease),
     })
+}
+
+fn configure_workspace_checkpoints(
+    prepared: &PreparedControllerStart,
+    bootstrap: &PortableControllerBootstrap,
+    mut runtime: PortableRuntime,
+) -> Result<PortableRuntime, PortableControllerError> {
+    runtime.checkpoints = None;
+    if prepared.admitted.runtime.workspace_checkpoints {
+        runtime.cleanup = Arc::new(PortableCheckpointCleanup {
+            inner: runtime.cleanup,
+            directory: prepared.paths.storage().join("checkpoints"),
+            repository: bootstrap.checkpoint_repository.clone(),
+        });
+        runtime.checkpoints = Some(Arc::new(
+            crate::native_v2_supervisor::checkpoints::ResticCheckpointStore::new(
+                prepared.paths.storage().join("checkpoints"),
+                bootstrap.checkpoint_repository.clone(),
+                bootstrap.workspace.clone(),
+                crate::native_v2_admission::writer_nodes(&prepared.admitted),
+            )
+            .map_err(|error| PortableControllerError::Io(error.0))?,
+        ));
+    }
+    Ok(runtime)
+}
+
+async fn restore_execution_seed(
+    bootstrap: &PortableControllerBootstrap,
+) -> Result<Vec<crate::full_v1_reducer::DurableExecution>, PortableControllerError> {
+    match &bootstrap.checkpoint {
+        Some(selection) => {
+            if !bootstrap.submission.runtime.workspace_checkpoints {
+                return Err(PortableControllerError::CheckpointsDisabled);
+            }
+            crate::native_v2_supervisor::checkpoints::restore(selection, &bootstrap.workspace)
+                .await
+                .map_err(|error| PortableControllerError::Io(error.0))
+        }
+        None => Ok(Vec::new()),
+    }
 }
 
 pub(super) struct PortableCheckpointCleanup {
@@ -417,7 +444,7 @@ impl CapsuleAllocator for SingleRunAllocator {
 
     async fn allocate(
         &self,
-        request: crate::native_v2_cloud::CapsuleAllocationRequest<'_>,
+        request: crate::native_v2_platform::CapsuleAllocationRequest<'_>,
     ) -> Result<AllocatedCapsule, CapsuleAllocationUnavailable> {
         self.require_run(request.run_id)?;
         let runtime = self

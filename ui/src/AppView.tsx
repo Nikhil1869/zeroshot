@@ -359,7 +359,7 @@ function WorkflowActionContent({ model }: { model: AppModel }) {
                     </option>
                   ))}
                 {bootstrap?.workers
-                  ?.filter((w) => w.runtimeKind === 'git_delivery')
+                  ?.filter((w) => ['git_delivery', 'comment_delivery'].includes(w.runtimeKind))
                   .map((w) => (
                     <option key={w.id} value={`worker:${w.id}`}>
                       {w.label}
@@ -583,6 +583,8 @@ function RuntimeContent({ model }: { model: AppModel }) {
         <RuntimeEditor
           document={{ ...doc, runtime: runtimeDraft }}
           schema={bootstrap?.runtimeSchema}
+          harnesses={bootstrap?.harnesses}
+          machines={bootstrap?.machines}
           recentModels={savedModels}
           invalidField={validation.state === 'invalid' ? validation.field : undefined}
           validated={doc.runtime}
@@ -974,6 +976,7 @@ function ProfileSidebar({ model }: { model: AppModel }) {
     setModalError,
     setModal,
     profiles,
+    profileProblems,
     doc,
     base,
     load,
@@ -1016,7 +1019,15 @@ function ProfileSidebar({ model }: { model: AppModel }) {
             )}
           </button>
         ))}
-        {!profiles.length && !loading && <div className="no-profiles">No saved profiles</div>}
+        {profileProblems.map((problem) => (
+          <div key={problem.name} className="no-profiles" role="status">
+            {problem.message}
+            {problem.isDefault && ' (default profile)'}
+          </div>
+        ))}
+        {!profiles.length && !profileProblems.length && !loading && (
+          <div className="no-profiles">No saved profiles</div>
+        )}
         {doc && !base && (
           <div className="draft-item">
             <FilePlus2 size={16} />

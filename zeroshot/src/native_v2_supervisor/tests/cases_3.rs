@@ -34,6 +34,16 @@ async fn crashed_node_instance_verifier_retries_with_a_fresh_provider_session() 
         }
     );
     assert_eq!(harness.driver.starts("review"), VERIFIER_ATTEMPTS as usize);
+    assert_eq!(
+        harness
+            .driver
+            .state()
+            .contexts
+            .iter()
+            .map(|(_, dispatch)| (dispatch.attempt, dispatch.iteration))
+            .collect::<Vec<_>>(),
+        vec![(1, 0), (2, 0)]
+    );
     assert!(harness.sessions.closed.load(Ordering::SeqCst) >= 1);
     assert_eq!(
         harness.sessions.opened.load(Ordering::SeqCst),
@@ -86,6 +96,7 @@ async fn active_history_after_runtime_loss_is_terminalized_without_redispatch() 
     let reference = seed_active_execution(harness.ledger.as_ref(), &run_id).await;
 
     let expected = TerminalResult::Failed {
+        context: None,
         reason: EnumLabel::new("runtime_lost").assert_value_with("label"),
     };
     assert_eq!(

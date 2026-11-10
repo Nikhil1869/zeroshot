@@ -1,0 +1,1343 @@
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex as StdMutex;
+
+use openengine_cluster_protocol::{
+    ActiveMemoryConfig, IdempotencyKey, Sha256Digest, TokenCount, WorkerOutcome,
+};
+use openengine_cluster_testkit::assertions::AssertValue;
+use serde_json::{Value, json};
+
+use super::*;
+use tokio::sync::Mutex;
+use crate::active_memory::{ActiveMemoryStore, SqliteMemoryBackend};
+
+mod diagnostics;
+mod initialization;
+mod reconciliation;
+mod replay;
+mod scoped_maintenance;
+mod source_positions;
+use crate::active_memory::{
+    LessonDraft, LessonEvidence, LessonMutation, LessonScope, ScopeQuery, ToolObservation,
+};
+use crate::native_v2_admission::NativeV2Admission;
+use crate::native_v2_contract::{NodeInvocation, RunSubmission, TokenUsageDelta};
+use crate::native_v2_runner::test_support::CountingSession;
+use crate::native_v2_runner::{
+    DriverControl, DriverInvocation, LiveOutput, LiveOutputStream, NativeNodeRunner, NodeDriver,
+    NodeRole, NodeSession, ResolvedEnvironment, SessionFactory, AUXILIARY_PROVIDER_SLOT_OFFSET,
+};
+use crate::native_v2_supervisor::NativeV2Supervisor;
+use crate::v2_run_ledger::{CreateRun, RunEvent};
+use crate::v2_run_ledger::fake::FakeRunLedger;
+
+struct Source {
+    manifest: Option<SuppliedMemoryManifest>,
+    observations: StdMutex<Vec<ToolObservation>>,
+}
+impl SuppliedLessonSource for Source {
+    fn manifest(&self) -> Option<SuppliedMemoryManifest> {
+        self.manifest.clone()
+    }
+    fn tool_observations(&self) -> Vec<ToolObservation> {
+        self.observations.lock().assert_value().clone()
+    }
+}
+
+#[derive(Default)]
+struct Driver {
+    outputs: StdMutex<BTreeMap<String, Value>>,
+    slots: StdMutex<Vec<(String, u64)>>,
+    globals: AtomicUsize,
+    closed: Arc<AtomicUsize>,
+    worker_message: StdMutex<Option<String>>,
+    maintenance_action: StdMutex<Option<&'static str>>,
+    maintenance_omit: StdMutex<Option<String>>,
+    maintenance_inputs: StdMutex<Vec<Value>>,
+    concurrent_store: StdMutex<Option<Arc<Mutex<ActiveMemoryStore>>>>,
+}
+
+#[async_trait]
+impl SessionFactory for Driver {
+    async fn open(
+        &self,
+        _: &NodeInvocation,
+        _: &ResolvedEnvironment,
+    ) -> Result<Arc<dyn NodeSession>, NodeRunnerError> {
+        Ok(Arc::new(CountingSession {
+            closed: self.closed.clone(),
+        }))
+    }
+}
+
+#[async_trait]
+impl NodeDriver for Driver {
+    async fn run(
+        &self,
+        invocation: DriverInvocation,
+        control: DriverControl,
+    ) -> Result<WorkerOutcome, NodeRunnerError> {
+        let name = invocation.node.reference.node.as_str().to_owned();
+        self.slots
+            .lock()
+            .assert_value()
+            .push((name.clone(), invocation.provider_session_slot.get()));
+        control
+            .record_token_usage(Some(TokenUsageDelta {
+                input_tokens: TokenCount::new(1).assert_value(),
+                output_tokens: TokenCount::new(1).assert_value(),
+                cache_read_input_tokens: None,
+                cache_creation_input_tokens: None,
+            }))
+            .await?;
+        if invocation.role == NodeRole::Worker {
+            let text=self.worker_message.lock().assert_value().clone().unwrap_or_else(||
+                "A costly rejected provider guard was repaired after the initial focused tests omitted OAuth controls.".to_owned());
+            control
+                .emit(LiveOutput::new(LiveOutputStream::System, text)?)
+                .await?;
+            return Ok(WorkerOutcome::Verified {
+                output: Value::Null,
+                artifacts: Vec::new(),
+            });
+        }
+        let mut labels = BTreeMap::from([(
+            "ZEROSHOT_NODE_NAME".to_owned(),
+            "prior-primary-node".to_owned(),
+        )]);
+        crate::native_v2_capsule::provider_process::apply_execution_environment(
+            &mut labels,
+            &invocation,
+        )
+        .assert_value();
+        assert!(name.starts_with("active_memory_"));
+        assert_eq!(
+            labels["ZEROSHOT_RUN_ID"],
+            invocation.node.reference.run_id.as_str()
+        );
+        assert_eq!(labels["ZEROSHOT_NODE_NAME"], name);
+        assert_eq!(labels["ZEROSHOT_NODE_KIND"], "verifier");
+        assert_eq!(
+            labels["ZEROSHOT_NODE_INSTANCE_ID"],
+            invocation.node.reference.node_instance.to_string()
+        );
+        assert_eq!(
+            labels["ZEROSHOT_EXECUTION_REF"],
+            invocation
+                .node
+                .reference
+                .public_execution()
+                .assert_value()
+                .as_str()
+        );
+        assert_eq!(labels["ZEROSHOT_NODE_ATTEMPT"], "1");
+        assert_eq!(labels["ZEROSHOT_NODE_ITERATION"], "0");
+        self.globals.fetch_add(1, Ordering::SeqCst);
+        let concurrent = if name == "active_memory_repository_maintenance" {
+            self.concurrent_store.lock().assert_value().take()
+        } else {
+            None
+        };
+        if let Some(store) = concurrent {
+            let mut newer = seed_lesson();
+            newer.recommendation =
+                "Keep the concurrent provider advice and reconcile the new finding.".to_owned();
+            store
+                .lock()
+                .await
+                .apply_batch(&[LessonMutation::Upsert {
+                    expected_revision: Some(1),
+                    draft: Box::new(newer),
+                }])
+                .assert_value();
+        }
+        let fallback = if name.ends_with("_maintenance") {
+            self.maintenance_output(&invocation)
+        } else {
+            json!({"lessons":[]})
+        };
+        let output = self
+            .outputs
+            .lock()
+            .assert_value()
+            .get(&name)
+            .cloned()
+            .unwrap_or(fallback);
+        Ok(WorkerOutcome::Verifier {
+            output,
+            signals: BTreeMap::new(),
+            diagnostic: Value::Null,
+            artifacts: Vec::new(),
+        })
+    }
+}
+
+impl Driver {
+    fn maintenance_output(&self, invocation: &DriverInvocation) -> Value {
+        let input: Value =
+            serde_json::from_str(invocation.node.input["context"].as_str().assert_value())
+                .assert_value();
+        self.maintenance_inputs
+            .lock()
+            .assert_value()
+            .push(input.clone());
+        let action = self
+            .maintenance_action
+            .lock()
+            .assert_value()
+            .unwrap_or("defer");
+        let omitted = self.maintenance_omit.lock().assert_value().clone();
+        let decisions = input["supplied_lessons"]
+            .as_object()
+            .assert_value()
+            .iter()
+            .filter(|(id, _)| omitted.as_deref() != Some(id.as_str()))
+            .map(|(id, lesson)| {
+                let mut output = decision(action);
+                output["id"] = json!(id);
+                if lesson["scope"]["kind"] == "graph" {
+                    output["references"] = json!(["node:worker", "graph:worker"]);
+                    for key in ["files", "folders", "identifiers", "keyword_groups"] {
+                        output[key] = json!([]);
+                    }
+                }
+                if action == "defer" {
+                    output["title"] = json!("");
+                    output["recommendation"] = json!("");
+                    for key in [
+                        "files",
+                        "folders",
+                        "identifiers",
+                        "keyword_groups",
+                        "references",
+                    ] {
+                        output[key] = json!([]);
+                    }
+                }
+                output
+            })
+            .collect::<Vec<_>>();
+        json!({"decisions":decisions})
+    }
+}
+
+struct Fixture {
+    _directory: tempfile::TempDir,
+    supervisor: NativeV2Supervisor,
+    ledger: Arc<FakeRunLedger>,
+    store: Arc<Mutex<ActiveMemoryStore>>,
+    driver: Arc<Driver>,
+    factory: Arc<dyn AuxiliaryRunnerFactory>,
+    admitted: AdmittedRun,
+    run_id: RunId,
+    query: ScopeQuery,
+    source: Arc<Source>,
+}
+
+impl Fixture {
+    fn substantial_exploration(&self) {
+        *self.source.observations.lock().assert_value() = [1, 150001, 300001]
+            .into_iter()
+            .enumerate()
+            .map(|(index, timestamp_ms)| ToolObservation {
+                seq: index as u64 + 1,
+                node_id: "worker".to_owned(),
+                execution_id: 1,
+                timestamp_ms,
+                tool_name: "read_file".to_owned(),
+                paths: vec!["src/provider.rs".to_owned()],
+            })
+            .collect();
+    }
+
+    fn output(&self, role: &str, output: Value) {
+        self.driver
+            .outputs
+            .lock()
+            .assert_value()
+            .insert(format!("active_memory_{role}"), output);
+    }
+
+    async fn lessons(&self) -> Vec<crate::active_memory::Lesson> {
+        self.store
+            .lock()
+            .await
+            .snapshot(&self.query)
+            .assert_value()
+            .lessons
+    }
+
+    async fn drive(&self) {
+        assert!(matches!(
+            self.supervisor.drive().await.assert_value(),
+            TerminalResult::Succeeded { .. }
+        ));
+    }
+
+    async fn postmortem_request(&self) -> PostmortemRequest {
+        let stored = self
+            .ledger
+            .get(&self.run_id)
+            .await
+            .assert_value()
+            .assert_value();
+        PostmortemRequest {
+            run_id: self.run_id.clone(),
+            admitted: self.admitted.clone(),
+            primary_terminal: stored.snapshot.terminal.clone().assert_value(),
+            snapshot: stored.snapshot,
+            environment: Arc::new(
+                RunEnvironment::exact_for_admitted(&self.admitted, BTreeMap::new()).assert_value(),
+            ),
+            ledger: self.ledger.clone(),
+        }
+    }
+
+    async fn maintenance_rejected(&self) -> bool {
+        self.ledger.snapshot_and_tail(&self.run_id,None).await.assert_value().events.iter().any(|event| {
+            matches!(&event.event,RunEvent::SafeLog {line,..} if line.as_str().contains("maintenance findings rejected"))
+        })
+    }
+}
+
+async fn fixture(
+    settings: ActiveMemoryConfig,
+    seed: Option<LessonDraft>,
+    manifest_known: bool,
+) -> Fixture {
+    fixture_with_lessons(settings, seed.into_iter().collect(), manifest_known).await
+}
+
+async fn fixture_with_lessons(
+    settings: ActiveMemoryConfig,
+    seeds: Vec<LessonDraft>,
+    manifest_known: bool,
+) -> Fixture {
+    let directory = tempfile::tempdir().assert_value();
+    let workspace = directory.path().join("workspace");
+    std::fs::create_dir_all(workspace.join("src")).assert_value();
+    std::fs::write(
+        workspace.join("src/provider.rs"),
+        "fn reject_provider_controls() {}\n",
+    )
+    .assert_value();
+    let submission:RunSubmission=serde_json::from_value(json!({
+        "title":"Active Memory test", "submissionKey":"active-memory-test", "initialInput":null,
+        "graph":{"profile":"openengine.graph.full/v1","initialInput":{"kind":"null"},
+            "policy":{"policy":"policy.native-v2@1","default":"deny"},
+            "root":{"kind":"seq","name":"root","state":{"kind":"null"},"promotedStatePaths":[],"children":[
+                {"kind":"step","name":"worker","worker":"worker.test@1","instructions":"Implement the task.",
+                    "input":{"kind":"null"},"output":{"kind":"null"},"inputBindings":[],"writeBindings":[],"attempts":1},
+                {"kind":"succeed","name":"done","output":{"kind":"null"},"bindings":[]}
+            ]}},
+        "runtime":{"harness":"codex","provider":"openai","size":"small","activeMemory":settings,
+            "nodes":{"worker":{"kind":"agent","model":"opaque-test-model","connections":{},"sessionScope":"node_instance"}}}
+    })).assert_value();
+    let admitted = NativeV2Admission.admit(submission).await.assert_value();
+    let run_id = RunId::new("active-memory-run");
+    let ledger = Arc::new(FakeRunLedger::new());
+    ledger
+        .create_or_get(CreateRun {
+            run_id: run_id.clone(),
+            submission_key: IdempotencyKey::new("active-memory-test").assert_value(),
+            submission_digest: Sha256Digest::new("0".repeat(64)).assert_value(),
+            admitted: admitted.clone(),
+        })
+        .await
+        .assert_value();
+    let driver = Arc::new(Driver::default());
+    let runner =
+        Arc::new(NativeNodeRunner::new(&admitted, driver.clone(), driver.clone()).assert_value());
+    let factory = runner.auxiliary_factory();
+    let store = Arc::new(Mutex::new(
+        ActiveMemoryStore::open(&directory.path().join("memory/lessons.sqlite")).assert_value(),
+    ));
+    let mutations = seeds
+        .into_iter()
+        .map(|draft| LessonMutation::Upsert {
+            expected_revision: None,
+            draft: Box::new(draft),
+        })
+        .collect::<Vec<_>>();
+    store.lock().await.apply_batch(&mutations).assert_value();
+    let graph_hash = admitted.graph.identity().assert_value().as_str().to_owned();
+    let query = ScopeQuery {
+        repository: Some("example/repo".to_owned()),
+        graph_hash: Some(graph_hash.clone()),
+        node_id: None,
+        repository_lessons: true,
+        graph_lessons: true,
+    };
+    let snapshot = store.lock().await.snapshot(&query).assert_value();
+    let manifest = manifest_known.then(|| SuppliedMemoryManifest {
+        lessons: snapshot
+            .lessons
+            .iter()
+            .map(crate::active_memory::Lesson::version)
+            .collect(),
+    });
+    let source = Arc::new(Source {
+        manifest,
+        observations: StdMutex::new(Vec::new()),
+    });
+    let postmortem = Arc::new(BuiltinPostmortem::new(BuiltinPostmortemConfig {
+        store: SqliteMemoryBackend::shared(store.clone()),
+        factory: factory.clone(),
+        snapshot,
+        supplied: source.clone(),
+        repository: query.repository.clone(),
+        graph_hash,
+        workspace,
+    }));
+    let environment =
+        Arc::new(RunEnvironment::exact_for_admitted(&admitted, BTreeMap::new()).assert_value());
+    let supervisor = NativeV2Supervisor::new(run_id.clone(), ledger.clone(), runner, environment)
+        .with_postmortem(Some(postmortem));
+    Fixture {
+        _directory: directory,
+        supervisor,
+        ledger,
+        store,
+        driver,
+        factory,
+        admitted,
+        run_id,
+        query,
+        source,
+    }
+}
+
+fn candidate(node: &str) -> Value {
+    json!({"title":"Keep provider controls complete","recommendation":"Reject OAuth refresh tokens as well as the focused API-key controls before launching Bedrock.",
+        "node_id":node,"files":["src/provider.rs"],"folders":[],"identifiers":["reject_provider_controls"],"keyword_groups":[["oauth","bedrock"]],
+        "references":["hook:1","hook:2","hook:3","repository:src/provider.rs"],"costly_recurring_reason":"Sustained provider exploration established the otherwise non-obvious credential interaction needed by future lane changes.","repository_specific":true})
+}
+
+fn seed_lesson() -> LessonDraft {
+    LessonDraft {
+        id: "existing-provider-lesson".to_owned(),
+        scope: LessonScope::Repository {
+            repository: "example/repo".to_owned(),
+            files: vec!["src/provider.rs".to_owned()],
+            folders: Vec::new(),
+            identifiers: Vec::new(),
+            keyword_groups: Vec::new(),
+        },
+        title: "Existing provider lesson".to_owned(),
+        recommendation: "Check all provider controls.".to_owned(),
+        evidence: LessonEvidence {
+            run_id: "older-run".to_owned(),
+            node_id: "worker".to_owned(),
+            references: vec!["older-evidence".to_owned()],
+            costly_recurring_reason:
+                "An earlier rejected repair omitted adjacent provider controls.".to_owned(),
+        },
+    }
+}
+
+fn decision(action: &str) -> Value {
+    json!({"id":"existing-provider-lesson","action":action,"title":"Updated provider lesson",
+        "recommendation":"Reject every cached OAuth credential before using the Bedrock lane.","files":["src/provider.rs"],"folders":[],"identifiers":[],"keyword_groups":[],
+        "references":["node:worker","repository:src/provider.rs"],"reason":"Current source and this run show the old advice omitted a recurring cached OAuth credential failure."})
+}
+
+fn ledger_format_lesson() -> LessonDraft {
+    let mut lesson = seed_lesson();
+    lesson.title = "Use the durable ledger format".to_owned();
+    lesson.recommendation = "Use ledgerFormat 3 in settings/schema.json.".to_owned();
+    lesson.scope = LessonScope::Repository {
+        repository: "example/repo".to_owned(),
+        files: vec!["settings/schema.json".to_owned()],
+        folders: Vec::new(),
+        identifiers: Vec::new(),
+        keyword_groups: Vec::new(),
+    };
+    lesson
+}
+
+fn write_ledger_format(fixture: &Fixture, version: u32) {
+    let settings = fixture._directory.path().join("workspace/settings");
+    std::fs::create_dir_all(&settings).assert_value();
+    std::fs::write(
+        settings.join("schema.json"),
+        format!("{{\"ledgerFormat\":{version}}}\n"),
+    )
+    .assert_value();
+}
+
+#[tokio::test]
+async fn repository_keep_rejects_circular_confirmation_from_a_repeated_stale_card() {
+    let fixture = self::fixture(Default::default(), Some(ledger_format_lesson()), true).await;
+    write_ledger_format(&fixture, 4);
+    *fixture.driver.worker_message.lock().assert_value() =
+        Some("The supplied memory says to use ledgerFormat 3 in settings/schema.json.".to_owned());
+    let mut keep = decision("keep");
+    keep["references"] = json!(["node:worker"]);
+    keep["reason"] =
+        json!("The main worker repeated ledgerFormat 3, so the supplied advice is still valid.");
+    fixture.output("repository_maintenance", json!({"decisions":[keep]}));
+    fixture.drive().await;
+    assert!(fixture.maintenance_rejected().await);
+    assert_eq!(fixture.lessons().await[0].revision, 1);
+}
+
+#[tokio::test]
+async fn repository_keep_accepts_a_current_file_citation_and_explicit_comparison() {
+    let fixture = self::fixture(Default::default(), Some(ledger_format_lesson()), true).await;
+    write_ledger_format(&fixture, 3);
+    let mut keep = decision("keep");
+    keep["references"] = json!(["repository:settings/schema.json"]);
+    keep["reason"] = json!(
+        "Current settings/schema.json declares ledgerFormat 3, matching the supplied lesson's concrete version."
+    );
+    fixture.output("repository_maintenance", json!({"decisions":[keep]}));
+    fixture.drive().await;
+    assert!(!fixture.maintenance_rejected().await);
+    assert_eq!(fixture.lessons().await[0].revision, 1);
+}
+
+#[tokio::test]
+async fn maintenance_current_file_gates_reject_missing_paths_and_empty_justification() {
+    for (reference, reason) in [
+        (
+            "repository:missing.rs",
+            "Current source confirms the advice.",
+        ),
+        (
+            "repository:../outside.rs",
+            "Current source confirms the advice.",
+        ),
+        ("repository:src/provider.rs", ""),
+    ] {
+        let fixture = self::fixture(Default::default(), Some(seed_lesson()), true).await;
+        let mut keep = decision("keep");
+        keep["references"] = json!([reference]);
+        keep["reason"] = json!(reason);
+        fixture.output("repository_maintenance", json!({"decisions":[keep]}));
+        fixture.drive().await;
+        assert!(fixture.maintenance_rejected().await);
+    }
+}
+
+#[tokio::test]
+async fn maintenance_adapt_and_retire_require_current_source_as_well_as_run_evidence() {
+    for action in ["adapt", "retire"] {
+        for references in [
+            json!(["node:worker"]),
+            json!(["repository:src/provider.rs"]),
+        ] {
+            let fixture = self::fixture(Default::default(), Some(seed_lesson()), true).await;
+            let mut mutation = decision(action);
+            mutation["references"] = references;
+            fixture.output("repository_maintenance", json!({"decisions":[mutation]}));
+            fixture.drive().await;
+            assert!(fixture.maintenance_rejected().await);
+            assert_eq!(fixture.lessons().await[0].revision, 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn graph_keep_requires_the_current_authored_node_reference() {
+    let template = self::fixture(Default::default(), None, true).await;
+    let mut lesson = seed_lesson();
+    lesson.scope = LessonScope::Graph {
+        graph_hash: template.query.graph_hash.clone().assert_value(),
+        node_id: "worker".to_owned(),
+        repository: None,
+    };
+    for (reference, rejected) in [
+        ("node:worker", true),
+        ("graph:worker", false),
+        ("graph:invented_node", true),
+    ] {
+        let fixture = self::fixture(Default::default(), Some(lesson.clone()), true).await;
+        let mut keep = decision("keep");
+        keep["references"] = json!([reference]);
+        keep["reason"] = json!(
+            "The current authored worker node and its output contract retain the procedural operation covered by this lesson."
+        );
+        fixture.output("graph_maintenance", json!({"decisions":[keep]}));
+        fixture.drive().await;
+        assert_eq!(fixture.maintenance_rejected().await, rejected);
+        assert_eq!(fixture.lessons().await[0].revision, 1);
+    }
+}
+
+#[tokio::test]
+async fn maintenance_can_defer_when_current_source_verification_is_unavailable() {
+    let fixture = self::fixture(Default::default(), Some(seed_lesson()), true).await;
+    let mut deferred = decision("defer");
+    deferred["references"] = json!([]);
+    deferred["reason"] =
+        json!("Current authoritative source could not be verified, so no freshness claim is made.");
+    fixture.output("repository_maintenance", json!({"decisions":[deferred]}));
+    fixture.drive().await;
+    assert!(!fixture.maintenance_rejected().await);
+    assert_eq!(fixture.lessons().await[0].revision, 1);
+}
+
+#[tokio::test]
+async fn four_specialists_share_run_authority_and_publish_scoped_lessons_without_reducer_executions()
+ {
+    let fixture = self::fixture(Default::default(), None, true).await;
+    fixture.substantial_exploration();
+    fixture.output("repository", json!({"lessons":[candidate("worker")]}));
+    fixture.output("graph", json!({"lessons":[candidate("worker")]}));
+    fixture.drive().await;
+    assert_eq!(fixture.driver.globals.load(Ordering::SeqCst), 4);
+    assert_eq!(fixture.driver.closed.load(Ordering::SeqCst), 5);
+    let lessons = fixture.lessons().await;
+    assert_eq!(lessons.len(), 2);
+    assert!(
+        lessons
+            .iter()
+            .any(|lesson| matches!(lesson.scope, LessonScope::Repository { .. }))
+    );
+    assert!(
+        lessons
+            .iter()
+            .any(|lesson| matches!(lesson.scope, LessonScope::Graph { .. }))
+    );
+    let stored = fixture
+        .ledger
+        .get(&fixture.run_id)
+        .await
+        .assert_value()
+        .assert_value();
+    assert_eq!(stored.snapshot.executions.len(), 1);
+    assert!(stored.snapshot.execution_seed.is_empty());
+    assert_eq!(
+        stored
+            .snapshot
+            .token_usage
+            .as_ref()
+            .assert_value()
+            .output_tokens
+            .get(),
+        5
+    );
+    let slots = fixture.driver.slots.lock().assert_value();
+    assert!(
+        slots
+            .iter()
+            .filter(|(name, _)| name.starts_with("active_memory_"))
+            .all(|(_, slot)| *slot > AUXILIARY_PROVIDER_SLOT_OFFSET)
+    );
+}
+
+#[tokio::test]
+async fn maintenance_binds_decision_ids_to_the_frozen_revision_and_the_host_increments_it() {
+    let fixture = self::fixture(Default::default(), Some(seed_lesson()), true).await;
+    fixture.output(
+        "repository_maintenance",
+        json!({"decisions":[decision("adapt")]}),
+    );
+    fixture.drive().await;
+    let lessons = fixture.lessons().await;
+    assert_eq!(lessons.len(), 1);
+    assert_eq!(lessons[0].revision, 2);
+    assert!(lessons[0].recommendation.contains("cached OAuth"));
+}
+
+#[tokio::test]
+async fn unknown_supplied_manifest_prevents_maintenance_mutation() {
+    let fixture = self::fixture(Default::default(), Some(seed_lesson()), false).await;
+    fixture.output(
+        "repository_maintenance",
+        json!({"decisions":[decision("retire")]}),
+    );
+    fixture.drive().await;
+    assert_eq!(fixture.lessons().await[0].revision, 1);
+}
+
+#[tokio::test]
+async fn pre_postmortem_refresh_reconciles_the_new_revision_and_preserves_discovery() {
+    let fixture = self::fixture(Default::default(), Some(seed_lesson()), true).await;
+    fixture.substantial_exploration();
+    let mut newer = seed_lesson();
+    newer.recommendation = "A concurrent run already corrected the advice.".to_owned();
+    fixture
+        .store
+        .lock()
+        .await
+        .apply_batch(&[LessonMutation::Upsert {
+            expected_revision: Some(1),
+            draft: Box::new(newer),
+        }])
+        .assert_value();
+    fixture.output(
+        "repository_maintenance",
+        json!({"decisions":[decision("adapt")]}),
+    );
+    fixture.output("repository", json!({"lessons":[candidate("worker")]}));
+    fixture.drive().await;
+    let lessons = fixture.lessons().await;
+    assert_eq!(lessons.len(), 2);
+    let existing = lessons
+        .iter()
+        .find(|lesson| lesson.id == "existing-provider-lesson")
+        .assert_value();
+    assert_eq!(existing.revision, 3);
+    assert!(existing.recommendation.contains("cached OAuth"));
+    let inputs = fixture.driver.maintenance_inputs.lock().assert_value();
+    assert!(inputs.iter().any(
+        |input| input["lesson_changes"]["existing-provider-lesson"]["current"]["revision"] == 2
+    ));
+}
+
+#[tokio::test]
+async fn invalid_discovery_node_is_rejected_while_other_specialists_can_succeed() {
+    let fixture = self::fixture(Default::default(), None, true).await;
+    fixture.substantial_exploration();
+    fixture.output("graph", json!({"lessons":[candidate("invented_node")]}));
+    fixture.output("repository", json!({"lessons":[candidate("worker")]}));
+    fixture.drive().await;
+    let lessons = fixture.lessons().await;
+    assert_eq!(lessons.len(), 1);
+    assert!(matches!(lessons[0].scope, LessonScope::Repository { .. }));
+}
+
+#[tokio::test]
+async fn collection_respects_independent_scope_opt_outs_and_total_opt_out() {
+    let fixture = self::fixture(
+        ActiveMemoryConfig {
+            graph: false,
+            ..Default::default()
+        },
+        None,
+        true,
+    )
+    .await;
+    fixture.output("graph", json!({"lessons":[candidate("worker")]}));
+    fixture.drive().await;
+    assert_eq!(fixture.driver.globals.load(Ordering::SeqCst), 2);
+    assert!(fixture.lessons().await.is_empty());
+    let fixture = self::fixture(
+        ActiveMemoryConfig {
+            repository: false,
+            graph: false,
+            ..Default::default()
+        },
+        None,
+        true,
+    )
+    .await;
+    fixture.drive().await;
+    assert_eq!(fixture.driver.globals.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn auxiliary_factory_rejects_forks_after_close() {
+    let fixture = self::fixture(Default::default(), None, true).await;
+    fixture.factory.close_run(&fixture.run_id).await;
+    let plan = plan::build(&fixture.admitted).await.assert_value();
+    assert!(matches!(
+        fixture.factory.fork(&plan),
+        Err(NodeRunnerError::RunClosed)
+    ));
+}
+
+#[tokio::test]
+async fn global_usage_is_recorded_separately_from_graph_execution_history() {
+    let fixture = self::fixture(Default::default(), None, true).await;
+    fixture.drive().await;
+    let page = fixture
+        .ledger
+        .snapshot_and_tail(&fixture.run_id, None)
+        .await
+        .assert_value();
+    assert_eq!(
+        page.events
+            .iter()
+            .filter(|event| matches!(event.event, RunEvent::RunTokenUsageObserved { .. }))
+            .count(),
+        4
+    );
+}
+
+#[tokio::test]
+async fn reordered_associations_do_not_duplicate_an_existing_lesson() {
+    let mut existing = seed_lesson();
+    let mut proposed = candidate("worker");
+    existing.recommendation = proposed["recommendation"]
+        .as_str()
+        .assert_value()
+        .to_owned();
+    existing.scope = LessonScope::Repository {
+        repository: "example/repo".to_owned(),
+        files: vec!["src/b.rs".to_owned(), "src/a.rs".to_owned()],
+        folders: vec!["tests".to_owned(), "src".to_owned()],
+        identifiers: vec!["ProviderBeta".to_owned(), "ProviderAlpha".to_owned()],
+        keyword_groups: vec![
+            vec!["oauth".to_owned(), "bedrock".to_owned()],
+            vec!["selector".to_owned(), "gateway".to_owned()],
+        ],
+    };
+    proposed["files"] = json!(["src/a.rs", "src/b.rs"]);
+    proposed["folders"] = json!(["src", "tests"]);
+    proposed["identifiers"] = json!(["ProviderAlpha", "ProviderBeta"]);
+    proposed["keyword_groups"] = json!([["gateway", "selector"], ["bedrock", "oauth"]]);
+    let fixture = self::fixture(Default::default(), Some(existing), true).await;
+    fixture.substantial_exploration();
+    fixture.output("repository", json!({"lessons":[proposed]}));
+    fixture.drive().await;
+    let lessons = fixture.lessons().await;
+    assert_eq!(lessons.len(), 1);
+    assert_eq!(lessons[0].id, "existing-provider-lesson");
+    assert_eq!(lessons[0].revision, 1);
+}
+
+#[tokio::test]
+async fn specialist_assessed_lessons_can_use_one_short_main_run_observation() {
+    let fixture = self::fixture(Default::default(), None, true).await;
+    fixture.substantial_exploration();
+    fixture
+        .source
+        .observations
+        .lock()
+        .assert_value()
+        .truncate(1);
+    let mut proposed = candidate("worker");
+    proposed["references"] = json!(["hook:1", "repository:src/provider.rs"]);
+    fixture.output("graph", json!({"lessons":[proposed.clone()]}));
+    fixture.output("repository", json!({"lessons":[proposed]}));
+    fixture.drive().await;
+    assert_eq!(fixture.lessons().await.len(), 2);
+}
+
+pub(super) fn review_node(name: &str) -> Value {
+    json!({"kind":"verifier","name":name,"worker":"verifier.test@1","instructions":"Review the task.",
+        "input":{"kind":"null"},"output":{"kind":"null"},"inputBindings":[],"writeBindings":[],"attempts":1,
+        "signals":{"verdict":["accepted","rejected"]},"diagnostic":{"kind":"null"}})
+}
+
+fn empty_proposal_context<'a>(
+    config: proposals::LessonContext<'a>,
+    request: &'a PostmortemRequest,
+    evidence: &'a evidence::FrozenEvidence,
+) -> proposals::ProposalContext<'a> {
+    proposals::ProposalContext::new(
+        config,
+        request,
+        evidence,
+        Some(SuppliedMemoryManifest {
+            lessons: Vec::new(),
+        }),
+    )
+}
+
+#[tokio::test]
+async fn worker_lessons_can_cite_their_own_completion_and_related_rejected_review() {
+    use crate::full_v1_reducer::StructuralOccurrence;
+    use crate::native_v2_contract::{ExecutionId, ExecutionRef, NodeCompletion, NodeInstanceId};
+    use openengine_cluster_protocol::{NodeName, PositiveInteger};
+    let fixture = self::fixture(Default::default(), None, true).await;
+    let mut graph = serde_json::to_value(&fixture.admitted.graph).assert_value();
+    graph.as_object_mut().assert_value().remove("bounds");
+    graph["root"]["children"]
+        .as_array_mut()
+        .assert_value()
+        .insert(1, review_node("reviewer"));
+    let mut runtime = serde_json::to_value(&fixture.admitted.runtime).assert_value();
+    runtime["nodes"]["reviewer"] = runtime["nodes"]["worker"].clone();
+    let submission = serde_json::from_value(json!({
+        "title":"Worker review evidence","submissionKey":"worker-review-evidence","initialInput":null,
+        "graph":graph,"runtime":runtime
+    })).assert_value();
+    let admitted = NativeV2Admission.admit(submission).await.assert_value();
+    let ledger = Arc::new(FakeRunLedger::new());
+    ledger
+        .create_or_get(CreateRun {
+            run_id: fixture.run_id.clone(),
+            submission_key: IdempotencyKey::new("worker-review-evidence").assert_value(),
+            submission_digest: Sha256Digest::new("0".repeat(64)).assert_value(),
+            admitted: admitted.clone(),
+        })
+        .await
+        .assert_value();
+    ledger
+        .append(&fixture.run_id, vec![RunEvent::RunStarted])
+        .await
+        .assert_value();
+    let mut references = Vec::new();
+    for (number, name, outcome) in [
+        (
+            1,
+            "worker",
+            WorkerOutcome::Verified {
+                output: Value::Null,
+                artifacts: Vec::new(),
+            },
+        ),
+        (
+            2,
+            "reviewer",
+            WorkerOutcome::Verifier {
+                output: Value::Null,
+                signals: BTreeMap::from([(
+                    "verdict".parse().assert_value(),
+                    "rejected".parse().assert_value(),
+                )]),
+                diagnostic: Value::Null,
+                artifacts: Vec::new(),
+            },
+        ),
+    ] {
+        let name: NodeName = name.parse().assert_value();
+        let reference = ExecutionRef {
+            run_id: fixture.run_id.clone(),
+            node: name.clone(),
+            node_instance: NodeInstanceId::new(number).assert_value(),
+            execution: ExecutionId::new(number).assert_value(),
+        };
+        let result = ledger
+            .append(
+                &fixture.run_id,
+                vec![
+                    RunEvent::NodeStarted {
+                        reference: reference.clone(),
+                        occurrence: StructuralOccurrence {
+                            node: name,
+                            map_indices: Vec::new(),
+                        },
+                        attempt: PositiveInteger::new(1).assert_value(),
+                        input: Value::Null,
+                    },
+                    RunEvent::NodeCompleted {
+                        completion: NodeCompletion { reference, outcome },
+                    },
+                ],
+            )
+            .await
+            .assert_value();
+        references.push(
+            result
+                .events
+                .last()
+                .assert_value()
+                .cursor
+                .as_str()
+                .to_owned(),
+        );
+    }
+    let stored = ledger
+        .get(&fixture.run_id)
+        .await
+        .assert_value()
+        .assert_value();
+    let request = PostmortemRequest {
+        run_id: fixture.run_id.clone(),
+        environment: Arc::new(
+            RunEnvironment::exact_for_admitted(&admitted, BTreeMap::new()).assert_value(),
+        ),
+        admitted,
+        snapshot: stored.snapshot,
+        primary_terminal: TerminalResult::Succeeded {
+            output: Value::Null,
+        },
+        ledger,
+    };
+    let evidence = evidence::collect(&request, Vec::new()).await.assert_value();
+    assert!(
+        references
+            .iter()
+            .all(|reference| evidence.references.contains(reference))
+    );
+    assert!(evidence.impact.episodes["worker"].allows(&references));
+    let mut query = fixture.query.clone();
+    query.graph_hash = Some(
+        request
+            .admitted
+            .graph
+            .identity()
+            .assert_value()
+            .as_str()
+            .to_owned(),
+    );
+    let snapshot = fixture.store.lock().await.snapshot(&query).assert_value();
+    let workspace = fixture._directory.path().join("workspace");
+    let context = empty_proposal_context(
+        proposals::LessonContext {
+            snapshot: &snapshot,
+            repository: &query.repository,
+            graph_hash: query.graph_hash.as_deref().assert_value(),
+            workspace: &workspace,
+        },
+        &request,
+        &evidence,
+    );
+    let mut proposed = candidate("worker");
+    proposed["references"] = json!(references);
+    proposed["costly_recurring_reason"] =
+        json!("The rejected review exposed omitted OAuth controls that recur in provider changes.");
+    let mutations = context
+        .mutations(plan::Role::Graph, &json!({}), json!({"lessons":[proposed]}))
+        .assert_value();
+    assert_eq!(mutations.len(), 1);
+    fixture
+        .store
+        .lock()
+        .await
+        .apply_batch(&mutations)
+        .assert_value();
+    let persisted = fixture
+        .store
+        .lock()
+        .await
+        .snapshot(&query)
+        .assert_value()
+        .lessons;
+    assert_eq!(persisted.len(), 1);
+    assert_eq!(persisted[0].evidence.node_id, "worker");
+    assert_eq!(persisted[0].evidence.references, references);
+}
+
+#[tokio::test]
+async fn discovery_rejects_valid_main_run_references_owned_only_by_another_node() {
+    use crate::native_v2_contract::ExecutionId;
+    use crate::v2_run_ledger::NodeState;
+    let fixture = self::fixture(Default::default(), None, true).await;
+    fixture.drive().await;
+    let mut request = fixture.postmortem_request().await;
+    let mut other = request
+        .snapshot
+        .executions
+        .values()
+        .next()
+        .assert_value()
+        .clone();
+    let other_name: openengine_cluster_protocol::NodeName = "another_worker".parse().assert_value();
+    let binding = request
+        .admitted
+        .runtime
+        .nodes()
+        .get(&other.reference.node)
+        .assert_value()
+        .clone();
+    request
+        .admitted
+        .runtime
+        .nodes_mut()
+        .insert(other_name.clone(), binding);
+    other.reference.node = other_name.clone();
+    other.occurrence.node = other_name;
+    other.reference.execution = ExecutionId::new(2).assert_value();
+    other.state = NodeState::Active;
+    request
+        .snapshot
+        .executions
+        .insert(other.reference.execution, other);
+    let evidence = evidence::collect(
+        &request,
+        vec![ToolObservation {
+            seq: 1,
+            node_id: "another_worker".to_owned(),
+            execution_id: 2,
+            timestamp_ms: 1,
+            tool_name: "read_file".to_owned(),
+            paths: vec!["src/provider.rs".to_owned()],
+        }],
+    )
+    .await
+    .assert_value();
+    assert!(evidence.references.contains("hook:1"));
+    let snapshot = fixture
+        .store
+        .lock()
+        .await
+        .snapshot(&fixture.query)
+        .assert_value();
+    let workspace = fixture._directory.path().join("workspace");
+    let context = empty_proposal_context(
+        proposals::LessonContext {
+            snapshot: &snapshot,
+            repository: &fixture.query.repository,
+            graph_hash: fixture.query.graph_hash.as_deref().assert_value(),
+            workspace: &workspace,
+        },
+        &request,
+        &evidence,
+    );
+    let mut proposed = candidate("worker");
+    proposed["references"] = json!(["hook:1", "repository:src/provider.rs"]);
+    for role in [plan::Role::Graph, plan::Role::Repository] {
+        assert!(matches!(
+            context.mutations(role, &json!({}), json!({"lessons":[proposed.clone()]})),
+            Err(proposals::ProposalRejection::Evidence)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn repository_discovery_requires_current_source_and_concrete_verified_associations() {
+    for (files, folders, identifiers, references, accepted) in [
+        (
+            json!([]),
+            json!([]),
+            json!([]),
+            json!(["hook:1", "hook:2", "hook:3", "repository:src/provider.rs"]),
+            false,
+        ),
+        (
+            json!([]),
+            json!([]),
+            json!(["invented_identifier"]),
+            json!(["hook:1", "hook:2", "hook:3", "repository:src/provider.rs"]),
+            false,
+        ),
+        (
+            json!(["src/provider.rs"]),
+            json!([]),
+            json!([]),
+            json!(["hook:1", "hook:2", "hook:3"]),
+            false,
+        ),
+        (
+            json!([]),
+            json!([]),
+            json!(["reject_provider_controls"]),
+            json!(["hook:1", "hook:2", "hook:3", "repository:src/provider.rs"]),
+            true,
+        ),
+    ] {
+        let fixture = self::fixture(Default::default(), None, true).await;
+        fixture.substantial_exploration();
+        let mut proposed = candidate("worker");
+        proposed["files"] = files;
+        proposed["folders"] = folders;
+        proposed["identifiers"] = identifiers;
+        proposed["references"] = references;
+        fixture.output("repository", json!({"lessons":[proposed]}));
+        fixture.drive().await;
+        assert_eq!(fixture.lessons().await.len(), usize::from(accepted));
+    }
+}
+
+#[tokio::test]
+async fn fewer_tools_and_short_exploration_remain_available_for_specialist_assessment() {
+    for timestamps in [vec![1, 300001], vec![1, 2, 3]] {
+        let fixture = self::fixture(Default::default(), None, true).await;
+        fixture.substantial_exploration();
+        let observations = fixture.source.tool_observations();
+        *fixture.source.observations.lock().assert_value() = observations
+            .into_iter()
+            .zip(timestamps)
+            .map(|(mut observation, timestamp)| {
+                observation.timestamp_ms = timestamp;
+                observation
+            })
+            .collect();
+        let mut proposed = candidate("worker");
+        proposed["references"] = json!(["hook:1", "hook:2", "repository:src/provider.rs"]);
+        fixture.output("repository", json!({"lessons":[proposed]}));
+        fixture.drive().await;
+        assert_eq!(fixture.lessons().await.len(), 1);
+    }
+}
+
+#[test]
+fn specialist_prompts_distinguish_evidence_from_replacements_and_require_whole_advice_validity() {
+    let maintenance = plan::Role::RepositoryMaintenance.instruction();
+    assert!(maintenance.contains("entire recommendation"));
+    assert!(maintenance.contains("Keep requires nonempty references and reason"));
+    assert!(
+        plan::Role::Graph
+            .instruction()
+            .contains("Do not restate existing instructions or the response/output contract")
+    );
+}
+
+#[tokio::test]
+async fn single_observed_main_completion_is_eligible_regardless_of_qualitative_failure_kind() {
+    use crate::v2_run_ledger::{NodeState, cursor_for};
+    use openengine_cluster_protocol::{WorkerErrorCode, WorkerFailureReason};
+    let fixture = self::fixture(Default::default(), None, true).await;
+    fixture.drive().await;
+    let mut request = fixture.postmortem_request().await;
+    for code in [
+        WorkerErrorCode::Timeout,
+        WorkerErrorCode::Crash,
+        WorkerErrorCode::Malformed,
+        WorkerErrorCode::Refusal,
+    ] {
+        request
+            .snapshot
+            .executions
+            .values_mut()
+            .next()
+            .assert_value()
+            .state = NodeState::Completed {
+            at: cursor_for(1),
+            outcome: WorkerOutcome::Error {
+                code,
+                reason: WorkerFailureReason::DeclaredFailure,
+            },
+        };
+        let impact = impact::ImpactEvidence::new(&request, Vec::new());
+        assert!(impact.episodes["worker"].allows(&["v2:1".to_owned()]));
+    }
+}
+
+#[tokio::test]
+async fn auxiliary_postmortem_output_and_tool_observations_are_not_discovery_evidence() {
+    let fixture = self::fixture(Default::default(), None, true).await;
+    fixture.drive().await;
+    let request = fixture.postmortem_request().await;
+    let observations = vec![ToolObservation {
+        seq: 1,
+        node_id: "active_memory_repository".to_owned(),
+        execution_id: AUXILIARY_PROVIDER_SLOT_OFFSET + 1,
+        timestamp_ms: 1,
+        tool_name: "read_file".to_owned(),
+        paths: Vec::new(),
+    }];
+    let evidence = evidence::collect(&request, observations)
+        .await
+        .assert_value();
+    assert!(evidence.impact.tools.is_empty());
+    assert!(!evidence.references.contains("hook:1"));
+    let records = evidence.document["records"].as_array().assert_value();
+    assert!(!records.is_empty());
+    assert!(records.iter().all(|record| {
+        !record["event"]
+            .as_str()
+            .assert_value()
+            .contains("active_memory_")
+    }));
+}
+
+#[tokio::test]
+async fn postmortem_inherits_an_agent_verifier_after_a_decision_verifier() {
+    use openengine_cluster_protocol::{EnumLabel, NonEmptyEnumSet};
+    use crate::native_v2_candidate::decision::contract;
+    let options = NonEmptyEnumSet::new(
+        ["simple", "complex"]
+            .into_iter()
+            .map(|label| EnumLabel::new(label).unwrap())
+            .collect(),
+    )
+    .unwrap();
+    let decision = json!({
+        "kind":"verifier","name":"triage","worker":"triage@1","instructions":"Classify the task.",
+        "input":{"kind":"record","fields":{}},"output":contract::output_schema(&options).unwrap(),
+        "signals":{"route":["simple","complex","uncertain"]},"diagnostic":contract::diagnostic_schema().unwrap(),
+        "inputBindings":[],"writeBindings":[],"attempts":1
+    });
+    let reviewer = json!({
+        "kind":"verifier","name":"reviewer","worker":"reviewer@1","instructions":"Inspect the evidence.",
+        "input":{"kind":"null"},"output":{"kind":"null"},"signals":{},"diagnostic":{"kind":"null"},
+        "inputBindings":[],"writeBindings":[],"attempts":1
+    });
+    let graph = crate::native_v2_candidate::test_support::full_graph(vec![
+        decision,
+        reviewer,
+        crate::native_v2_candidate::test_support::success_node(),
+    ]);
+    let main: RunSubmission = serde_json::from_value(json!({
+        "title":"Mixed decisions and agents", "submissionKey":"decision-postmortem", "initialInput":null,"graph":graph,
+        "runtime":{"harness":"codex","provider":"openai","size":"small","nodes":{
+            "triage":{"kind":"decision","api":"systemone","model":"decision-model","minProbability":0.85,"uncertainLabel":"uncertain",
+                "connections":{"decisions":["DECISION_ENDPOINT","DECISION_API_KEY"]}},
+            "reviewer":{"kind":"agent","model":"postmortem-model","harnessConfig":{"args":["--config","web_search=\"disabled\""]}}
+        }}
+    })).unwrap();
+    let main = NativeV2Admission.admit(main).await.unwrap();
+    let postmortem = plan::build(&main).await.unwrap();
+    for binding in postmortem.runtime.nodes().values() {
+        let crate::native_v2_contract::NodeRuntimeBinding::Agent { model, .. } = binding else {
+            panic!("agent binding")
+        };
+        assert_eq!(model.as_str(), "postmortem-model");
+        assert_eq!(
+            binding.harness_config().unwrap().args().unwrap(),
+            ["--config", "web_search=\"disabled\""]
+        );
+    }
+}
+
+#[tokio::test]
+async fn publication_conflict_reinvokes_maintenance_and_preserves_new_discoveries() {
+    let fixture = fixture(Default::default(), Some(seed_lesson()), true).await;
+    fixture.substantial_exploration();
+    *fixture.driver.maintenance_action.lock().assert_value() = Some("adapt");
+    *fixture.driver.concurrent_store.lock().assert_value() = Some(fixture.store.clone());
+    fixture.output("repository", json!({"lessons":[candidate("worker")]}));
+    fixture.drive().await;
+    let lessons = fixture.lessons().await;
+    assert_eq!(lessons.len(), 2);
+    assert_eq!(
+        lessons
+            .iter()
+            .find(|lesson| lesson.id == "existing-provider-lesson")
+            .assert_value()
+            .revision,
+        3
+    );
+    assert_eq!(fixture.driver.globals.load(Ordering::SeqCst), 6);
+    assert!(fixture.driver.maintenance_inputs.lock().assert_value().iter().any(|input| {
+        input["publication_retry"] == true && input["lesson_changes"]["existing-provider-lesson"]["initial_proposal"]["draft"]["recommendation"].as_str().is_some_and(|text| text.contains("cached OAuth"))
+    }));
+    let inputs = fixture.driver.maintenance_inputs.lock().assert_value();
+    assert!(inputs.iter().any(
+        |input| input["lesson_changes"]["existing-provider-lesson"]["current"]["revision"] == 2
+    ));
+    assert!(inputs.iter().any(|input| {
+        input["lesson_changes"]
+            .as_object()
+            .assert_value()
+            .values()
+            .any(|change| !change["run_finding"].is_null())
+    }));
+}
+
+#[tokio::test]
+async fn refresh_reports_retirement_without_recreating_the_lesson() {
+    let fixture = fixture(Default::default(), Some(seed_lesson()), true).await;
+    fixture
+        .store
+        .lock()
+        .await
+        .apply_batch(&[LessonMutation::Delete {
+            id: "existing-provider-lesson".to_owned(),
+            expected_revision: 1,
+        }])
+        .assert_value();
+    fixture.drive().await;
+    assert!(fixture.lessons().await.is_empty());
+    let inputs = fixture.driver.maintenance_inputs.lock().assert_value();
+    let change = inputs
+        .iter()
+        .find_map(|input| input["lesson_changes"].get("existing-provider-lesson"))
+        .assert_value();
+    assert_eq!(change["before"]["revision"], 1);
+    assert!(change["current"].is_null());
+    assert_eq!(change["worker_received"], true);
+}
+
+#[tokio::test]
+async fn externally_added_advice_is_reconciled_without_claiming_worker_exposure() {
+    let fixture = fixture(Default::default(), None, true).await;
+    let mut external = seed_lesson();
+    external.id = "external-new-lesson".to_owned();
+    fixture
+        .store
+        .lock()
+        .await
+        .apply_batch(&[LessonMutation::Upsert {
+            expected_revision: None,
+            draft: Box::new(external),
+        }])
+        .assert_value();
+    fixture.drive().await;
+    assert_eq!(fixture.lessons().await.len(), 1);
+    let inputs = fixture.driver.maintenance_inputs.lock().assert_value();
+    let change = inputs
+        .iter()
+        .find_map(|input| input["lesson_changes"].get("external-new-lesson"))
+        .assert_value();
+    assert!(change["before"].is_null());
+    assert_eq!(change["current"]["revision"], 1);
+    assert_eq!(change["worker_received"], false);
+}

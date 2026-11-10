@@ -61,13 +61,13 @@ class Preset:
 
     Args:
         name: Exact name returned by Client.list_presets().
-        delivery: Native delivery selector: none, push, pull_request, or merge.
+        delivery: Native delivery selector. None uses the executable-owned template default.
         pull_request_feedback: Whether pull-request feedback is considered or ignored for
             pull_request and merge delivery.
     """
 
     name: str
-    delivery: str = field(default="none", kw_only=True)
+    delivery: str | None = field(default=None, kw_only=True)
     pull_request_feedback: str = field(default="consider", kw_only=True)
 
 
@@ -105,25 +105,39 @@ class UniformRuntime:
     """Apply one agent runtime to every executable graph node.
 
     Args:
-        harness: Native codex, claude, copilot, or pi harness name.
+        harness: Harness identifier enabled by the selected host.
         provider: Native provider name.
         model: Native model identifier.
         effort: Optional native reasoning effort.
-        size: Native small, medium, or large run size.
+        context_window: Optional caller-declared model context window. None keeps the provider's
+            own default.
+        max_tokens: Optional caller-declared model output limit. None keeps the provider's own
+            default.
+        size: Native small, medium, large, xl, or gpu_t4 run size, subject to target support.
+        workspace_checkpoints: Whether to capture workspace snapshots. Defaults to enabled.
         session_scope: execution opens a fresh session for each execution; node_instance reuses a
             live session when that graph node instance runs again.
         connections: Connection keys mapped to the exact environment field names their agent nodes
             need. None selects the executable-owned provider defaults; an empty mapping declares no
             connections.
+        harness_config: Optional secret-free native args/options for each agent binding.
+        active_memory: Optional native repository/graph recall and collection controls.
+        global_agents: Optional native built-in global-agent settings, including postmortem.
     """
 
     harness: str
     provider: str
     model: str
     effort: str | None = None
+    context_window: int | None = None
+    max_tokens: int | None = None
     size: str = "medium"
+    workspace_checkpoints: bool = True
     session_scope: str = "execution"
     connections: Mapping[str, tuple[str, ...]] | None = None
+    active_memory: Mapping[str, JsonValue] | None = None
+    global_agents: Mapping[str, JsonValue] | None = None
+    harness_config: Mapping[str, JsonValue] | None = None
 
     def to_dict(self) -> dict[str, JsonValue]:
         """Encode the declarative uniform runtime consumed and validated by Zeroshot."""
@@ -134,12 +148,24 @@ class UniformRuntime:
             "sessionScope": self.session_scope,
         }
         value["harness"] = self.harness
+        if not self.workspace_checkpoints:
+            value["workspaceCheckpoints"] = False
         if self.effort is not None:
             value["effort"] = self.effort
+        if self.context_window is not None:
+            value["contextWindow"] = self.context_window
+        if self.max_tokens is not None:
+            value["maxTokens"] = self.max_tokens
         if self.connections is not None:
             value["connections"] = {
                 key: list(environment) for key, environment in self.connections.items()
             }
+        if self.harness_config is not None:
+            value["harnessConfig"] = deepcopy(dict(self.harness_config))
+        if self.active_memory is not None:
+            value["activeMemory"] = deepcopy(dict(self.active_memory))
+        if self.global_agents is not None:
+            value["globalAgents"] = deepcopy(dict(self.global_agents))
         return value
 
 

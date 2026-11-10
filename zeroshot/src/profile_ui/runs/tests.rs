@@ -290,6 +290,7 @@ struct Fixture {
 fn safe_logs(count: usize, prefix: &str) -> Vec<RunEvent> {
     (0..count)
         .map(|index| RunEvent::SafeLog {
+            diagnostic: None,
             execution: Some(ExecutionId::new(1).assert_value()),
             timestamp: UnixTimestampMillis::new(index as u64 + 1).assert_value(),
             stream: SafeLogStream::Output,
@@ -378,11 +379,10 @@ impl Fixture {
                     title: RunTitle::new("Inspect retained changes").assert_value(),
                     graph,
                     initial_input,
-                    runtime: crate::native_v2_contract::RuntimePlan::Codex {
-                        provider: crate::native_v2_contract::CodexProvider::OpenAi,
-                        size: RunSize::Small,
-                        nodes: Default::default(),
-                    },
+                    runtime: crate::native_v2_candidate::test_support::codex_runtime(
+                        RunSize::Small,
+                        Default::default(),
+                    ),
                     source: Some(repository_source()),
                 },
             })
@@ -439,6 +439,7 @@ async fn definition_uses_admitted_inputs_and_history_preserves_browser_identitie
             &fixture.id,
             vec![
                 RunEvent::SafeLog {
+                    diagnostic: None,
                     execution: Some(ExecutionId::new(identity).assert_value()),
                     timestamp: UnixTimestampMillis::new(1_789_612_345_678).assert_value(),
                     stream: SafeLogStream::Output,

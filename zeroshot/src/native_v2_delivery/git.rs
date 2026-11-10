@@ -29,6 +29,8 @@ impl From<GitCommandFailure> for GitError {
 pub(crate) struct SystemGit {
     program: PathBuf,
     identity: Option<crate::execution::process::HostedProcessIdentity>,
+    local_environment: Option<std::collections::BTreeMap<String, String>>,
+    commit_identity: Option<openengine_cluster_protocol::CommitIdentity>,
 }
 
 impl SystemGit {
@@ -36,6 +38,8 @@ impl SystemGit {
         Self {
             program,
             identity: None,
+            local_environment: None,
+            commit_identity: None,
         }
     }
 
@@ -44,6 +48,22 @@ impl SystemGit {
         identity: Option<crate::execution::process::HostedProcessIdentity>,
     ) -> Self {
         self.identity = identity;
+        self
+    }
+
+    pub(crate) fn with_local_environment(
+        mut self,
+        environment: Option<std::collections::BTreeMap<String, String>>,
+    ) -> Self {
+        self.local_environment = environment;
+        self
+    }
+
+    pub(crate) fn with_commit_identity(
+        mut self,
+        identity: Option<openengine_cluster_protocol::CommitIdentity>,
+    ) -> Self {
+        self.commit_identity = identity;
         self
     }
 
@@ -57,18 +77,19 @@ impl SystemGit {
         let unresolved = self
             .require_success(workspace, &["diff", "--name-only", "--diff-filter=U"])
             .await?;
-        if !unresolved.stdout.is_empty() || unresolved.stdout_truncated {
-            return Err(GitError::Unmerged(Box::new(unresolved)));
+        if !unresolved.stdout().is_empty() || unresolved.stdout_truncated() {
+            return Err(GitError::Unmerged(Box::new(unresolved.into_diagnostic())));
         }
         self.require_success(workspace, &["add", "--all"]).await?;
         if self.commit_pending(workspace).await? {
+            let [name, email] = command::identity_configuration(self.commit_identity.as_ref());
             self.require_success(
                 workspace,
                 &[
                     "-c",
-                    "user.name=Zeroshot",
+                    &name,
                     "-c",
-                    "user.email=delivery@zeroshot.invalid",
+                    &email,
                     "commit",
                     "--no-verify",
                     "--message",
@@ -84,16 +105,17 @@ impl SystemGit {
         let directory = self
             .require_success(workspace, &["rev-parse", "--absolute-git-dir"])
             .await?;
-        if directory.stdout_truncated || directory.stdout.is_empty() {
+        if directory.stdout_truncated() || directory.stdout().is_empty() {
             return Err(directory
+                .into_diagnostic()
                 .with_context("Git directory path is unavailable")
                 .into());
         }
         let path = Path::new(
             directory
-                .stdout
+                .stdout()
                 .strip_suffix('\n')
-                .unwrap_or(&directory.stdout),
+                .unwrap_or(directory.stdout()),
         );
         for marker in [
             "rebase-merge",
@@ -104,6 +126,7 @@ impl SystemGit {
         ] {
             let pending = path.join(marker).try_exists().map_err(|error| {
                 directory
+                    .diagnostic()
                     .clone()
                     .with_context(format!("cannot inspect Git state {marker}: {error}"))
             })?;
@@ -114,7 +137,7 @@ impl SystemGit {
                         &["--no-optional-locks", "status", "--untracked-files=all"],
                     )
                     .await?;
-                return Err(status.with_context(format!(
+                return Err(status.into_diagnostic().with_context(format!(
                     "workspace has an unfinished Git operation ({marker}); finish or abort it before delivery; \
                      no files were staged or committed"
                 )).into());
@@ -131,8 +154,8 @@ impl SystemGit {
         let head = self
             .require_success(workspace, &["rev-parse", "HEAD"])
             .await?;
-        let revision = head.stdout.trim().to_owned();
-        if !valid_revision(&revision) || head.stdout_truncated {
+        let revision = head.stdout().trim().to_owned();
+        if !valid_revision(&revision) || head.stdout_truncated() {
             return Err(GitError::InvalidRevision);
         }
         let status = self
@@ -143,8 +166,8 @@ impl SystemGit {
             .await?;
         Ok((
             revision,
-            !status.stdout.is_empty()
-                || status.stdout_truncated
+            !status.stdout().is_empty()
+                || status.stdout_truncated()
                 || self.merge_pending(workspace).await?,
         ))
     }
@@ -157,8 +180,8 @@ impl SystemGit {
         let tree = self
             .require_success(workspace, &["rev-parse", &format!("{revision}^{{tree}}")])
             .await?;
-        let value = tree.stdout.trim().to_owned();
-        if tree.stdout_truncated || !valid_revision(&value) {
+        let value = tree.stdout().trim().to_owned();
+        if tree.stdout_truncated() || !valid_revision(&value) {
             return Err(GitError::InvalidRevision);
         }
         Ok(value)
@@ -168,10 +191,10 @@ impl SystemGit {
         let staged = self
             .execute(workspace, &["diff", "--cached", "--quiet", "--exit-code"])
             .await?;
-        match staged.exit_status {
+        match staged.diagnostic().exit_status {
             Some(0) => self.merge_pending(workspace).await,
             Some(1) => Ok(true),
-            _ => Err(staged.into()),
+            _ => Err(staged.into_diagnostic().into()),
         }
     }
 
@@ -179,10 +202,10 @@ impl SystemGit {
         let merge = self
             .execute(workspace, &["rev-parse", "-q", "--verify", "MERGE_HEAD"])
             .await?;
-        match merge.exit_status {
+        match merge.diagnostic().exit_status {
             Some(0) => Ok(true),
             Some(1) => Ok(false),
-            _ => Err(merge.into()),
+            _ => Err(merge.into_diagnostic().into()),
         }
     }
 
@@ -194,8 +217,8 @@ impl SystemGit {
         let output = self
             .require_success(workspace, &["rev-parse", "HEAD"])
             .await?;
-        let revision = output.stdout.trim().to_owned();
-        if !valid_revision(&revision) {
+        let revision = output.stdout().trim().to_owned();
+        if output.stdout_truncated() || !valid_revision(&revision) {
             return Err(GitError::InvalidRevision);
         }
         if revision == base_revision {
@@ -213,7 +236,7 @@ impl SystemGit {
         &self,
         workspace: &Path,
         arguments: &[&str],
-    ) -> Result<GitCommandFailure, GitError> {
+    ) -> Result<command::GitCommandOutput, GitError> {
         self.execute(workspace, arguments)
             .await?
             .require_success()
@@ -224,18 +247,26 @@ impl SystemGit {
         &self,
         workspace: &Path,
         arguments: &[&str],
-    ) -> Result<GitCommandFailure, GitError> {
-        command::capture(
+    ) -> Result<command::GitCommandOutput, GitError> {
+        command::capture_sensitive(
             &mut self.command(workspace, arguments),
             Duration::from_secs(10 * 60),
+            &[],
         )
         .await
         .map_err(Into::into)
     }
 
     fn command(&self, workspace: &Path, arguments: &[&str]) -> Command {
-        let mut command =
-            command::local_git_command_with_identity(&self.program, workspace, self.identity);
+        let mut command = command::git_command(
+            &self.program,
+            workspace,
+            command::GitCommandContext {
+                identity: self.identity,
+                local_environment: self.local_environment.as_ref(),
+                commit_identity: self.commit_identity.as_ref(),
+            },
+        );
         command.args(arguments);
         command
     }
@@ -248,3 +279,11 @@ mod tests;
 #[cfg(test)]
 #[path = "git/tests/operations.rs"]
 mod operations;
+
+#[cfg(test)]
+#[path = "git/test_support.rs"]
+pub(crate) mod test_support;
+
+#[cfg(test)]
+#[path = "git/tests/environment.rs"]
+mod environment_tests;

@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use openengine_cluster_client::SubscriptionTransport;
 use openengine_cluster_protocol::{
     ConnectionDeleteRequest, ConnectionDeleteResult, ConnectionListRequest, ConnectionListResult,
-    ConnectionMutationResult, ConnectionSetRequest, MergePlan, MergePlanId, RunForceParams,
+    ConnectionMutationResult, ConnectionSetRequest, Stack, StackId, RunForceParams,
     RunConnectionRequirements, RunListParams, RunLogEventNotification, RunLogsParams, RunProfile,
     RunProfileDefaultRequest, RunProfileDefaultResult, RunProfileDeleteResult,
     RunProfileListRequest, RunProfileListResult, RunProfileMutationResult, RunProfileSelector,
@@ -14,7 +14,7 @@ use openengine_cluster_protocol::{
 use super::BoxedSubscription;
 use crate::native_v2_cli::{
     CliRunForceResult, CliRunListResult, CliRunStatusResult, CliRunWatchEventNotification,
-    NativeV2CliError, PreparedMergePlanRequest, PreparedRunRequest, TargetAdd,
+    NativeV2CliError, PreparedStackRequest, PreparedRunRequest, TargetAdd,
 };
 
 /// Named-target authority. The CLI does not interpret login credentials or runtime configuration.
@@ -22,8 +22,40 @@ use crate::native_v2_cli::{
 pub trait TargetConnector: Send + Sync {
     type Transport: SubscriptionTransport + Send + Sync + 'static;
 
+    async fn review_cache_namespace(
+        &self,
+        _name: &str,
+    ) -> Result<Option<String>, NativeV2CliError> {
+        Ok(None)
+    }
+
+    async fn resolve_review(
+        &self,
+        _name: &str,
+        _request: crate::native_v2_review::ReviewResolutionRequest,
+        _runtime: &openengine_cluster_protocol::RuntimePlan,
+    ) -> Result<crate::native_v2_review::PreparedReview, NativeV2CliError> {
+        Err(NativeV2CliError::Target(
+            "target does not advertise task resolution".to_owned(),
+        ))
+    }
+
     async fn add(&self, request: TargetAdd) -> Result<(), NativeV2CliError>;
     async fn login(&self, name: &str) -> Result<(), NativeV2CliError>;
+    async fn default_resource_scope(
+        &self,
+        _name: &str,
+    ) -> Result<openengine_cluster_protocol::ConnectionScope, NativeV2CliError> {
+        Ok(openengine_cluster_protocol::ConnectionScope::User)
+    }
+    async fn delegation(
+        &self,
+        _command: crate::native_v2_cli::DelegationCommand,
+    ) -> Result<crate::native_v2_cli::DelegationResult, NativeV2CliError> {
+        Err(NativeV2CliError::Target(
+            "target does not advertise delegation management".to_owned(),
+        ))
+    }
     async fn connection_list(
         &self,
         name: &str,
@@ -64,31 +96,31 @@ pub trait TargetConnector: Send + Sync {
         name: &str,
         request: RunProfileDefaultRequest,
     ) -> Result<RunProfileDefaultResult, NativeV2CliError>;
-    async fn merge_plan_submit(
+    async fn stack_submit(
         &self,
         _name: &str,
-        _request: PreparedMergePlanRequest,
-    ) -> Result<MergePlan, NativeV2CliError> {
+        _request: PreparedStackRequest,
+    ) -> Result<Stack, NativeV2CliError> {
         Err(NativeV2CliError::Target(
-            "target does not advertise merge plans".to_owned(),
+            "target does not advertise stacks".to_owned(),
         ))
     }
-    async fn merge_plan_status(
+    async fn stack_status(
         &self,
         _name: &str,
-        _plan_id: MergePlanId,
-    ) -> Result<MergePlan, NativeV2CliError> {
+        _stack_id: StackId,
+    ) -> Result<Stack, NativeV2CliError> {
         Err(NativeV2CliError::Target(
-            "target does not advertise merge plans".to_owned(),
+            "target does not advertise stacks".to_owned(),
         ))
     }
-    async fn merge_plan_force(
+    async fn stack_force(
         &self,
         _name: &str,
-        _plan_id: MergePlanId,
-    ) -> Result<MergePlan, NativeV2CliError> {
+        _stack_id: StackId,
+    ) -> Result<Stack, NativeV2CliError> {
         Err(NativeV2CliError::Target(
-            "target does not advertise merge plans".to_owned(),
+            "target does not advertise stacks".to_owned(),
         ))
     }
     async fn submit(

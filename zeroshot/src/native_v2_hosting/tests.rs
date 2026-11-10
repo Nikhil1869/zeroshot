@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 
 use super::*;
 use crate::native_v2_candidate::test_support::{TestDirectory, admit, environment_name};
-use crate::native_v2_cloud::CapsuleAllocator;
+use crate::native_v2_platform::CapsuleAllocator;
 use crate::native_v2_contract::{self, ExecutionRef, NodeInvocation};
 use crate::native_v2_runner::{NodeRunRequest, ResolvedEnvironment};
 use crate::native_v2_portable_controller::WorkspaceIdentity;
@@ -28,7 +28,8 @@ use super::allocator::{ProductionCapsuleAllocator, monitor_workspace_identity, p
 use super::repository::{RepositoryInstall, install_repository, path_source};
 
 mod checkout;
-mod fixtures;
+pub(super) mod fixtures;
+mod harnesses;
 
 use fixtures::*;
 
@@ -135,6 +136,7 @@ fn run_environment_is_exact_and_request_debug_is_redacted() {
         connection_resolver: None,
         git_credentials: None,
         github_token: Some("github-secret".to_owned()),
+        commit_identity: None,
     };
     let debug = format!("{request:?}");
     assert!(debug.contains("OPENAI_API_KEY"));
@@ -146,7 +148,7 @@ fn run_environment_is_exact_and_request_debug_is_redacted() {
 
 #[test]
 fn graph_rejection_projects_its_first_safe_diagnostic() {
-    let projected = project_cloud_error(NativeV2CloudError::Admission(
+    let projected = project_platform_error(NativeV2PlatformError::Admission(
         crate::native_v2_admission::NativeV2AdmissionError::GraphVerification(
             VerificationError::Rejected {
                 diagnostics: vec![GraphDiagnostic {
@@ -169,38 +171,38 @@ fn graph_rejection_projects_its_first_safe_diagnostic() {
 }
 
 #[test]
-fn cloud_failures_map_to_stable_target_error_classes() {
+fn platform_failures_map_to_stable_target_error_classes() {
     let cases = [
         (
-            NativeV2CloudError::SubmissionIdentity,
+            NativeV2PlatformError::SubmissionIdentity,
             TargetAuthorityErrorKind::Invalid,
         ),
         (
-            NativeV2CloudError::Ledger(RunLedgerError::AdmittedRunTooLarge),
+            NativeV2PlatformError::Ledger(RunLedgerError::AdmittedRunTooLarge),
             TargetAuthorityErrorKind::Invalid,
         ),
         (
-            NativeV2CloudError::Ledger(RunLedgerError::SubmissionConflict {
+            NativeV2PlatformError::Ledger(RunLedgerError::SubmissionConflict {
                 existing_run_id: RunId::new("existing-run"),
             }),
             TargetAuthorityErrorKind::Conflict,
         ),
         (
-            NativeV2CloudError::Ledger(RunLedgerError::RunIdConflict),
+            NativeV2PlatformError::Ledger(RunLedgerError::RunIdConflict),
             TargetAuthorityErrorKind::Conflict,
         ),
         (
-            NativeV2CloudError::Ledger(RunLedgerError::Storage),
+            NativeV2PlatformError::Ledger(RunLedgerError::Storage),
             TargetAuthorityErrorKind::Unavailable,
         ),
         (
-            NativeV2CloudError::ResumeCredentials,
+            NativeV2PlatformError::ResumeCredentials,
             TargetAuthorityErrorKind::Unavailable,
         ),
     ];
     for (source, expected) in cases {
         let message = source.to_string();
-        let projected = project_cloud_error(source);
+        let projected = project_platform_error(source);
         assert_eq!(projected.kind(), expected);
         assert_eq!(projected.message(), message);
     }
@@ -247,7 +249,7 @@ fn capsule_configuration_requires_every_executable_boundary() {
             _ => unreachable!(),
         }
         assert!(matches!(
-            ProductionCapsuleAllocator::new(config),
+            capsule_allocator(config),
             Err(ProductionHostingError::CapsuleConfiguration)
         ));
     }
@@ -378,8 +380,27 @@ fn production_ledger_rejects_symlinks_and_foreign_owners() {
 }
 
 #[test]
+fn production_storage_rejects_a_symlinked_profile_store() {
+    use std::os::unix::fs::symlink;
+
+    let root = TestDirectory::new("hosting-profile-store-validation");
+    let target = root.path().join("target");
+    fs::write(&target, "{}").assert_value();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).assert_value();
+    symlink(&target, root.path().join("profiles.json")).assert_value();
+    assert_eq!(
+        prepare_storage_root(&root.path().to_owned()),
+        Err(ProductionHostingError::Storage)
+    );
+    assert_eq!(
+        fs::metadata(&target).assert_value().permissions().mode() & 0o777,
+        0o644
+    );
+}
+
+#[test]
 #[cfg(target_os = "linux")]
-fn hosted_worker_cannot_read_the_ledger_or_another_candidate() {
+fn root_hosted_worker_cannot_read_the_ledger_or_another_candidate() {
     use crate::execution::process::{HostedProcessPool, HostedProcessScope};
     use crate::native_v2_capsule::{CapsuleFilesystemSpec, prepare_capsule_filesystem};
 
@@ -388,6 +409,13 @@ fn hosted_worker_cannot_read_the_ledger_or_another_candidate() {
         return;
     }
     let root = TestDirectory::new("hosting-cross-run-boundary");
+    // A profile store written by an earlier target is repaired before runs can traverse the root.
+    let profiles_path = root.path().join("profiles.json");
+    let profiles_lock_path = root.path().join("profiles.lock");
+    for path in [&profiles_path, &profiles_lock_path] {
+        fs::write(path, "{}").assert_value();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o644)).assert_value();
+    }
     let storage = prepare_storage_root(&root.path().to_owned()).assert_value();
     let ledger_path = storage.join("runs.sqlite3");
     fs::write(&ledger_path, "private ledger").assert_value();
@@ -418,15 +446,19 @@ fn hosted_worker_cannot_read_the_ledger_or_another_candidate() {
         .identity(HostedProcessScope::Writer)
         .assert_value();
 
+    // `set -e` ignores negated commands, so each denied read must fail the script explicitly.
     let status = Command::new("/bin/sh")
         .arg("-c")
         .arg(
             "set -eu; cd \"$OWN\"; printf own > worker.txt; test \"$(cat worker.txt)\" = own; \
-             ! cat \"$LEDGER\" >/dev/null 2>&1; ! cat \"$OTHER/secret\" >/dev/null 2>&1",
+             for denied in \"$LEDGER\" \"$PROFILES\" \"$PROFILES_LOCK\" \"$OTHER/secret\"; do \
+             if cat \"$denied\" >/dev/null 2>&1; then exit 1; fi; done",
         )
         .env_clear()
         .env("OWN", &first.workspace)
         .env("LEDGER", &ledger_path)
+        .env("PROFILES", &profiles_path)
+        .env("PROFILES_LOCK", &profiles_lock_path)
         .env("OTHER", &second.workspace)
         .uid(writer.uid())
         .gid(writer.gid())
@@ -453,11 +485,15 @@ async fn invalid_submission_fails_before_run_allocation() {
         "0123456789abcdef0123456789abcdef01234567",
         "invalid-before-effects",
     );
-    sourceful.runtime = RuntimePlan::Codex {
-        provider: crate::native_v2_contract::CodexProvider::OpenAi,
-        size: RunSize::Small,
-        nodes: BTreeMap::new(),
-    };
+    sourceful.runtime = RuntimePlan::new(
+        openengine_cluster_protocol::RuntimeLane::new(
+            "codex",
+            (crate::native_v2_contract::CodexProvider::OpenAi).name(),
+        )
+        .assert_value(),
+        RunSize::Small,
+        BTreeMap::new(),
+    );
 
     let error = factory
         .submit(
@@ -469,6 +505,7 @@ async fn invalid_submission_fails_before_run_allocation() {
                 connection_resolver: None,
                 git_credentials: None,
                 github_token: None,
+                commit_identity: None,
             },
         )
         .await
@@ -510,6 +547,7 @@ async fn invalid_run_environment_fails_before_allocation() {
                 connection_resolver: None,
                 git_credentials: None,
                 github_token: None,
+                commit_identity: None,
             },
         )
         .await
@@ -544,6 +582,7 @@ async fn repository_resolution_and_installation_preserve_the_exact_revision() {
     let workspace = root.path().join("workspace");
     writable_directory(&workspace);
     let installed = install_repository(RepositoryInstall {
+        checkout_references: &[],
         git_credentials: None,
         private_directory: root.path(),
         git_program: Path::new("/usr/bin/git"),
@@ -571,7 +610,7 @@ async fn allocator_uses_one_workspace_then_cleans_without_replacement() {
         "hosting-allocation",
     ))
     .await;
-    let allocator = ProductionCapsuleAllocator::new(capsule_config(root.path().to_owned()))
+    let allocator = capsule_allocator(capsule_config(root.path().to_owned()))
         .assert_value_with("allocator")
         .with_test_filesystem_and_source(repository.remote, portable_filesystem);
     let run_id = RunId::new("run-hosting-one");
@@ -693,7 +732,7 @@ async fn default_claude_environment_owns_private_session_home_until_completion()
     config.claude_process_environment = ClaudeProcessEnvironment::default();
     config.claude_executable = "/bin/sh".to_owned();
     config.claude_prefix_arguments = vec!["-c".to_owned(), CLAUDE_HOME_SCRIPT.to_owned()];
-    let allocator = ProductionCapsuleAllocator::new(config)
+    let allocator = capsule_allocator(config)
         .assert_value_with("allocator")
         .with_test_filesystem_and_source(repository.remote, portable_filesystem);
     let run_id = RunId::new("run-hosting-claude-environment");
@@ -714,6 +753,7 @@ async fn default_claude_environment_owns_private_session_home_until_completion()
     let mut handle = capsule
         .runner
         .start(NodeRunRequest {
+            dispatch: Default::default(),
             invocation: NodeInvocation {
                 reference: ExecutionRef {
                     run_id: run_id.clone(),
@@ -783,4 +823,17 @@ async fn assert_running_claude_home_if_root(
         private_home.to_string_lossy()
     );
     fs::write(run_path.join("workspace/release-provider"), "").assert_value();
+}
+
+#[test]
+fn unsupported_contained_targets_refuse_workspace_checkpoint_opt_out() {
+    let mut request = submission(runtime(BTreeSet::new()), &"a".repeat(40), "local-folder");
+    request.runtime.workspace_checkpoints = false;
+    let error = prepare_contained_submission(&mut request).assert_error();
+    assert_eq!(error.kind(), TargetAuthorityErrorKind::Invalid);
+    assert!(
+        error
+            .message()
+            .contains("does not support disabling workspace checkpoints")
+    );
 }

@@ -77,12 +77,8 @@ fn lane_submission_fixture_round_trips_with_per_node_lanes() {
     let wire: Value = serde_json::from_str(LANE_SUBMISSION).assert_value();
     let params: RunSubmitParams = serde_json::from_value(wire.clone()).assert_value();
     let runtime = &params.submission.runtime;
-    let codex = RuntimeLane::Codex {
-        provider: CodexProvider::OpenAi,
-    };
-    let claude = RuntimeLane::Claude {
-        provider: ClaudeProvider::Anthropic,
-    };
+    let codex = RuntimeLane::new("codex", "openai").assert_value();
+    let claude = RuntimeLane::new("claude", "anthropic").assert_value();
     let effective_lane = |node: &str| {
         let binding = runtime
             .nodes()
@@ -195,6 +191,26 @@ fn both_harness_provider_enums_round_trip_bedrock() {
 }
 
 #[test]
+fn both_harness_provider_enums_round_trip_foundry() {
+    assert_eq!(
+        serde_json::to_value(CodexProvider::Foundry).assert_value(),
+        json!("foundry")
+    );
+    assert_eq!(
+        serde_json::from_value::<CodexProvider>(json!("foundry")).assert_value(),
+        CodexProvider::Foundry
+    );
+    assert_eq!(
+        serde_json::to_value(ClaudeProvider::Foundry).assert_value(),
+        json!("foundry")
+    );
+    assert_eq!(
+        serde_json::from_value::<ClaudeProvider>(json!("foundry")).assert_value(),
+        ClaudeProvider::Foundry
+    );
+}
+
+#[test]
 fn submit_rejects_removed_ship_and_inventory_is_closed() {
     let mut wire = json!({ "runId": "run-1", "submission": submission() });
     json_insert::json_insert(&mut wire, "", "ship", json!(false));
@@ -253,4 +269,14 @@ fn resume_debug_exposes_connection_names_but_redacts_credentials() {
     assert!(diagnostic.contains("[REDACTED]"));
     assert!(!diagnostic.contains("connection-secret"));
     assert!(!diagnostic.contains("github-secret"));
+}
+
+#[test]
+fn xl_and_gpu_sizes_round_trip_without_rewriting_machine_identity() {
+    for (wire, expected) in [("xl", RunSize::Xl), ("gpu_t4", RunSize::GpuT4)] {
+        let size: RunSize = serde_json::from_value(json!(wire)).assert_value();
+        assert_eq!(size, expected);
+        assert_eq!(serde_json::to_value(size).assert_value(), json!(wire));
+    }
+    assert!(serde_json::from_value::<RunSize>(json!("gpu")).is_err());
 }

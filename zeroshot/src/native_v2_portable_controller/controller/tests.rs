@@ -21,6 +21,97 @@ async fn insert_fake_run(ledger: &FakeRunLedger, run: &str, key: &str, digest: c
         .assert_value();
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn review_git_preparation_requires_the_workspace_lease_before_any_mutation() {
+    use crate::native_v2_cli::{BuiltinGraphTemplate, TemplateDelivery};
+    use openengine_cluster_protocol::{
+        CodexProvider, DeclaredConnections, NodeName, NodeRuntimeBinding, RunSize, RuntimePlan,
+    };
+    use serde_json::json;
+    for occupied in [true, false] {
+        let root = tempfile::tempdir().assert_value();
+        let workspace = root.path().join("workspace");
+        let bin = root.path().join("bin");
+        std::fs::create_dir(&workspace).assert_value();
+        std::fs::create_dir(&bin).assert_value();
+        let git = bin.join("git");
+        openengine_cluster_testkit::fixture::write_executable(
+            &git,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$0.calls\"\n",
+            0o755,
+        )
+        .assert_value();
+        let mut submission =
+            crate::native_v2_portable_controller::tests::submission("review-lease");
+        submission.graph = BuiltinGraphTemplate::IssueReview
+            .materialize(TemplateDelivery::Comment)
+            .assert_value();
+        let revision = submission.source.as_ref().unwrap().revision.as_str();
+        submission.initial_input = json!({
+            "url":"https://github.com/open-engine/zeroshot/pull/17",
+            "context":{"title":"Review","body":"Changes","reviewScope":{
+                "baseRepository":"open-engine/zeroshot", "baseBranch":"main", "baseRevision":"b".repeat(40),
+                "headRepository":"contributor/fork", "headBranch":"feature", "headRevision":revision
+            }}
+        });
+        submission.runtime = RuntimePlan::new(
+            openengine_cluster_protocol::RuntimeLane::new("codex", (CodexProvider::OpenAi).name())
+                .assert_value(),
+            RunSize::Small,
+            std::collections::BTreeMap::from([
+                (
+                    NodeName::new("reviewer").assert_value(),
+                    serde_json::from_value(json!({"kind":"agent", "model":"fixture"}))
+                        .assert_value(),
+                ),
+                (
+                    NodeName::new("deliver").assert_value(),
+                    NodeRuntimeBinding::CommentDelivery {
+                        connections: DeclaredConnections::empty(),
+                    },
+                ),
+            ]),
+        );
+        let mut bootstrap = crate::native_v2_portable_controller::tests::bootstrap(
+            RunId::new("review-lease"),
+            submission,
+            workspace.clone(),
+            root.path().join("state"),
+        );
+        bootstrap
+            .native_environment
+            .insert("PATH".to_owned(), bin.to_str().unwrap().to_owned());
+        let lease = occupied.then(|| {
+            ControllerLease::acquire_workspace(&bootstrap.workspace_lease, &workspace)
+                .assert_value()
+        });
+        let prepared = prepare_controller_start(&bootstrap).await.assert_value();
+        let result = prepare_runtime(&prepared, &bootstrap, |_| {
+            Err::<PortableRuntime, _>(std::io::Error::other("stop before graph dispatch"))
+        })
+        .await;
+        if occupied {
+            assert!(matches!(
+                result,
+                Err(PortableControllerError::Lease(
+                    super::super::ControllerLeaseError::Held
+                ))
+            ));
+            assert!(!git.with_extension("calls").exists());
+        } else {
+            assert!(matches!(
+                result,
+                Err(PortableControllerError::RuntimeUnavailable)
+            ));
+            let calls = std::fs::read_to_string(git.with_extension("calls")).assert_value();
+            assert!(calls.lines().any(|arg| arg == "fetch"));
+            assert!(calls.lines().any(|arg| arg == "refs/zeroshot/review/base"));
+        }
+        drop(lease);
+    }
+}
+
 fn workspace_identity(root: &Path) -> (PathBuf, WorkspaceIdentity) {
     let workspace = root.join("workspace");
     std::fs::create_dir(&workspace).assert_value();
@@ -482,4 +573,41 @@ fn final_contract_workspace_monitor_distinguishes_continue_loss_and_owner_shutdo
         workspace_monitor_action(&monitor),
         WorkspaceMonitorAction::Stop
     );
+}
+
+#[tokio::test]
+async fn workspace_checkpoint_store_follows_runtime_policy() {
+    use crate::native_v2_portable_controller::tests::{bootstrap, submission, NeverDispatched};
+    for enabled in [false, true] {
+        let root = tempfile::tempdir().assert_value();
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).assert_value();
+        let storage = root.path().join("state");
+        let mut submitted = submission("checkpoint-policy");
+        submitted.runtime.workspace_checkpoints = enabled;
+        let bootstrap = bootstrap(
+            RunId::new("checkpoint-policy"),
+            submitted,
+            workspace,
+            storage,
+        );
+        let prepared = prepare_controller_start(&bootstrap).await.assert_value();
+        let runtime = prepare_runtime(&prepared, &bootstrap, |_| {
+            Ok::<_, std::io::Error>(PortableRuntime {
+                checkpoints: None,
+                execution_seed: Vec::new(),
+                runner: Arc::new(NeverDispatched),
+                cleanup: Arc::new(super::super::engine::ConfirmedCleanup),
+            })
+        })
+        .await
+        .assert_value()
+        .runtime
+        .assert_value();
+        assert_eq!(runtime.checkpoints.is_some(), enabled);
+        if !enabled {
+            assert!(!bootstrap.checkpoint_repository.exists());
+            assert!(!prepared.paths.storage().join("checkpoints").exists());
+        }
+    }
 }

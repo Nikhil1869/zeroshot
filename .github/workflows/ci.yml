@@ -1,10 +1,9 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
   pull_request:
     branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
   merge_group:
     types: [checks_requested]
   workflow_dispatch:
@@ -26,6 +25,7 @@ jobs:
       tooling: ${{ steps.paths.outputs.tooling }}
       npm: ${{ steps.paths.outputs.npm }}
       docs: ${{ steps.paths.outputs.docs }}
+      readme: ${{ steps.paths.outputs.readme }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -39,25 +39,75 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha || github.sha }}
-        run: |
-          set -euo pipefail
-          if [[ "$EVENT_NAME" == "workflow_dispatch" ]] ||
-             [[ -z "$BASE_SHA" ]] ||
-             [[ "$BASE_SHA" =~ ^0+$ ]] ||
-             ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null ||
-             ! git cat-file -e "${HEAD_SHA}^{commit}" 2>/dev/null; then
-            node .github/ci-path-classifier.js < /dev/null | tee -a "$GITHUB_OUTPUT"
-            exit 0
-          fi
+        run: bash .github/select-ci-lanes.sh | tee -a "$GITHUB_OUTPUT"
 
-          git diff --no-renames --name-only -z "$BASE_SHA" "$HEAD_SHA" |
-            node .github/ci-path-classifier.js |
-            tee -a "$GITHUB_OUTPUT"
+  quick-check:
+    name: PR checks
+    needs: classify
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        if: needs.classify.outputs.native == 'true'
+        with:
+          toolchain: 1.97.0
+          components: rustfmt
+
+      - name: Install repository tooling
+        run: npm ci --ignore-scripts
+
+      - name: Check Rust formatting
+        if: needs.classify.outputs.native == 'true'
+        run: cargo fmt --all -- --check
+
+      - name: Check repository tooling and workflow formatting
+        run: |
+          npm run lint
+          npx --no-install prettier --check .github/workflows/*.yml
+
+      - name: Test CI routing and delivery contracts
+        run: >-
+          node --test
+          tests/tooling/ci-*.test.js
+          tests/tooling/greptile-gate.test.js
+          tests/tooling/release-contract.test.js
+
+  readme-check:
+    name: README
+    needs: classify
+    if: needs.classify.outputs.readme == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install repository tooling
+        run: npm ci --ignore-scripts
+
+      - name: Check README formatting and documentation contracts
+        run: |
+          npx --no-install prettier --check README.md
+          node --test tests/tooling/docs-agent-contract.test.js
 
   tooling-check:
     name: Repository tooling
     needs: classify
-    if: needs.classify.outputs.tooling == 'true'
+    if: github.event_name != 'pull_request' && needs.classify.outputs.tooling == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -91,7 +141,7 @@ jobs:
   npm-check:
     name: npm package (${{ matrix.os }})
     needs: classify
-    if: needs.classify.outputs.npm == 'true'
+    if: github.event_name != 'pull_request' && needs.classify.outputs.npm == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -131,7 +181,7 @@ jobs:
   native-check:
     name: Native product (${{ matrix.os }})
     needs: classify
-    if: needs.classify.outputs.native == 'true'
+    if: github.event_name != 'pull_request' && needs.classify.outputs.native == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -165,6 +215,16 @@ jobs:
           node-version: 24
           cache: npm
           cache-dependency-path: ui/package-lock.json
+
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Test contributed native bridges
+        run: >-
+          python -m unittest discover
+          -s zeroshot/src/harnesses/adapters/contributed/hermes/tests
+          -p 'native_*_test.py'
 
       - name: Build pinned Restic sidecar for native tests
         shell: bash
@@ -290,8 +350,8 @@ jobs:
   macos-check:
     name: macOS compilation
     needs: classify
-    if: needs.classify.outputs.native == 'true'
-    runs-on: macos-14
+    if: github.event_name != 'pull_request' && needs.classify.outputs.native == 'true'
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -321,7 +381,7 @@ jobs:
   python-check:
     name: Python SDK
     needs: classify
-    if: needs.classify.outputs.python == 'true'
+    if: github.event_name != 'pull_request' && needs.classify.outputs.python == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -399,7 +459,7 @@ jobs:
   docs-check:
     name: Strict documentation
     needs: classify
-    if: needs.classify.outputs.docs == 'true'
+    if: github.event_name != 'pull_request' && needs.classify.outputs.docs == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -417,6 +477,7 @@ jobs:
       - name: Test documentation and publication contracts
         run: >-
           node --test
+          tests/tooling/docs-agent-contract.test.js
           tests/tooling/docs-versions.test.js
           tests/tooling/release-contract.test.js
 
@@ -448,6 +509,7 @@ jobs:
 
       - name: Build strict documentation
         run: |
+          python tests/docs/render_metadata.py
           python -m mkdocs build --strict
           test -f site/manifest.json
           grep -q 'id="zeroshot.Client"' site/reference/python/client/index.html
@@ -457,7 +519,7 @@ jobs:
   target-image:
     name: Target image
     needs: classify
-    if: needs.classify.outputs.native == 'true'
+    if: github.event_name != 'pull_request' && needs.classify.outputs.native == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -519,7 +581,7 @@ jobs:
         run: |
           docker run --rm --network none --read-only \
             --tmpfs /tmp:rw,nosuid,nodev,size=64m,mode=1777 \
-            --tmpfs /work:rw,nosuid,nodev,exec,size=256m,mode=0700,uid=10001,gid=10001 \
+            --tmpfs /work:rw,nosuid,nodev,exec,size=512m,mode=0700,uid=10001,gid=10001 \
             --user 10001:10001 \
             --mount "type=bind,src=${PWD}/docker/zeroshot-target/smoke-toolchains.sh,dst=/smoke.sh,readonly" \
             --mount "type=bind,src=${PWD}/rust-toolchain.toml,dst=/rust-toolchain.toml,readonly" \
@@ -527,12 +589,25 @@ jobs:
             zeroshot-target:ci -i HOME=/work/home PATH=/usr/local/bin:/usr/bin:/bin \
             /bin/sh /smoke.sh
 
+  coverage-check:
+    needs: classify
+    if: github.event_name != 'pull_request' && needs.classify.outputs.native == 'true'
+    uses: ./.github/workflows/coverage.yml
+
+  opcore-check:
+    if: github.event_name != 'pull_request'
+    uses: ./.github/workflows/opcore.yml
+
   required:
     name: required
     if: always()
     needs:
       [
         classify,
+        quick-check,
+        coverage-check,
+        opcore-check,
+        readme-check,
         tooling-check,
         npm-check,
         native-check,
@@ -542,16 +617,24 @@ jobs:
         target-image,
       ]
     runs-on: ubuntu-latest
+    permissions:
+      checks: read
     steps:
       - name: Require every selected lane
         shell: bash
         env:
+          EVENT_NAME: ${{ github.event_name }}
+          QUICK_RESULT: ${{ needs.quick-check.result }}
+          COVERAGE_RESULT: ${{ needs.coverage-check.result }}
+          OPCORE_RESULT: ${{ needs.opcore-check.result }}
           CLASSIFY_RESULT: ${{ needs.classify.result }}
           NATIVE_SELECTED: ${{ needs.classify.outputs.native }}
           PYTHON_SELECTED: ${{ needs.classify.outputs.python }}
           TOOLING_SELECTED: ${{ needs.classify.outputs.tooling }}
           NPM_SELECTED: ${{ needs.classify.outputs.npm }}
           DOCS_SELECTED: ${{ needs.classify.outputs.docs }}
+          README_SELECTED: ${{ needs.classify.outputs.readme }}
+          README_RESULT: ${{ needs.readme-check.result }}
           TOOLING_RESULT: ${{ needs.tooling-check.result }}
           NPM_RESULT: ${{ needs.npm-check.result }}
           DOCS_RESULT: ${{ needs.docs-check.result }}
@@ -565,14 +648,23 @@ jobs:
             echo "::error::classify concluded with $CLASSIFY_RESULT"
             exit 1
           }
+          case "$EVENT_NAME" in
+            pull_request) QUICK_SELECTED=true; FULL_SELECTED=false ;;
+            merge_group|workflow_dispatch) QUICK_SELECTED=false; FULL_SELECTED=true ;;
+            *) echo "::error::Unsupported CI event: $EVENT_NAME" >&2; exit 1 ;;
+          esac
           require_result() {
             local selected="$1"
             local result="$2"
             local name="$3"
+            local full_only="${4:-false}"
             [[ "$selected" == "true" || "$selected" == "false" ]] || {
               echo "::error::$name has invalid selection value: $selected"
               exit 1
             }
+            if [[ "$full_only" == "true" && "$FULL_SELECTED" == "false" ]]; then
+              selected=false
+            fi
             if [[ "$selected" == "true" && "$result" != "success" ]]; then
               echo "::error::$name concluded with $result"
               exit 1
@@ -582,10 +674,32 @@ jobs:
               exit 1
             fi
           }
-          require_result "$TOOLING_SELECTED" "$TOOLING_RESULT" tooling-check
-          require_result "$NPM_SELECTED" "$NPM_RESULT" npm-check
-          require_result "$DOCS_SELECTED" "$DOCS_RESULT" docs-check
-          require_result "$NATIVE_SELECTED" "$NATIVE_RESULT" native-check
-          require_result "$NATIVE_SELECTED" "$MACOS_RESULT" macos-check
-          require_result "$NATIVE_SELECTED" "$IMAGE_RESULT" target-image
-          require_result "$PYTHON_SELECTED" "$PYTHON_RESULT" python-check
+          require_result "$QUICK_SELECTED" "$QUICK_RESULT" quick-check
+          require_result "$FULL_SELECTED" "$OPCORE_RESULT" opcore-check
+          require_result "$NATIVE_SELECTED" "$COVERAGE_RESULT" coverage-check true
+          require_result "$README_SELECTED" "$README_RESULT" readme-check
+          require_result "$TOOLING_SELECTED" "$TOOLING_RESULT" tooling-check true
+          require_result "$NPM_SELECTED" "$NPM_RESULT" npm-check true
+          require_result "$DOCS_SELECTED" "$DOCS_RESULT" docs-check true
+          require_result "$NATIVE_SELECTED" "$NATIVE_RESULT" native-check true
+          require_result "$NATIVE_SELECTED" "$MACOS_RESULT" macos-check true
+          require_result "$NATIVE_SELECTED" "$IMAGE_RESULT" target-image true
+          require_result "$PYTHON_SELECTED" "$PYTHON_RESULT" python-check true
+
+      - name: Wait for Greptile review
+        if: github.event_name == 'pull_request' && !github.event.pull_request.draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REVIEW_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          while true; do
+            review_status="$(gh api --paginate --slurp \
+              "repos/$GITHUB_REPOSITORY/commits/$REVIEW_HEAD_SHA/check-runs?per_page=100" |
+              jq -r '[.[].check_runs[] | select(.app.id == 867647 and .name == "Greptile Review")] | max_by(.id) | .status // "pending"')"
+            if [[ "$review_status" == "completed" ]]; then
+              break
+            fi
+            echo "Waiting for Greptile to finish reviewing $REVIEW_HEAD_SHA ($review_status)"
+            sleep 15
+          done

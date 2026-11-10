@@ -68,6 +68,9 @@ function stagePackedPackage(temporary) {
     'lib/skills.js',
     'package.json',
     'skills/zeroshot/SKILL.md',
+    'skills/zeroshot-memory-init/SKILL.md',
+    'skills/zeroshot-graph-design/SKILL.md',
+    'skills/zeroshot-plan/SKILL.md',
     'targets.json',
   ]) {
     assert.equal(packedFiles.has(filename), true, `${filename} is missing from npm pack`);
@@ -138,6 +141,16 @@ it('packs and installs the published npm surface on the current host', async (t)
       skills.requireCompleteSkillInstall(results, sink, sink);
     },
   };
+  const skipOptions = {
+    ...installOptions,
+    environment: { ZEROSHOT_SKIP_SKILLS: '1' },
+  };
+  const skippedDestination = await installed.install(skipOptions);
+  assert.deepEqual(fs.readFileSync(skippedDestination), binary);
+  assert.deepEqual(fs.readdirSync(homeDirectory), []);
+  assert.deepEqual(skillRuns.pop(), []);
+  requested.length = 0;
+
   const destination = await installed.install(installOptions);
 
   assert.deepEqual(fs.readFileSync(destination), binary);
@@ -150,6 +163,12 @@ it('packs and installs the published npm surface on the current host', async (t)
     [
       ['agents', 'installed'],
       ['claude', 'installed'],
+      ['agents', 'installed'],
+      ['claude', 'installed'],
+      ['agents', 'installed'],
+      ['claude', 'installed'],
+      ['agents', 'installed'],
+      ['claude', 'installed'],
     ]
   );
   const agentSkill = path.join(homeDirectory, '.agents', 'skills', 'zeroshot', 'SKILL.md');
@@ -157,7 +176,16 @@ it('packs and installs the published npm surface on the current host', async (t)
   assert.equal(await installed.install(installOptions), destination);
   assert.deepEqual(
     skillRuns[1].map(({ status }) => status),
-    ['unchanged', 'unchanged']
+    [
+      'unchanged',
+      'unchanged',
+      'unchanged',
+      'unchanged',
+      'unchanged',
+      'unchanged',
+      'unchanged',
+      'unchanged',
+    ]
   );
   assert.deepEqual(fs.readFileSync(agentSkill), before);
 
@@ -166,9 +194,43 @@ it('packs and installs the published npm surface on the current host', async (t)
   await assert.rejects(installed.install(installOptions), /SKILL_INSTALL_INCOMPLETE/);
   assert.deepEqual(
     skillRuns[2].map(({ status }) => status),
-    ['conflict', 'unchanged']
+    [
+      'conflict',
+      'unchanged',
+      'unchanged',
+      'unchanged',
+      'unchanged',
+      'unchanged',
+      'unchanged',
+      'unchanged',
+    ]
   );
   assert.deepEqual(fs.readFileSync(agentSkill), edited);
+  const claudeRoot = path.join(homeDirectory, '.claude');
+  fs.rmSync(claudeRoot, { recursive: true });
+  fs.writeFileSync(claudeRoot, 'blocked destination');
+  const removedSkill = path.join(homeDirectory, '.agents', 'skills', 'zeroshot-plan');
+  fs.rmSync(removedSkill, { recursive: true });
+  const replacement = Buffer.from('updated executable without skill changes\n');
+  const replacementArchive = createArchive([
+    { name: selected.executable, contents: replacement },
+    { name: selected.resticExecutable, contents: restic },
+  ]);
+  assert.equal(
+    await installed.install({
+      ...skipOptions,
+      fetchBuffer: async (url) =>
+        url.endsWith('/SHA256SUMS')
+          ? Buffer.from(`${sha256(replacementArchive)}  ${filename}\n`)
+          : replacementArchive,
+    }),
+    destination
+  );
+  assert.deepEqual(fs.readFileSync(destination), replacement);
+  assert.deepEqual(skillRuns[3], []);
+  assert.deepEqual(fs.readFileSync(agentSkill), edited);
+  assert.equal(fs.readFileSync(claudeRoot, 'utf8'), 'blocked destination');
+  assert.equal(fs.existsSync(removedSkill), false);
   assert.deepEqual(
     requested.map((url) => url.split('/').at(-1)),
     ['SHA256SUMS', filename, 'SHA256SUMS', filename, 'SHA256SUMS', filename]

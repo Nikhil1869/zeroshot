@@ -1,6 +1,4 @@
-use openengine_cluster_protocol::{
-    RunProfileListResult, RunProfileName, RunProfileScope, RunProfileSummary, RunTitle,
-};
+use openengine_cluster_protocol::{RunProfileName, RunProfileScope, RunProfileSummary, RunTitle};
 use openengine_cluster_testkit::admission::graph_fixture;
 use openengine_cluster_testkit::assertions::{AssertError, AssertValue};
 use serde_json::json;
@@ -41,6 +39,7 @@ fn materialization_fixture() -> (GraphSpec, RuntimePlan) {
 #[tokio::test]
 async fn management_contract_selects_and_materializes_profiles() {
     let named = reference("beta", None);
+    let backend = FakeBackend::default();
     for (reference, target, expected) in [
         (None, None, vec![None]),
         (
@@ -64,24 +63,28 @@ async fn management_contract_selects_and_materializes_profiles() {
         ),
     ] {
         assert_eq!(
-            profile_scopes(reference.as_ref(), target).assert_value(),
+            profile_scopes(reference.as_ref(), target, &backend)
+                .await
+                .assert_value(),
             expected
         );
     }
     let remote_without_target = reference("alpha", Some(ProfileQualifier::User));
     assert!(matches!(
-        profile_scopes(Some(&remote_without_target), None).assert_error(),
+        profile_scopes(Some(&remote_without_target), None, &backend).await.assert_error(),
         NativeV2CliError::Usage(message) if message == "remote profile selectors require --target"
     ));
 
-    let list = RunProfileListResult {
+    let list = CliProfileListResult {
         profiles: vec![
             summary("alpha", RunProfileScope::User, true),
             summary("beta", RunProfileScope::User, false),
         ],
+        ..CliProfileListResult::default()
     };
     assert_eq!(
         select_profile(list.clone(), None)
+            .assert_value()
             .assert_value()
             .name
             .as_str(),
@@ -90,11 +93,16 @@ async fn management_contract_selects_and_materializes_profiles() {
     assert_eq!(
         select_profile(list.clone(), Some(&named))
             .assert_value()
+            .assert_value()
             .name
             .as_str(),
         "beta"
     );
-    assert!(select_profile(list, Some(&reference("missing", None))).is_none());
+    assert!(
+        select_profile(list, Some(&reference("missing", None)))
+            .assert_value()
+            .is_none()
+    );
     assert!(profile_not_found(None).to_string().contains("no default"));
     assert!(
         profile_not_found(Some(&reference("missing", None)))
@@ -132,6 +140,7 @@ async fn wave6_cli_contract_remote_profile_resolution_preserves_selector_and_pay
     let run = RunCommand {
         cwd: None,
         source_connection: None,
+        source_forge: None,
 
         environment: None,
         target: Some("prod".to_owned()),
@@ -154,7 +163,7 @@ async fn wave6_cli_contract_remote_profile_resolution_preserves_selector_and_pay
         resolved.graph.profile,
         openengine_cluster_protocol::GraphProfile::Full
     );
-    assert!(matches!(resolved.runtime, RuntimePlan::Codex { .. }));
+    assert_eq!(resolved.runtime.harness.as_str(), "codex");
     assert!(matches!(
         backend.calls().as_slice(),
         [
@@ -177,4 +186,83 @@ async fn wave6_cli_contract_remote_profile_resolution_preserves_selector_and_pay
         resolve_run_profile(&missing, &backend).await,
         Err(NativeV2CliError::Usage(message)) if message == "profile missing was not found"
     ));
+}
+
+#[tokio::test]
+async fn organization_owner_resolves_bare_and_default_profiles_without_user_catalog_access() {
+    let root = tempfile::tempdir().assert_value();
+    let local = LocalRunProfileStore::new(root.path().to_owned());
+    for selection in [Some(reference("beta", None)), None] {
+        let backend = FakeBackend::with_organization_owner();
+        let resolved =
+            resolve_stored_profile_with_store(Some("prod"), selection.as_ref(), &backend, &local)
+                .await
+                .assert_value();
+        let selector = resolved.remote_selector.assert_value();
+        assert_eq!(selector.scope, RunProfileScope::Org);
+        assert_eq!(
+            selector.name.as_str(),
+            if selection.is_some() { "beta" } else { "alpha" }
+        );
+        assert!(matches!(backend.calls().as_slice(), [
+            Call::ProfileList { request, .. }, Call::ProfileShow { .. }
+        ] if request.scope == RunProfileScope::Org));
+    }
+    let explicit_user = reference("beta", Some(ProfileQualifier::User));
+    assert!(
+        resolve_stored_profile_with_store(
+            Some("prod"),
+            Some(&explicit_user),
+            &FakeBackend::with_organization_owner(),
+            &local,
+        )
+        .await
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn local_bare_and_default_profiles_resolve_without_machine_identity() {
+    let root = tempfile::tempdir().assert_value();
+    let local = LocalRunProfileStore::new(root.path().to_owned());
+    let (graph, runtime) = materialization_fixture();
+    local
+        .set(openengine_cluster_protocol::RunProfileSetRequest {
+            name: RunProfileName::new("offline").assert_value(),
+            scope: RunProfileScope::User,
+            graph: graph.clone(),
+            runtime: runtime.clone(),
+            set_default: true,
+        })
+        .assert_value();
+    let path = root.path().join("profiles.json");
+    let mut stored: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).assert_value()).assert_value();
+    stored["profiles"]["broken"] = json!({"id": false});
+    std::fs::write(&path, serde_json::to_vec(&stored).assert_value()).assert_value();
+    for selection in [Some(reference("offline", None)), None] {
+        let backend = FakeBackend::with_unavailable_machine_identity();
+        let resolved =
+            resolve_stored_profile_with_store(Some("prod"), selection.as_ref(), &backend, &local)
+                .await
+                .assert_value();
+        assert_eq!(resolved.graph, graph);
+        assert_eq!(resolved.runtime, runtime);
+        assert!(resolved.remote_selector.is_none());
+        assert!(backend.calls().is_empty());
+    }
+
+    stored["default"] = json!("broken");
+    std::fs::write(path, serde_json::to_vec(&stored).assert_value()).assert_value();
+    for selection in [Some(reference("broken", None)), None] {
+        let backend = FakeBackend::default();
+        assert!(matches!(
+            resolve_stored_profile_with_store(Some("prod"), selection.as_ref(), &backend, &local).await,
+            Err(NativeV2CliError::Local(message)) if message == "profile broken has malformed metadata"
+        ));
+        assert!(
+            backend.calls().is_empty(),
+            "a malformed selected local profile must not fall through to a remote profile"
+        );
+    }
 }

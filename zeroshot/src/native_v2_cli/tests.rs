@@ -4,7 +4,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use openengine_cluster_protocol::{
-    ConnectionScope, EnvironmentVariableName, ExecutionRef, MergePlanId, RunAttachParams,
+    ConnectionScope, EnvironmentVariableName, ExecutionRef, StackId, RunAttachParams,
     RunDiscardWorkspaceParams, RunForceParams, RunListParams, RunLogsParams, RunProfileName,
     RunProfileScope, RunResumeParams, RunStatusParams, RunTitle, RunWatchParams, RuntimePlan,
     SourceBranchId, SourceRevisionId, StaticConnectionValues,
@@ -20,6 +20,10 @@ mod attach_tests;
 mod checkpoint_tests;
 #[path = "tests/connections.rs"]
 mod connection_tests;
+#[path = "tests/delegations.rs"]
+mod delegation_tests;
+#[path = "tests/documented_examples.rs"]
+mod documented_example_tests;
 #[path = "tests/environment.rs"]
 mod environment_tests;
 #[path = "tests/lifecycle.rs"]
@@ -30,6 +34,8 @@ mod management_tests;
 mod outcome_tests;
 #[path = "tests/parser.rs"]
 mod parser_tests;
+#[path = "tests/review.rs"]
+mod review_tests;
 
 #[path = "tests/support.rs"]
 pub(in crate::native_v2_cli) mod support;
@@ -387,13 +393,13 @@ async fn wave5_cli_contract_default_backend_bounds_recovery_and_redacts_requests
     let runtime = runtime();
     assert!(
         backend
-            .merge_plan_status("target", MergePlanId::new("plan-default"))
+            .stack_status("target", StackId::new("plan-default"))
             .await
             .is_err()
     );
     assert!(
         backend
-            .merge_plan_force("target", MergePlanId::new("plan-default"))
+            .stack_force("target", StackId::new("plan-default"))
             .await
             .is_err()
     );
@@ -417,6 +423,7 @@ async fn wave5_cli_contract_default_backend_bounds_recovery_and_redacts_requests
     );
     let resume = RunResumeParams {
         git_credentials: None,
+        commit_identity: None,
 
         run_id: run_id.clone(),
         successor_run_id: RunId::new("run-successor"),
@@ -563,7 +570,14 @@ fn template_list_and_show_are_static_and_emit_ordinary_json() {
     assert_eq!(outcome, CliOutcome::Completed);
     assert_eq!(
         serde_json::from_slice::<Value>(&list_output).assert_value(),
-        json!(["single-worker", "software-change", "auto-research"])
+        json!([
+            "single-worker",
+            "software-change",
+            "auto-research",
+            "issue-review",
+            "pr-review",
+            "code-review"
+        ])
     );
 
     let mut show_output = Vec::new();

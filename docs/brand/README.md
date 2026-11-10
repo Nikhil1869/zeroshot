@@ -1,25 +1,27 @@
 # Zeroshot README banners
 
 Editable HTML/CSS sources and rendered light/dark desktop PNGs, plus a portrait
-mobile PNG, for the repository README.
+mobile PNG. The repository README no longer shows a banner: it said the same thing as the text
+under it and took a phone's whole first screen. The files are kept for reuse.
 The design follows [The Open Engine](https://theopenengine.com) and
 [Zeroshot](https://zeroshot.sh), inspected on October 2, 2026: warm paper,
 handwritten headings and diagrams, yellow notes, and the company mascot.
 
 ## Files
 
-- `zeroshot-hero-light.html` and `zeroshot-hero-dark.html`: source layouts.
+- `zeroshot-hero-light.html`, `zeroshot-hero-dark.html` and `zeroshot-hero-mobile.html`: source
+  layouts.
 - `hero.css`: shared layout and theme tokens.
 - `zeroshot-hero-light.png` and `zeroshot-hero-dark.png`: 2560 × 800 exports
   from a 1280 × 400 canvas at 2× scale.
-- `zeroshot-hero-mobile.png`: 1122 × 1402 portrait banner selected by the README
-  below 641px viewport width, before the desktop theme sources. It uses the same
-  warm-paper design in both themes, larger text and diagram labels, and omits the
-  duplicate sticky note. This is a raster asset, separate from the HTML exports.
+- `zeroshot-hero-mobile.png`: 1122 × 1402 portrait banner, exported from a 561 × 701 canvas at
+  2× scale. The README used to select it below 641px viewport width. It uses the warm-paper design
+  in both themes.
 - `social/starred-by.html`: the "Starred by engineers at" strip under the README badges. Its
   companies come from the self-reported GitHub company field of zeroshot stargazers, each profile
-  checked by hand, so the copy says "engineers at", never "used by". Marks are Simple Icons (CC0);
-  brands that asked Simple Icons to remove their marks stay off. `starred-by-light.png` and
+  checked by hand, so the copy says "engineers at", never "used by". Marks are Simple Icons (CC0).
+  Simple Icons later removed Microsoft and Amazon over those companies' trademark terms; the strip
+  keeps their v11 marks on purpose. `starred-by-light.png` and
   `starred-by-dark.png` are its transparent 2× exports; re-render steps are below.
 - `assets/`: local fonts, font licenses, and the website mascot. Rendering needs
   no network requests.
@@ -30,7 +32,8 @@ Reenie Beanie is the handwriting face; Fraunces 600 is the company wordmark.
 The light palette uses paper `#FAF7F1`, pen ink `#26221C`, and rust `#C2240C`.
 Dark mode uses `#171411`, cream text, and the documentation theme's lighter rust
 `#ED6B55` for readable accents. Notes retain yellow paper and dark ink in both themes.
-The diagrams illustrate each product's feedback loop, rather than runtime status.
+The banners carry the README headline and the "graphs are enforced" note. They draw no graph:
+a fixed loop on the banner would sell the built-in template instead of the team's own graph.
 
 ## Re-render
 
@@ -50,8 +53,9 @@ const { pathToFileURL } = require('node:url');
       viewport: { width: 1280, height: 400 },
       deviceScaleFactor: 2,
     });
-    for (const theme of ['light', 'dark']) {
-      const stem = resolve(`docs/brand/zeroshot-hero-${theme}`);
+    for (const [name, width, height] of [['light', 1280, 400], ['dark', 1280, 400], ['mobile', 561, 701]]) {
+      await page.setViewportSize({ width, height });
+      const stem = resolve(`docs/brand/zeroshot-hero-${name}`);
       await page.goto(pathToFileURL(`${stem}.html`).href);
       await page.evaluate(() => document.fonts.ready);
       const ready = await page.evaluate(() =>
@@ -71,11 +75,6 @@ JS
 Review both exports at full resolution and README display width before committing.
 
 ## Asset provenance
-
-- `zeroshot-hero-mobile.png`: generated with the built-in imagegen tool on October 13,
-  2026, using the existing light banner as the edit target. Direction: reflow into a
-  4:5 mobile portrait; preserve the exact main sentence, company mark, handwritten
-  style and review loop; enlarge all text; remove the duplicate sticky note.
 
 - `assets/oec-mascot.png`: unchanged copy of
   `company/content/brand/logos/open-engine-mascot-website.png`, originally from
@@ -117,13 +116,14 @@ a delivery failure; both repairs return to both reviewers.
 
 The 22-second GIF exports are `docs/assets/zeroshot-demo.gif` (light) and
 `docs/assets/zeroshot-demo-dark.gif` (dark), rendered at 1600 × 940 and 15 fps.
-The README uses the static SVG when reduced motion is preferred.
+The documentation retains these workflow assets; the README uses the product-page graphs below.
 
 ## Social buttons
 
-`social/buttons.html` is the source for the README call-to-action, zeroshot.sh,
-and X buttons. The Discord button is the row's only filled rust button, so it reads
-as the primary action; the other buttons stay ink pills with rust icons. Exports are
+`social/buttons.html` is the source for the README's "Talk to the team and power users on Discord" and zeroshot.sh
+buttons, plus an X button the README no longer shows. The Discord button is the only filled rust
+button, so it reads as the primary action; the other buttons stay ink pills with rust icons.
+The README also dropped the theopenengine.com and LinkedIn buttons; their PNGs remain in `social/`. Exports are
 70 px tall (35 px at 2×) and are displayed at `height="30"`.
 
 Re-render both themes with the Playwright install above:
@@ -186,3 +186,75 @@ const { pathToFileURL } = require('node:url');
 })().catch(error => { console.error(error); process.exitCode = 1; });
 JS
 ```
+
+## README example graph
+
+Under "Get started", the README shows zeroshot.sh's example graph from issue to merge: the
+drawing in the page's `#one-graph` section, without the section's headline. It is an illustrative
+custom graph, not a recording or the built-in template; the end-to-end test is a custom addition.
+The README's opening graph stays a text block, so agents that fetch it as plain text can read it.
+
+- `diagram-sources/example-graph-{wide,tall}.svg`: the page's wide and tall drawings, frozen on
+  November 4, 2026 from zeroshot-landing-page `846a4bd` (`index.html` and `styles.css`). Each file
+  inlines both themes' colours, the loop's rules and its 31.8-second run. HTML entities are written
+  as characters so the files parse as XML.
+- `../assets/example-graph-{wide,tall}-{light,dark}.gif`: the run, 1,590 frames at 50 fps,
+  looping. Wide is 1760px (880px at 2×); tall is 800px (400px at 2×), and the README picks it
+  below 641px viewport width.
+- `../assets/example-graph-{wide,tall}-{light,dark}.png`: the page's reduced-motion still, with no
+  moving dot and the passing ticks shown, for readers who turn motion off.
+
+The page owns the drawing. When its drawing or run changes, refresh the sources first from a
+checkout of [zeroshot-landing-page](https://github.com/the-open-engine/zeroshot-landing-page) at
+the commit that is live on zeroshot.sh, then re-render all eight. With the Playwright install
+described above and FFmpeg on PATH, from the repository root:
+
+```sh
+python3 docs/brand/freeze-example-graph.py ../zeroshot-landing-page .
+NODE_PATH=/tmp/open-engine-banner-tools/node_modules node docs/brand/render-example-graph.cjs
+```
+
+The renderer only reads the frozen sources. It checks that every animation runs the
+31.8-second loop, pauses them and seeks each frame. Update the commit and date above when you
+refresh.
+
+## Product-page graph exports
+
+The README no longer shows these exports. Its opening example graph is a text block, so it stays
+sharp at any width, works in both themes, and is readable by agents that fetch the README as plain
+text.
+The exports below are kept for reuse. They come from <https://zeroshot.sh/#topology>, captured on
+October 19, 2026.
+The source panels are `graph-panel-feature` (Ship a feature) and `graph-panel-danger` (A risky
+change), each with desktop and mobile SVG layouts. These are illustrative custom graphs, not
+recordings or built-in templates. The README links back to the interactive examples.
+
+`docs/assets/product-graph-feature-{wide,mobile}.gif` preserves the feature graph's 16-second
+animation: review rejection, repair, end-to-end rejection, repair, then delivery. The exports
+have 800 frames at 50 fps and loop continuously. Desktop is 1280px wide; mobile is 780px wide.
+The desktop export includes the page's key (writes, judges, built in, boots the stack); the
+page's mobile layout has no key.
+The risk-routing graph is static on the source page and exported as a PNG.
+
+The four `product-graph-{feature,danger}-{wide,mobile}.png` files are static exports.
+
+Exports retain the page's paths, labels, role icons, Caveat 600 font, and warm-paper palette.
+Sixteen SVG units of padding protect icons at the edges. Both themes use the page's paper
+background. PNGs are rendered at 2× scale from 960px desktop and 390px mobile display widths.
+
+The feature animation's SVG sources are frozen in `diagram-sources/product-graph-feature-*.svg`.
+Their animation rules come from the page stylesheet `assets/index-CvFDPx6b.css`; the source
+keyframes and timing are unchanged. Caveat and its SIL Open Font License are in `assets/`,
+from [Google Fonts](https://github.com/google/fonts/tree/main/ofl/caveat). Rendering is offline.
+
+With the Playwright install described above and FFmpeg on PATH, reproduce the GIFs from the
+repository root:
+
+```sh
+NODE_PATH=/tmp/open-engine-banner-tools/node_modules node docs/brand/render-product-graphs.cjs
+```
+
+The renderer pauses the source CSS animations and seeks every frame explicitly. Inspect the
+review rejection, end-to-end rejection, final delivery, and loop boundary in both sizes.
+When updating the drawings, refresh them from the source page and preserve its animation rules.
+The source page owns changes to the graph drawings.

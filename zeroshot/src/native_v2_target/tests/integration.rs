@@ -25,18 +25,18 @@ type ServerRequest = tokio_tungstenite::tungstenite::handshake::server::Request;
 type ServerResponse = tokio_tungstenite::tungstenite::handshake::server::Response;
 
 #[test]
-fn file_registry_initializes_cloud_with_a_stable_hosted_identity() {
+fn file_registry_initializes_platform_with_a_stable_hosted_identity() {
     let root = temp_root();
     let path = root.path("config/targets.json");
-    let cloud = FileTargetRegistry::new(path.clone())
-        .get("cloud")
+    let platform = FileTargetRegistry::new(path.clone())
+        .get("platform")
         .assert_value();
-    assert_eq!(cloud.name, "cloud");
-    assert_eq!(cloud.origin, "https://api.cloud.zeroshot.sh");
-    assert!(matches!(cloud.access, TargetAccess::Hosted { .. }));
+    assert_eq!(platform.name, "platform");
+    assert_eq!(platform.origin, "https://api.app.zeroshot.sh");
+    assert!(matches!(platform.access, TargetAccess::Hosted { .. }));
     assert_eq!(
-        FileTargetRegistry::new(path).get("cloud").assert_value(),
-        cloud
+        FileTargetRegistry::new(path).get("platform").assert_value(),
+        platform
     );
     assert!(matches!(
         FileTargetRegistry::new(root.path("other/targets.json")).get("unknown"),
@@ -117,7 +117,7 @@ fn file_registry_rejects_malformed_records_and_noncanonical_recovery_authority()
         std::fs::create_dir_all(path.parent().assert_value()).assert_value();
         std::fs::write(&path, serde_json::to_vec(&state).assert_value()).assert_value();
         assert!(matches!(
-            FileTargetRegistry::new(path).get("cloud"),
+            FileTargetRegistry::new(path).get("platform"),
             Err(TargetConnectorError::RegistryJson(_))
         ));
     }
@@ -126,14 +126,14 @@ fn file_registry_rejects_malformed_records_and_noncanonical_recovery_authority()
     std::fs::create_dir_all(oversized.parent().assert_value()).assert_value();
     std::fs::write(&oversized, vec![b' '; 1024 * 1024 + 1]).assert_value();
     assert!(matches!(
-        FileTargetRegistry::new(oversized).get("cloud"),
+        FileTargetRegistry::new(oversized).get("platform"),
         Err(TargetConnectorError::RegistryTooLarge)
     ));
 
     let directory = root.path("directory/targets.json");
     std::fs::create_dir_all(&directory).assert_value();
     assert!(matches!(
-        FileTargetRegistry::new(directory).get("cloud"),
+        FileTargetRegistry::new(directory).get("platform"),
         Err(TargetConnectorError::RegistryIo(_))
     ));
 
@@ -475,6 +475,7 @@ async fn direct_connector_constrains_resume_values_and_propagates_authorization(
         connection_resolver: None,
         github_token: None,
         git_credentials: None,
+        commit_identity: None,
         from: None,
     };
     assert!(
@@ -500,6 +501,7 @@ async fn direct_connector_constrains_resume_values_and_propagates_authorization(
         }),
         github_token: None,
         git_credentials: None,
+        commit_identity: None,
         from: None,
     };
     assert!(
@@ -582,6 +584,7 @@ async fn named_target_recovery_and_checkpoints_require_advertisement_before_dial
                     connection_resolver: None,
                     github_token: None,
                     git_credentials: None,
+                    commit_identity: None,
                     from: None,
                 },
             )
@@ -810,7 +813,7 @@ fn assert_device_exchange(requests: &[CapturedHttpRequest]) {
             .contains("device_token=22222222-2222-4222-8222-222222222222")
     );
     assert!(request.body.contains("device_label=zeroshot-cli"));
-    assert!(request.body.contains("audience=controller"));
+    assert!(request.body.contains("audience=admin"));
 }
 
 fn assert_submit_and_session_requests(requests: &[CapturedHttpRequest], run_id: &RunId) {
@@ -996,6 +999,69 @@ async fn websocket_dialer_rejects_cross_authority_before_network() {
         .await
         .assert_error_with("cross-authority session unexpectedly dialed");
     assert!(matches!(error, TargetConnectorError::InvalidOecpEndpoint));
+}
+
+#[test]
+fn oecp_access_rejects_missing_or_mismatched_bearer_authority_and_redacts_tokens() {
+    let hosted = hosted_target("local", "http://127.0.0.1:8080");
+    for token in [None, Some(String::new()), Some("control\n".to_owned())] {
+        assert!(
+            TargetOecpAccess::new("ws://127.0.0.1:8080/native-v2/oecp", token, &hosted.access,)
+                .is_err()
+        );
+    }
+    let direct = direct_target("http://127.0.0.1:8080");
+    assert!(
+        TargetOecpAccess::new(
+            "ws://127.0.0.1:8080/native-v2/oecp",
+            Some("unexpected-token".to_owned()),
+            &direct.access,
+        )
+        .is_err()
+    );
+    let access = TargetOecpAccess::new(
+        "ws://127.0.0.1:8080/native-v2/oecp",
+        Some("private-token".to_owned()),
+        &hosted.access,
+    )
+    .assert_value();
+    let diagnostic = format!("{access:?}");
+    assert!(diagnostic.contains("TargetOecpAccess"));
+    assert!(diagnostic.contains("[REDACTED]"));
+    assert!(!diagnostic.contains("private-token"));
+}
+
+#[tokio::test]
+async fn websocket_dialer_rejects_nonliteral_and_cross_scheme_endpoints_before_network() {
+    let target = direct_target("http://127.0.0.1:8080");
+    for endpoint in [
+        "not a uri",
+        "ws://127.0.0.1:8080/native-v2/oecp?query=1",
+        "ws://user@127.0.0.1:8080/native-v2/oecp",
+        "wss://127.0.0.1:8080/native-v2/oecp",
+        "mailto:oecp@example.test",
+        "//127.0.0.1:8080/native-v2/oecp",
+    ] {
+        let session = TargetOecpAccess::new(endpoint, None, &target.access).assert_value();
+        let error = TargetOecpWebSocketDialer
+            .dial(&target, session)
+            .await
+            .assert_error_with("invalid OECP endpoint unexpectedly dialed");
+        assert!(matches!(error, TargetConnectorError::InvalidOecpEndpoint));
+    }
+
+    for origin in ["mailto:oecp@example.test", "//127.0.0.1:8080"] {
+        let mut malformed_origin = target.clone();
+        malformed_origin.origin = origin.to_owned();
+        let session =
+            TargetOecpAccess::new("ws://127.0.0.1:8080/native-v2/oecp", None, &target.access)
+                .assert_value();
+        let error = TargetOecpWebSocketDialer
+            .dial(&malformed_origin, session)
+            .await
+            .assert_error_with("invalid origin unexpectedly dialed");
+        assert!(matches!(error, TargetConnectorError::InvalidOecpEndpoint));
+    }
 }
 
 #[tokio::test]

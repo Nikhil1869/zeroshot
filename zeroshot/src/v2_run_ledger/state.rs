@@ -1,4 +1,7 @@
-use openengine_cluster_protocol::{Cursor, PositiveInteger, TerminalResult, TokenCount, TokenUsage};
+use openengine_cluster_protocol::{
+    ActiveExecution, BoundedLogMessage, Cursor, FailureDiagnostic, FailureDiagnosticKind,
+    PositiveInteger, TerminalResult, TokenCount, TokenUsage,
+};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -7,7 +10,7 @@ use crate::full_v1_reducer::StructuralOccurrence;
 use super::{
     CreateRun, ExecutionId, ExecutionRef, ExecutionVoidReason, MAX_ADMITTED_RUN_BYTES,
     MAX_EVENT_BYTES, MAX_PRIOR_EXECUTION_BYTES, NodeCompletion, NodeSnapshot, NodeState, RunEvent,
-    RunLedgerError, RunPhase, RunSnapshot, TokenUsageDelta, INITIAL_CURSOR,
+    PrimaryGraphCompletion, RunLedgerError, RunPhase, RunSnapshot, TokenUsageDelta, INITIAL_CURSOR,
 };
 
 pub(crate) fn initial_cursor() -> Cursor {
@@ -42,6 +45,24 @@ pub(crate) fn validate_event(event: &RunEvent) -> Result<(), RunLedgerError> {
 fn bounded_json(value: &impl Serialize, maximum: usize) -> Result<(), ()> {
     let bytes = serde_json::to_vec(value).map_err(|_| ())?;
     (bytes.len() <= maximum).then_some(()).ok_or(())
+}
+
+/// Freeze diagnostics with the primary outcome and include them in terminal events.
+/// Earlier records in the same append are already projected, so event and status agree.
+pub(crate) fn prepare_event(snapshot: &RunSnapshot, mut event: RunEvent) -> RunEvent {
+    if let RunEvent::Terminal {
+        result: TerminalResult::Failed { reason, context },
+    }
+    | RunEvent::PrimaryGraphCompleted {
+        result: TerminalResult::Failed { reason, context },
+        ..
+    } = &mut event
+        && context.is_none()
+        && reason.as_str() != "force_stopped"
+    {
+        *context = snapshot.failure_context.clone();
+    }
+    event
 }
 
 pub(crate) fn apply_event(
@@ -87,12 +108,35 @@ fn apply_event_kind(
         RunEvent::ExecutionVoided { reference, reason } => {
             apply_execution_voided(snapshot, reference, *reason, sequence)
         }
-        RunEvent::SafeLog { execution, .. } => apply_safe_log(snapshot, *execution),
-        RunEvent::TokenUsageObserved { execution, usage } => {
-            apply_token_usage(snapshot, *execution, usage.as_ref())
+        RunEvent::SafeLog { .. }
+        | RunEvent::TokenUsageObserved { .. }
+        | RunEvent::RunTokenUsageObserved { .. } => {
+            apply_observation_event(snapshot, event, sequence)
+        }
+        RunEvent::PrimaryGraphCompleted {
+            result,
+            auxiliary_pending,
+            delivery_execution,
+        } => {
+            apply_primary_graph_completed(snapshot, result, *auxiliary_pending, delivery_execution)
         }
         RunEvent::ForceStopRequested => apply_force_stop(snapshot),
         RunEvent::Terminal { result } => apply_terminal(snapshot, result),
+    }
+}
+
+fn apply_observation_event(
+    snapshot: &mut RunSnapshot,
+    event: &RunEvent,
+    sequence: u64,
+) -> Result<(), RunLedgerError> {
+    match event {
+        RunEvent::SafeLog { .. } => apply_safe_log(snapshot, event, sequence),
+        RunEvent::TokenUsageObserved { execution, usage } => {
+            apply_token_usage(snapshot, *execution, usage.as_ref())
+        }
+        RunEvent::RunTokenUsageObserved { usage } => add_usage(snapshot, usage.as_ref()),
+        _ => Err(RunLedgerError::InvalidEvent("invalid observation event")),
     }
 }
 
@@ -154,6 +198,7 @@ fn apply_node_started(
             input: input.clone(),
             started_at: cursor_for(sequence),
             state: NodeState::Active,
+            failure_diagnostic: false,
         },
     );
     Ok(())
@@ -223,15 +268,89 @@ fn apply_execution_voided(
 }
 
 fn apply_safe_log(
-    snapshot: &RunSnapshot,
-    execution: Option<ExecutionId>,
+    snapshot: &mut RunSnapshot,
+    event: &RunEvent,
+    sequence: u64,
 ) -> Result<(), RunLedgerError> {
-    match execution {
-        None => Ok(()),
-        Some(id) if snapshot.executions.contains_key(&id) => Ok(()),
-        Some(_) => Err(RunLedgerError::InvalidEvent(
+    if let RunEvent::SafeLog {
+        execution: Some(id),
+        ..
+    } = event
+        && !snapshot.executions.contains_key(id)
+    {
+        return Err(RunLedgerError::InvalidEvent(
             "log references an unknown execution",
-        )),
+        ));
+    }
+    apply_failure_diagnostic(snapshot, event, sequence)
+}
+
+fn apply_failure_diagnostic(
+    snapshot: &mut RunSnapshot,
+    event: &RunEvent,
+    sequence: u64,
+) -> Result<(), RunLedgerError> {
+    let RunEvent::SafeLog {
+        execution,
+        stream,
+        line,
+        diagnostic: Some(kind),
+        ..
+    } = event
+    else {
+        return Ok(());
+    };
+    if *stream != super::SafeLogStream::Error {
+        return Err(RunLedgerError::InvalidEvent(
+            "failure diagnostic must use the error stream",
+        ));
+    }
+    if *kind == FailureDiagnosticKind::Incomplete {
+        snapshot.failure_context.get_or_insert_default().incomplete = true;
+        return Ok(());
+    }
+    let public_execution = diagnostic_execution(snapshot, *execution)?;
+    let message = BoundedLogMessage::new(crate::native_v2_runner::bounded_log_text(
+        crate::native_v2_contract::visible_text(line.as_str()),
+        openengine_cluster_protocol::MAX_LOG_MESSAGE_BYTES,
+    ))
+    .unwrap_or_else(|_| BoundedLogMessage::redacted());
+    let diagnostic = FailureDiagnostic {
+        message,
+        execution: public_execution,
+        cursor: Some(cursor_for(sequence)),
+    };
+    let context = snapshot.failure_context.get_or_insert_default();
+    if execution.is_none() && context.primary.is_none() {
+        context.primary = Some(diagnostic);
+    } else {
+        context.record(diagnostic);
+    }
+    Ok(())
+}
+
+fn diagnostic_execution(
+    snapshot: &mut RunSnapshot,
+    execution: Option<ExecutionId>,
+) -> Result<Option<ActiveExecution>, RunLedgerError> {
+    match execution {
+        Some(id) => {
+            let node = snapshot
+                .executions
+                .get_mut(&id)
+                .ok_or(RunLedgerError::InvalidEvent(
+                    "diagnostic execution was not dispatched",
+                ))?;
+            node.failure_diagnostic = true;
+            Ok(Some(ActiveExecution {
+                execution: node
+                    .reference
+                    .public_execution()
+                    .map_err(|_| RunLedgerError::Corrupt)?,
+                node: node.reference.node.clone(),
+            }))
+        }
+        None => Ok(None),
     }
 }
 
@@ -241,6 +360,13 @@ fn apply_token_usage(
     usage: Option<&TokenUsageDelta>,
 ) -> Result<(), RunLedgerError> {
     require_active_execution(snapshot, execution)?;
+    add_usage(snapshot, usage)
+}
+
+fn add_usage(
+    snapshot: &mut RunSnapshot,
+    usage: Option<&TokenUsageDelta>,
+) -> Result<(), RunLedgerError> {
     match (&mut snapshot.token_usage, usage) {
         (None, Some(usage)) => {
             snapshot.token_usage = Some(TokenUsage {
@@ -305,6 +431,40 @@ fn add_optional_tokens(
     }
 }
 
+fn apply_primary_graph_completed(
+    snapshot: &mut RunSnapshot,
+    result: &TerminalResult,
+    auxiliary_pending: bool,
+    delivery_execution: &Option<ExecutionId>,
+) -> Result<(), RunLedgerError> {
+    if !matches!(snapshot.phase, RunPhase::Running | RunPhase::Stopping) {
+        return Err(RunLedgerError::InvalidEvent(
+            "primary graph has not started",
+        ));
+    }
+    if snapshot.primary_graph.is_some() {
+        return Err(RunLedgerError::InvalidEvent(
+            "primary graph already completed",
+        ));
+    }
+    if snapshot.active_executions().next().is_some() {
+        return Err(RunLedgerError::InvalidEvent(
+            "primary graph still has active executions",
+        ));
+    }
+    if delivery_execution.is_some_and(|execution| snapshot.execution_output(execution).is_none()) {
+        return Err(RunLedgerError::InvalidEvent(
+            "delivery evidence references no completed verifier",
+        ));
+    }
+    snapshot.primary_graph = Some(PrimaryGraphCompletion {
+        result: result.clone(),
+        auxiliary_pending,
+        delivery_execution: *delivery_execution,
+    });
+    Ok(())
+}
+
 fn apply_force_stop(snapshot: &mut RunSnapshot) -> Result<(), RunLedgerError> {
     if snapshot.force_stop_requested {
         return Err(RunLedgerError::InvalidEvent(
@@ -325,13 +485,16 @@ fn apply_terminal(
             "cannot finish with active executions",
         ));
     }
+    if let Some(primary) = &mut snapshot.primary_graph {
+        primary.auxiliary_pending = false;
+    }
     snapshot.terminal = Some(result.clone());
     snapshot.phase = RunPhase::Finished;
     Ok(())
 }
 
 fn require_running(snapshot: &RunSnapshot) -> Result<(), RunLedgerError> {
-    (snapshot.phase == RunPhase::Running)
+    (snapshot.phase == RunPhase::Running && snapshot.primary_graph.is_none())
         .then_some(())
         .ok_or(RunLedgerError::InvalidEvent("run is not dispatchable"))
 }

@@ -2,8 +2,8 @@
 
 from ._version import __version__ as __version__
 from .client import Client as Client
-from .client import MergePlan as MergePlan
 from .client import Run as Run
+from .client import Stack as Stack
 from .errors import (
     ClientClosedError as ClientClosedError,
 )
@@ -19,21 +19,6 @@ from .errors import (
 from .errors import (
     ZeroshotError as ZeroshotError,
 )
-from .plan_errors import (
-    MergePlanWaitTimeout as MergePlanWaitTimeout,
-)
-from .plans import (
-    MergePlanRequest as MergePlanRequest,
-)
-from .plans import (
-    MergePlanRun as MergePlanRun,
-)
-from .plans import (
-    MergePlanRunStatus as MergePlanRunStatus,
-)
-from .plans import (
-    MergePlanStatus as MergePlanStatus,
-)
 from .run_errors import (
     RunFailedError as RunFailedError,
 )
@@ -48,6 +33,12 @@ from .run_errors import (
 )
 from .runs import (
     ActiveExecution as ActiveExecution,
+)
+from .runs import (
+    FailureContext as FailureContext,
+)
+from .runs import (
+    FailureDiagnostic as FailureDiagnostic,
 )
 from .runs import (
     LogEvent as LogEvent,
@@ -96,5 +87,23 @@ from .source import (
 )
 from .source import (
     SourceForgeIdentity as SourceForgeIdentity,
+)
+from .stack_errors import (
+    StackWaitTimeout as StackWaitTimeout,
+)
+from .stacks import (
+    StackDelivery as StackDelivery,
+)
+from .stacks import (
+    StackRequest as StackRequest,
+)
+from .stacks import (
+    StackRun as StackRun,
+)
+from .stacks import (
+    StackRunStatus as StackRunStatus,
+)
+from .stacks import (
+    StackStatus as StackStatus,
 )
 from .values import JsonValue as JsonValue

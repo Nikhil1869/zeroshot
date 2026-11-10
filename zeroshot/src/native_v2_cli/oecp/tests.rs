@@ -7,7 +7,7 @@ use openengine_cluster_client::{
 };
 use openengine_cluster_protocol::{
     ConnectionKey, ConnectionScope, EnvironmentVariableName, ExecutionRef, IdempotencyKey,
-    MergePlanSource, RequestId, RunId, RunProfileName, RunProfileScope, RunTitle, SourceBranchId,
+    StackSource, RequestId, RunId, RunProfileName, RunProfileScope, RunTitle, SourceBranchId,
     SourceRepositoryId, StaticConnectionValues, SubscriptionCloseReason, SubscriptionId,
 };
 use openengine_cluster_testkit::assertions::{AssertError, AssertValue};
@@ -258,13 +258,14 @@ fn profile_set_request() -> RunProfileSetRequest {
     }
 }
 
-fn merge_plan_request() -> PreparedMergePlanRequest {
-    PreparedMergePlanRequest {
+fn stack_request() -> PreparedStackRequest {
+    PreparedStackRequest {
         environment: None,
-        submission_key: IdempotencyKey::new("oecp-merge-plan").assert_value(),
-        title: RunTitle::new("OECP merge plan").assert_value(),
+        submission_key: IdempotencyKey::new("oecp-stack").assert_value(),
+        title: RunTitle::new("OECP stack").assert_value(),
         expires_at: "2026-09-24T00:00:00Z".to_owned(),
-        source: MergePlanSource {
+        delivery: openengine_cluster_protocol::StackDelivery::Merge,
+        source: StackSource {
             repository: SourceRepositoryId::new("open-engine/zeroshot").assert_value(),
             branch: SourceBranchId::new("main").assert_value(),
         },
@@ -377,27 +378,27 @@ async fn wave7_cli_contract_oecp_default_optional_authority_is_refused() {
     ));
     assert!(
         backend
-            .merge_plan_submit("prod", merge_plan_request())
+            .stack_submit("prod", stack_request())
             .await
             .assert_error()
             .to_string()
-            .contains("does not advertise merge plans")
+            .contains("does not advertise stacks")
     );
     assert!(
         backend
-            .merge_plan_status("prod", MergePlanId::new("plan"))
+            .stack_status("prod", StackId::new("plan"))
             .await
             .assert_error()
             .to_string()
-            .contains("does not advertise merge plans")
+            .contains("does not advertise stacks")
     );
     assert!(
         backend
-            .merge_plan_force("prod", MergePlanId::new("plan"))
+            .stack_force("prod", StackId::new("plan"))
             .await
             .assert_error()
             .to_string()
-            .contains("does not advertise merge plans")
+            .contains("does not advertise stacks")
     );
 
     let run_id = RunId::new("run-contract");
@@ -421,6 +422,7 @@ async fn wave7_cli_contract_oecp_default_optional_authority_is_refused() {
     let successor_run_id = RunId::new("run-successor");
     let resume = openengine_cluster_protocol::RunResumeParams {
         git_credentials: None,
+        commit_identity: None,
 
         run_id: run_id.clone(),
         successor_run_id,
@@ -444,6 +446,138 @@ async fn wave7_cli_contract_oecp_default_optional_authority_is_refused() {
             .assert_error()
             .to_string()
             .contains("authorization")
+    );
+}
+
+#[tokio::test]
+async fn oecp_optional_authority_defaults_are_explicit_and_fail_closed() {
+    let connector = StubConnector::new(None);
+    assert_eq!(
+        connector
+            .review_cache_namespace("prod")
+            .await
+            .assert_value(),
+        None
+    );
+    assert_eq!(
+        connector
+            .default_resource_scope("prod")
+            .await
+            .assert_value(),
+        ConnectionScope::User
+    );
+    let request = crate::native_v2_review::ReviewResolutionRequest {
+        url: "https://github.com/open-engine/zeroshot/issues/1".to_owned(),
+        branch: None,
+        revision: None,
+    };
+    assert!(
+        connector
+            .resolve_review("prod", request.clone(), &profile_set_request().runtime,)
+            .await
+            .assert_error()
+            .to_string()
+            .contains("does not advertise task resolution")
+    );
+    assert!(
+        connector
+            .delegation(crate::native_v2_cli::DelegationCommand {
+                target: "prod".to_owned(),
+                action: crate::native_v2_cli::DelegationAction::List {
+                    owner: openengine_cluster_protocol::DelegationOwner::User,
+                    organization_id: None,
+                },
+            })
+            .await
+            .assert_error()
+            .to_string()
+            .contains("does not advertise delegation management")
+    );
+
+    let backend = NamedTargetCliBackend::new(StubConnector::new(None));
+    assert_eq!(
+        backend
+            .review_cache_namespace(Some("prod"))
+            .await
+            .assert_value(),
+        None
+    );
+    assert_eq!(
+        backend
+            .default_resource_scope(Some("prod"))
+            .await
+            .assert_value(),
+        ConnectionScope::User
+    );
+    assert!(
+        backend
+            .resolve_review(Some("prod"), request, &profile_set_request().runtime)
+            .await
+            .assert_error()
+            .to_string()
+            .contains("does not advertise task resolution")
+    );
+    assert!(
+        backend
+            .delegation(crate::native_v2_cli::DelegationCommand {
+                target: "prod".to_owned(),
+                action: crate::native_v2_cli::DelegationAction::List {
+                    owner: openengine_cluster_protocol::DelegationOwner::User,
+                    organization_id: None,
+                },
+            })
+            .await
+            .assert_error()
+            .to_string()
+            .contains("does not advertise delegation management")
+    );
+
+    let run_id = RunId::new("default-authority-run");
+    assert!(
+        backend
+            .run_checkpoints(
+                Some("prod"),
+                openengine_cluster_protocol::RunCheckpointsParams {
+                    run_id: run_id.clone(),
+                    after: None,
+                    limit: None,
+                },
+            )
+            .await
+            .assert_error()
+            .to_string()
+            .contains("does not advertise workspace checkpoints")
+    );
+    assert!(
+        backend
+            .run_resume(
+                Some("prod"),
+                openengine_cluster_protocol::RunResumeParams {
+                    run_id: run_id.clone(),
+                    successor_run_id: RunId::new("default-authority-successor"),
+                    from: None,
+                    connections: BTreeMap::new(),
+                    connection_resolver: None,
+                    github_token: None,
+                    git_credentials: None,
+                    commit_identity: None,
+                },
+            )
+            .await
+            .assert_error()
+            .to_string()
+            .contains("local authorization for workspace recovery is unavailable")
+    );
+    assert!(
+        backend
+            .run_discard_workspace(
+                Some("prod"),
+                openengine_cluster_protocol::RunDiscardWorkspaceParams { run_id },
+            )
+            .await
+            .assert_error()
+            .to_string()
+            .contains("does not advertise workspace recovery")
     );
 }
 

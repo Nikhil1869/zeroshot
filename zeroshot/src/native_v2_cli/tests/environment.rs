@@ -5,7 +5,6 @@ use openengine_cluster_testkit::assertions::{AssertError, AssertValue};
 use serde_json::{Value, json};
 
 use super::*;
-use crate::native_v2_cli::execution::{CliExecutionContext, execute_native_v2_cli_with_context};
 
 fn runtime_with_environment() -> RuntimePlan {
     serde_json::from_value(json!({
@@ -51,15 +50,6 @@ fn environment_command(extra: &[&str]) -> (FixtureFiles, NativeV2CliCommand) {
     let command = parse_native_v2_args(run_args(&files.graph, &files.input, &files.runtime, extra))
         .assert_value();
     (files, command)
-}
-
-async fn execute_with_environment(
-    command: NativeV2CliCommand,
-    backend: &FakeBackend,
-    environment: &dyn Fn(&str) -> Option<OsString>,
-) -> Result<CliOutcome, NativeV2CliError> {
-    let context = CliExecutionContext::new(backend, environment);
-    execute_native_v2_cli_with_context(command, &context, &mut NeverDetach, &mut Vec::new()).await
 }
 
 #[cfg(unix)]
@@ -479,6 +469,44 @@ async fn uniform_gateway_and_bedrock_runtime_materializes_for_every_supporting_h
             ) })
             );
         }
+    }
+}
+
+#[tokio::test]
+async fn uniform_foundry_runtime_materializes_one_shared_connection_for_codex_and_claude() {
+    let values = [
+        ("AZURE_FOUNDRY_API_KEY", "foundry-secret"),
+        ("AZURE_FOUNDRY_RESOURCE", "contoso-ai"),
+    ];
+    let available = |name: &str| {
+        values
+            .iter()
+            .find(|(field, _)| *field == name)
+            .map(|(_, value)| OsString::from(value))
+    };
+    for harness in ["codex", "claude"] {
+        let (runtime, connections) = contained_uniform_submission(
+            &format!("Uniform foundry {harness} runtime"),
+            json!({
+                "harness":harness,
+                "provider":"foundry",
+                "model":"provider-owned-deployment"
+            }),
+            &available,
+        )
+        .await;
+        assert_eq!(runtime.pointer("/provider"), Some(&json!("foundry")));
+        assert_eq!(
+            runtime.pointer("/nodes/worker/connections/foundry"),
+            Some(&json!(["AZURE_FOUNDRY_API_KEY", "AZURE_FOUNDRY_RESOURCE"]))
+        );
+        assert_eq!(
+            connections,
+            json!({"foundry": {
+                "AZURE_FOUNDRY_API_KEY": "foundry-secret",
+                "AZURE_FOUNDRY_RESOURCE": "contoso-ai"
+            }})
+        );
     }
 }
 

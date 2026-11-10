@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
@@ -15,31 +14,13 @@ use super::*;
 use crate::native_v2_admission::NativeV2Admission;
 use crate::native_v2_contract::RunSubmission;
 use crate::execution::SessionScope;
+use crate::native_v2_runner::test_support::CountingSession;
 use crate::native_v2_runner::{
     DriverControl, DriverInvocation, LiveOutput, LiveOutputStream, NativeNodeRunner, NodeDriver,
     NodeRole, NodeSession, SessionFactory,
 };
 use crate::v2_run_ledger::CreateRun;
 use crate::v2_run_ledger::fake::FakeRunLedger;
-
-struct FakeSession {
-    closed: Arc<AtomicUsize>,
-}
-
-#[async_trait]
-impl NodeSession for FakeSession {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    async fn is_live(&self) -> bool {
-        true
-    }
-
-    async fn close(&self) {
-        self.closed.fetch_add(1, Ordering::SeqCst);
-    }
-}
 
 #[derive(Default)]
 struct FakeSessionFactory {
@@ -55,7 +36,7 @@ impl SessionFactory for FakeSessionFactory {
         _environment: &ResolvedEnvironment,
     ) -> Result<Arc<dyn NodeSession>, NodeRunnerError> {
         self.opened.fetch_add(1, Ordering::SeqCst);
-        Ok(Arc::new(FakeSession {
+        Ok(Arc::new(CountingSession {
             closed: self.closed.clone(),
         }))
     }
@@ -68,6 +49,10 @@ enum Behavior {
         outcome: WorkerOutcome,
     },
     Fail(NodeRunnerError),
+    Reported {
+        message: &'static str,
+        result: Result<WorkerOutcome, NodeRunnerError>,
+    },
     Together(Arc<tokio::sync::Barrier>),
     CancelAfterStart(Arc<tokio::sync::Barrier>, NodeRunnerError),
     Hang,
@@ -77,6 +62,7 @@ enum Behavior {
 struct DriverState {
     scripts: BTreeMap<String, VecDeque<Behavior>>,
     starts: Vec<String>,
+    contexts: Vec<(ExecutionRef, crate::native_v2_runner::NodeDispatchMetadata)>,
     emissions: Vec<String>,
     cancellations: Vec<String>,
     active: usize,
@@ -148,6 +134,9 @@ impl NodeDriver for FakeDriver {
         let behavior = {
             let mut state = self.state();
             state.starts.push(node.clone());
+            state
+                .contexts
+                .push((invocation.node.reference.clone(), invocation.dispatch));
             state.active += 1;
             state.max_active = state.max_active.max(state.active);
             state
@@ -191,6 +180,15 @@ impl NodeDriver for FakeDriver {
                 Err(NodeRunnerError::Cancelled)
             }
             Behavior::Fail(error) => Err(error),
+            Behavior::Reported { message, result } => {
+                control
+                    .emit(LiveOutput::diagnostic(
+                        openengine_cluster_protocol::FailureDiagnosticKind::Failure,
+                        message,
+                    ))
+                    .await?;
+                result
+            }
         };
         self.state().active -= 1;
         result
@@ -199,10 +197,12 @@ impl NodeDriver for FakeDriver {
 
 fn success_for(role: NodeRole) -> WorkerOutcome {
     match role {
-        NodeRole::Worker | NodeRole::GitDelivery => WorkerOutcome::Verified {
-            output: Value::Null,
-            artifacts: Vec::new(),
-        },
+        NodeRole::Worker | NodeRole::GitDelivery | NodeRole::CommentDelivery => {
+            WorkerOutcome::Verified {
+                output: Value::Null,
+                artifacts: Vec::new(),
+            }
+        }
         NodeRole::Verifier => verifier_outcome("accepted"),
     }
 }
@@ -224,6 +224,15 @@ struct Harness {
     ledger: Arc<FakeRunLedger>,
     driver: Arc<FakeDriver>,
     sessions: Arc<FakeSessionFactory>,
+}
+
+impl Harness {
+    fn spawn_drive(
+        &self,
+    ) -> tokio::task::JoinHandle<Result<TerminalResult, NativeV2SupervisorError>> {
+        let supervisor = self.supervisor.clone();
+        tokio::spawn(async move { supervisor.drive().await })
+    }
 }
 
 #[derive(Clone, Default)]
@@ -434,3 +443,6 @@ mod failure_logs;
 mod checkpoint_seed;
 #[path = "tests/checkpoints.rs"]
 mod checkpoint_tests;
+
+#[path = "tests/postmortem.rs"]
+mod postmortem_tests;

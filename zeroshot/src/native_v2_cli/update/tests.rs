@@ -10,6 +10,26 @@ use openengine_cluster_testkit::assertions::{AssertError, AssertValue};
 
 use super::*;
 
+fn rerun_without_skill_opt_out(test_name: &str) -> bool {
+    if std::env::var_os("ZEROSHOT_SKIP_SKILLS").is_none() {
+        return false;
+    }
+    // Unset the opt-out only in a child, preserving concurrent tests' environment.
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test_name, "--nocapture"])
+        .env_remove("ZEROSHOT_SKIP_SKILLS")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+    true
+}
+
 fn assert_release_versions_are_canonical_and_ordered() {
     assert_eq!(
         ReleaseVersion::parse("8.2.1").assert_value().to_string(),
@@ -166,6 +186,11 @@ async fn bounded_download_accepts_success_and_rejects_status_and_both_oversize_f
 
 #[tokio::test]
 async fn wave5_cli_contract_release_metadata_and_verified_assets_are_self_consistent() {
+    if rerun_without_skill_opt_out(
+        "native_v2_cli::update::tests::wave5_cli_contract_release_metadata_and_verified_assets_are_self_consistent",
+    ) {
+        return;
+    }
     let metadata = TestServer::start(vec![
         fixed_response("200 OK", br#"{"tag_name":"v8.2.1"}"#),
         fixed_response("200 OK", br#"{"tag_name":"8.2.1"}"#),
@@ -199,19 +224,30 @@ async fn wave5_cli_contract_release_metadata_and_verified_assets_are_self_consis
         ArchiveEntry::File(restic_name, restic),
     ]);
     let canonical_skill = b"---\nname: zeroshot\ndescription: Release skill\n---\n\nVerified.\n";
+    let memory_skill = b"---\nname: zeroshot-memory-init\ndescription: Memory initialization\n---\n\nInitialize.\n";
+    let graph_skill =
+        b"---\nname: zeroshot-graph-design\ndescription: Graph design\n---\n\nDesign.\n";
+    let plan_skill = b"---\nname: zeroshot-plan\ndescription: Planning\n---\n\nPlan.\n";
     let manifest = format!(
-        "{:x}  {SKILL_ASSET}\n{:x}  {filename}\n",
+        "{:x}  {SKILL_ASSET}\n{:x}  zeroshot-memory-init-skill.md\n{:x}  zeroshot-graph-design-skill.md\n{:x}  zeroshot-plan-skill.md\n{:x}  {filename}\n",
         Sha256::digest(canonical_skill),
+        Sha256::digest(memory_skill),
+        Sha256::digest(graph_skill),
+        Sha256::digest(plan_skill),
         Sha256::digest(&archive),
     );
     let assets = TestServer::start(vec![
         fixed_response("200 OK", manifest.as_bytes()),
         fixed_response("200 OK", canonical_skill),
+        fixed_response("200 OK", memory_skill),
+        fixed_response("200 OK", graph_skill),
+        fixed_response("200 OK", plan_skill),
         fixed_response("200 OK", &archive),
     ]);
     let release = download_release_at(&client, ReleaseVersion([8, 2, 0]), latest, &assets.base_url)
         .await
         .assert_value();
+    assert_eq!(release.skills.len(), SKILL_ASSETS.len());
     let executables = release.executables.assert_value();
     assert_eq!(executables.zeroshot, binary);
     assert_eq!(executables.restic, restic);
@@ -221,14 +257,15 @@ async fn wave5_cli_contract_release_metadata_and_verified_assets_are_self_consis
     let unchanged = TestServer::start(vec![
         fixed_response("200 OK", manifest.as_bytes()),
         fixed_response("200 OK", canonical_skill),
+        fixed_response("200 OK", memory_skill),
+        fixed_response("200 OK", graph_skill),
+        fixed_response("200 OK", plan_skill),
     ]);
-    assert!(
-        download_release_at(&client, latest, latest, &unchanged.base_url)
-            .await
-            .assert_value()
-            .executables
-            .is_none()
-    );
+    let same_version = download_release_at(&client, latest, latest, &unchanged.base_url)
+        .await
+        .assert_value();
+    assert!(same_version.executables.is_none());
+    assert_eq!(same_version.skills.len(), SKILL_ASSETS.len());
     unchanged.finish();
 
     assert_eq!(
@@ -770,4 +807,136 @@ fn truncated_response(declared_length: usize, body: &[u8]) -> Vec<u8> {
     .into_bytes();
     response.extend_from_slice(body);
     response
+}
+
+#[tokio::test]
+async fn skill_opt_out_updates_executables_without_touching_user_skills() {
+    const FIXTURE: &str = "ZEROSHOT_SKILL_OPT_OUT_FIXTURE";
+    let Some(home) = std::env::var_os(FIXTURE).map(std::path::PathBuf::from) else {
+        // Keep the opt-out and home overrides isolated from concurrent tests.
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        fs::create_dir_all(home.join(".agents/skills/zeroshot")).unwrap();
+        fs::write(
+            home.join(".agents/skills/zeroshot/SKILL.md"),
+            b"user edit\n",
+        )
+        .unwrap();
+        fs::write(home.join(".claude"), b"blocked destination\n").unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "native_v2_cli::update::tests::skill_opt_out_updates_executables_without_touching_user_skills",
+                "--nocapture",
+            ])
+            .env(FIXTURE, &home)
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
+            .env("ZEROSHOT_SKIP_SKILLS", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        return;
+    };
+
+    let latest = ReleaseVersion([8, 2, 1]);
+    let (target, executable, restic) = release_target().unwrap();
+    let filename = format!("zeroshot-v{latest}-{target}.tar.gz");
+    let archive = test_archive(&[
+        ArchiveEntry::File(executable, b"new binary"),
+        ArchiveEntry::File(restic, b"new restic"),
+    ]);
+    // No skill assets or checksums are available: opting out needs only the executables.
+    let manifest = format!("{:x}  {filename}\n", Sha256::digest(&archive));
+    let client = http_client().unwrap();
+    let native = tempfile::tempdir().unwrap();
+    let candidate = native.path().join(executable);
+    fs::write(&candidate, b"old binary").unwrap();
+    for current in [ReleaseVersion([8, 2, 0]), latest] {
+        let mut responses = vec![fixed_response("200 OK", manifest.as_bytes())];
+        if current < latest {
+            responses.push(fixed_response("200 OK", &archive));
+        }
+        let server = TestServer::start(responses);
+        let release = download_release_at(&client, current, latest, &server.base_url)
+            .await
+            .unwrap();
+        server.finish();
+        assert!(release.skills.is_empty());
+        assert!(!install_skills(&release.skills).unwrap());
+        assert_eq!(release.executables.is_some(), current < latest);
+        if let Some(executables) = release.executables {
+            install_at(
+                &candidate,
+                &executables,
+                latest,
+                InstallOperations {
+                    verify: |_: &Path, _: ReleaseVersion| Ok(()),
+                    verify_restic: |_: &Path| Ok(()),
+                    replace: |staged: &Path| {
+                        fs::copy(staged, &candidate)?;
+                        Ok(())
+                    },
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(fs::read(&candidate).unwrap(), b"new binary");
+        assert_eq!(fs::read(native.path().join(restic)).unwrap(), b"new restic");
+        assert_eq!(
+            fs::read(home.join(".agents/skills/zeroshot/SKILL.md")).unwrap(),
+            b"user edit\n"
+        );
+        assert_eq!(
+            fs::read(home.join(".claude")).unwrap(),
+            b"blocked destination\n"
+        );
+        assert_eq!(
+            fs::read_dir(home.join(".agents/skills")).unwrap().count(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_verified_but_invalid_auxiliary_skill_aborts_release_preparation() {
+    if rerun_without_skill_opt_out(
+        "native_v2_cli::update::tests::a_verified_but_invalid_auxiliary_skill_aborts_release_preparation",
+    ) {
+        return;
+    }
+    let canonical = b"---\nname: zeroshot\n---\n";
+    let memory = b"---\nname: zeroshot-memory-init\n---\n";
+    let graph = b"---\nname: zeroshot-graph-design\n---\n";
+    let invalid = [0xff];
+    for invalid_index in [1, 2] {
+        let mut documents: [&[u8]; 3] = [canonical, memory, graph];
+        documents[invalid_index] = &invalid;
+        let manifest = SKILL_ASSETS
+            .iter()
+            .zip(documents)
+            .map(|((_, filename), document)| {
+                format!("{:x}  {filename}\n", Sha256::digest(document))
+            })
+            .collect::<String>();
+        let mut responses = vec![fixed_response("200 OK", manifest.as_bytes())];
+        responses.extend(
+            documents[..=invalid_index]
+                .iter()
+                .map(|document| fixed_response("200 OK", document)),
+        );
+        let server = TestServer::start(responses);
+        let client = http_client().unwrap();
+        let latest = ReleaseVersion([8, 2, 1]);
+        let result = download_release_at(&client, latest, latest, &server.base_url).await;
+        assert!(result.err().unwrap().to_string().contains("not UTF-8"));
+        server.finish();
+    }
 }

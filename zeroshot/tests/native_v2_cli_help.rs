@@ -103,6 +103,8 @@ fn help_explains_runtime_configuration() {
         RunSize::Small,
         RunSize::Medium,
         RunSize::Large,
+        RunSize::Xl,
+        RunSize::GpuT4,
     ]));
     let efforts = serialized_names(&exhaustive_values!(ReasoningEffort => [
         ReasoningEffort::Low,
@@ -116,28 +118,18 @@ fn help_explains_runtime_configuration() {
         SessionScope::NodeInstance,
     ]));
     let contract_prose = [
-        // Every admitted harness/provider pair is enumerated in one place, so a new lane cannot be
-        // added to the protocol without appearing in the CLI contract.
-        concat!(
-            "provider choices are codex/openai, codex/openrouter, codex/bedrock, ",
-            "claude/anthropic, claude/openrouter, claude/bedrock, codex/gateway, claude/gateway, ",
-            "copilot/github, pi/anthropic, pi/openai, pi/openrouter, pi/bedrock, and pi/gateway."
-        )
-        .to_owned(),
+        "the host's adapter registry admits supported harness/provider pairs.".to_owned(),
+        "see the harness adapters documentation for available pairs.".to_owned(),
         concat!(
             "gateway connections require gateway_base_url and gateway_api_key. codex uses ",
-            "responses and claude uses messages. the pi/gateway lane also carries gateway_api, ",
-            "which names the wire protocol as one of openai-responses, openai-completions, or ",
+            "responses and claude uses messages. pi, copilot, opencode, and hermes gateway lanes also carry gateway_api, ",
+            "which names the protocol as openai-responses, openai-completions, or ",
             "anthropic-messages. ",
             "declaring anthropic_base_url with anthropic_api_key sends the pi/anthropic lane ",
             "to a caller-owned anthropic messages endpoint."
         )
         .to_owned(),
-        concat!(
-            "known-incompatible harness/provider pairs include codex/anthropic, claude/openai, ",
-            "and pi/github."
-        )
-        .to_owned(),
+        "known-incompatible harness/provider pairs include codex/anthropic and claude/openai.".to_owned(),
         concat!(
             "pi has no permission control of its own, so its contained runs rely on the ",
             "disposable capsule rather than a bypass argument."
@@ -264,16 +256,24 @@ fn help_explains_delivery_authentication_and_local_run_safety() {
 }
 
 #[test]
-fn help_explains_the_seven_day_plan_queue_deadline() {
-    let plan = successful_stdout(&["plan", "--help"]);
+fn help_explains_stack_delivery_and_the_seven_day_queue_deadline() {
+    let stack = successful_stdout(&["stack", "--help"]);
     assert_prose(
-        &plan,
+        &stack,
         &[
+            "\"schema\": \"zeroshot.stack/v1\"",
+            "`delivery` is required",
+            "merge each run merges into the base branch",
+            "stacked_pull_requests each run opens a pull request against the branch of the run before it",
+            "in dependency order with ties broken by run name",
+            "`zeroshot stack validate` prints that order",
             "queue deadline is the earlier of `expiresat` and seven days after `readyat`",
             "`expiresat` must be in the future and no more than seven days away",
         ],
     );
-    assert!(!normalized(&plan).contains("24 hours"));
+    assert!(!normalized(&stack).contains("24 hours"));
+    assert!(!normalized(&stack).contains("merge-plan"));
+    assert!(!invoke(&["plan", "--help"]).status.success());
 }
 
 #[test]
@@ -306,6 +306,7 @@ fn update_help_explains_the_verified_in_place_release_flow() {
             "newest canonical release",
             "managed agent skill",
             "user-edited skills are preserved",
+            "zeroshot_skip_skills=1",
             "usage: zeroshot update",
         ],
     );

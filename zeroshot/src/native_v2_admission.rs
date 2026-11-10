@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use async_trait::async_trait;
 use openengine_cluster_protocol::{
     ArtifactResultProfile, AutonomyPolicy, CapabilityPolicy, GraphNode, GraphProfile, GraphSpec,
-    MediaType, NodeName, PayloadValueError, RedactionClass, TypeId, WorkerContract,
+    MediaType, NodeName, PayloadValueError, RedactionClass, StackDelivery, TypeId, WorkerContract,
     WorkerDescriptor, WorkerProtocolBinding, WorkerRef,
 };
 use openengine_cluster_server::admission::{GraphVerifier, VerificationError};
@@ -22,12 +22,20 @@ use thiserror::Error;
 
 use crate::native_v2_contract::{
     AdmittedRun, GIT_DELIVERY_MERGE_V2_WORKER_REF, GIT_DELIVERY_MERGE_V3_WORKER_REF,
-    NodeRuntimeBinding, RunSubmission, RunSubmissionIntent, RuntimePlan,
+    GIT_DELIVERY_PR_V2_WORKER_REF, NodeRuntimeBinding, RunSubmission, RunSubmissionIntent,
+    RuntimePlan,
 };
 use crate::native_v2_delivery::GITHUB_TOKEN_ENV;
 use openengine_cluster_protocol::MAX_DECLARED_ENVIRONMENT_NAMES;
 
 pub(crate) const MAX_AGENT_VERIFIER_ATTEMPTS: u64 = 2;
+
+const fn stack_delivery_node(delivery: &StackDelivery) -> &'static str {
+    match delivery {
+        StackDelivery::Merge => "Git merge delivery node (merge@2 or merge@3)",
+        StackDelivery::StackedPullRequests => "Git pull-request delivery node (pr@2)",
+    }
+}
 
 /// Host policy for graph-visible Git delivery.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -42,6 +50,8 @@ pub enum DeliveryPolicy {
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum NativeV2AdmissionError {
+    #[error("invalid runtime: {0}")]
+    InvalidRuntime(String),
     #[error("native-v2 requires graph profile openengine.graph.full/v1")]
     UnsupportedGraphProfile,
     #[error("invalid runtime environment: {0}")]
@@ -56,6 +66,8 @@ pub enum NativeV2AdmissionError {
     MissingRuntimeBinding { node: NodeName },
     #[error("runtime plan contains a binding for non-executable node {node}")]
     UnexpectedRuntimeBinding { node: NodeName },
+    #[error("invalid runtime binding for node {node}: {detail}")]
+    InvalidRuntimeBinding { node: NodeName, detail: String },
     #[error("agent-backed node {node} requires authored instructions")]
     MissingAgentInstructions { node: NodeName },
     #[error("Git delivery node {node} rejects authored instructions")]
@@ -75,12 +87,18 @@ pub enum NativeV2AdmissionError {
     },
     #[error("Git delivery requires a committed repository source")]
     DeliverySourceRequired,
+    #[error("invalid comment delivery: {0}")]
+    InvalidCommentDelivery(String),
     #[error("invalid source delivery: {0}")]
     InvalidSourceDelivery(String),
-    #[error("merge plans require exactly one graph-visible Git merge delivery node")]
-    MergeDeliveryRequired,
-    #[error("merge-plan agent node {node} must not declare GH_TOKEN")]
-    MergePlanAgentGitHubToken { node: NodeName },
+    #[error(
+        "stack delivery {:?} requires exactly one graph-visible {}",
+        .delivery.as_str(),
+        stack_delivery_node(.delivery)
+    )]
+    StackDeliveryRequired { delivery: StackDelivery },
+    #[error("stack agent node {node} must not declare GH_TOKEN")]
+    StackAgentGitHubToken { node: NodeName },
     #[error(
         "run declares {found} unique environment names; maximum is {MAX_DECLARED_ENVIRONMENT_NAMES}"
     )]
@@ -114,6 +132,37 @@ pub enum NativeV2AdmissionError {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NativeV2Admission;
 
+/// Host-selected implementation registries and policy for one pure admission operation.
+#[derive(Clone, Copy)]
+pub struct NativeV2AdmissionContext<'a> {
+    pub harnesses: &'a crate::harnesses::HarnessRegistry,
+    pub source: Option<&'a crate::source_code_provider::SourceCodeProviderRegistry>,
+    pub delivery_policy: DeliveryPolicy,
+}
+
+impl<'a> NativeV2AdmissionContext<'a> {
+    #[must_use]
+    pub fn new(
+        harnesses: &'a crate::harnesses::HarnessRegistry,
+        delivery_policy: DeliveryPolicy,
+    ) -> Self {
+        Self {
+            harnesses,
+            source: None,
+            delivery_policy,
+        }
+    }
+
+    #[must_use]
+    pub fn with_source_registry(
+        mut self,
+        source: &'a crate::source_code_provider::SourceCodeProviderRegistry,
+    ) -> Self {
+        self.source = Some(source);
+        self
+    }
+}
+
 impl NativeV2Admission {
     /// Validates one reusable graph/runtime profile without requiring run-specific input.
     pub async fn validate_profile(
@@ -122,12 +171,29 @@ impl NativeV2Admission {
         runtime: &RuntimePlan,
         delivery_policy: DeliveryPolicy,
     ) -> Result<(), NativeV2AdmissionError> {
+        let harnesses = crate::harnesses::HarnessRegistry::local();
+        self.validate_profile_with_context(
+            graph,
+            runtime,
+            NativeV2AdmissionContext::new(&harnesses, delivery_policy),
+        )
+        .await
+    }
+
+    /// Validates against the host's enabled implementations without runtime effects.
+    pub async fn validate_profile_with_context(
+        &self,
+        graph: &GraphSpec,
+        runtime: &RuntimePlan,
+        context: NativeV2AdmissionContext<'_>,
+    ) -> Result<(), NativeV2AdmissionError> {
         if graph.profile != GraphProfile::Full {
             return Err(NativeV2AdmissionError::UnsupportedGraphProfile);
         }
         let declarations = executable_declarations(&graph.root);
-        validate_executable_bindings(&declarations, runtime, delivery_policy)?;
+        validate_executable_bindings(&declarations, runtime, context)?;
         validate_delivery_concurrency(&graph.root)?;
+        comment::validate_comment_profile(graph)?;
         let registry = GraphBoundWorkerRegistry::from_declarations(graph, &declarations, runtime)?;
         ProductionGraphVerifier::new(registry)
             .verify(graph)
@@ -136,24 +202,27 @@ impl NativeV2Admission {
             .map_err(Into::into)
     }
 
-    /// Validates a reusable profile for merge-plan use, requiring merge rather than PR delivery.
-    pub(crate) async fn validate_merge_profile(
+    /// Validates a reusable profile for a stack whose sole delivery node matches its delivery.
+    pub(crate) async fn validate_stack_profile(
         &self,
         graph: &GraphSpec,
         runtime: &RuntimePlan,
+        delivery: StackDelivery,
     ) -> Result<(), NativeV2AdmissionError> {
         self.validate_profile(graph, runtime, DeliveryPolicy::Required)
             .await?;
-        let has_merge = executable_declarations(&graph.root)
+        let workers: &[&str] = match delivery {
+            StackDelivery::Merge => &[
+                GIT_DELIVERY_MERGE_V2_WORKER_REF,
+                GIT_DELIVERY_MERGE_V3_WORKER_REF,
+            ],
+            StackDelivery::StackedPullRequests => &[GIT_DELIVERY_PR_V2_WORKER_REF],
+        };
+        if !executable_declarations(&graph.root)
             .iter()
-            .any(|declaration| {
-                matches!(
-                    declaration.worker.as_str(),
-                    GIT_DELIVERY_MERGE_V2_WORKER_REF | GIT_DELIVERY_MERGE_V3_WORKER_REF
-                )
-            });
-        if !has_merge {
-            return Err(NativeV2AdmissionError::MergeDeliveryRequired);
+            .any(|declaration| workers.contains(&declaration.worker.as_str()))
+        {
+            return Err(NativeV2AdmissionError::StackDeliveryRequired { delivery });
         }
         if let Some(node) = runtime.nodes().iter().find_map(|(node, binding)| {
             let NodeRuntimeBinding::Agent { connections, .. } = binding else {
@@ -164,7 +233,7 @@ impl NativeV2Admission {
                 .any(|name| name.as_str() == GITHUB_TOKEN_ENV)
                 .then_some(node.clone())
         }) {
-            return Err(NativeV2AdmissionError::MergePlanAgentGitHubToken { node });
+            return Err(NativeV2AdmissionError::StackAgentGitHubToken { node });
         }
         Ok(())
     }
@@ -184,8 +253,12 @@ impl NativeV2Admission {
         submission: RunSubmission,
         delivery_policy: DeliveryPolicy,
     ) -> Result<AdmittedRun, NativeV2AdmissionError> {
-        self.admit_using_registry(submission, delivery_policy, None)
-            .await
+        let harnesses = crate::harnesses::HarnessRegistry::local();
+        self.admit_with_context(
+            submission,
+            NativeV2AdmissionContext::new(&harnesses, delivery_policy),
+        )
+        .await
     }
 
     /// Uses the caller's registered source adapters with the same graph and runtime admission.
@@ -194,15 +267,17 @@ impl NativeV2Admission {
         submission: RunSubmission,
         registry: &crate::source_code_provider::SourceCodeProviderRegistry,
     ) -> Result<AdmittedRun, NativeV2AdmissionError> {
-        self.admit_using_registry(submission, DeliveryPolicy::Optional, Some(registry))
-            .await
+        let harnesses = crate::harnesses::HarnessRegistry::local();
+        let context = NativeV2AdmissionContext::new(&harnesses, DeliveryPolicy::Optional)
+            .with_source_registry(registry);
+        self.admit_with_context(submission, context).await
     }
 
-    async fn admit_using_registry(
+    /// Admits through exactly the implementation registries selected by the execution host.
+    pub async fn admit_with_context(
         &self,
         submission: RunSubmission,
-        delivery_policy: DeliveryPolicy,
-        registry: Option<&crate::source_code_provider::SourceCodeProviderRegistry>,
+        context: NativeV2AdmissionContext<'_>,
     ) -> Result<AdmittedRun, NativeV2AdmissionError> {
         let RunSubmission {
             title,
@@ -223,9 +298,17 @@ impl NativeV2Admission {
                 branch: None,
                 submission_key,
             },
-            delivery_policy,
+            context,
         )?;
-        validate_source_delivery_with_registry(source.as_ref(), &prepared.graph, registry)?;
+        validate_source_delivery_with_registry(source.as_ref(), &prepared.graph, context.source)?;
+        comment::resolve_comment_input_at(
+            &prepared.graph.root,
+            &prepared.initial_input,
+            source
+                .as_ref()
+                .and_then(|source| source.remote.as_ref())
+                .and_then(|remote| remote.forge.as_ref()),
+        )?;
         let verified = verify_submission(&prepared).await?;
 
         Ok(AdmittedRun {
@@ -244,7 +327,21 @@ impl NativeV2Admission {
         intent: &RunSubmissionIntent,
         delivery_policy: DeliveryPolicy,
     ) -> Result<(), NativeV2AdmissionError> {
-        let prepared = prepare_submission(intent.clone(), delivery_policy)?;
+        let harnesses = crate::harnesses::HarnessRegistry::local();
+        self.validate_intent_with_context(
+            intent,
+            NativeV2AdmissionContext::new(&harnesses, delivery_policy),
+        )
+        .await
+    }
+
+    /// Validates an intent before host effects using the selected implementation registries.
+    pub async fn validate_intent_with_context(
+        &self,
+        intent: &RunSubmissionIntent,
+        context: NativeV2AdmissionContext<'_>,
+    ) -> Result<(), NativeV2AdmissionError> {
+        let prepared = prepare_submission(intent.clone(), context)?;
         verify_submission(&prepared).await.map(|_| ())
     }
 }
@@ -319,7 +416,7 @@ struct PreparedSubmission {
 
 fn prepare_submission(
     intent: RunSubmissionIntent,
-    delivery_policy: DeliveryPolicy,
+    context: NativeV2AdmissionContext<'_>,
 ) -> Result<PreparedSubmission, NativeV2AdmissionError> {
     let RunSubmissionIntent {
         title,
@@ -334,8 +431,10 @@ fn prepare_submission(
     validate_graph_input(&graph, &initial_input)?;
     loop_limits::bind_input_limits(&mut graph.root, &initial_input)?;
     let declarations = executable_declarations(&graph.root);
-    validate_executable_bindings(&declarations, &runtime, delivery_policy)?;
+    validate_executable_bindings(&declarations, &runtime, context)?;
     validate_delivery_concurrency(&graph.root)?;
+    comment::validate_comment_profile(&graph)?;
+    comment::validate_comment_input_shape(&graph.root, &initial_input)?;
 
     Ok(PreparedSubmission {
         title,
@@ -374,6 +473,10 @@ async fn verify_submission(
         .map_err(Into::into)
 }
 
+mod comment;
+mod source_access;
+pub use source_access::{delivery_credential_destinations, materialize_delivery_access};
+pub(crate) use comment::{resolve_comment_input_at, admitted_comment_input, comment_node};
 mod concurrency;
 mod loop_limits;
 mod validation;
@@ -389,8 +492,11 @@ pub(crate) fn executable_runtime_roles(root: &GraphNode) -> Vec<(NodeName, bool)
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RuntimeRole {
+    Script,
     Agent,
+    Decision,
     GitDelivery,
+    CommentDelivery,
 }
 
 #[derive(Clone, Debug)]
@@ -414,11 +520,10 @@ impl GraphBoundWorkerRegistry {
     ) -> Result<Self, NativeV2AdmissionError> {
         let mut resolved = BTreeMap::<WorkerRef, ResolvedDeclaration>::new();
         for declaration in declarations {
-            let role = match runtime.nodes().get(&declaration.name) {
-                Some(NodeRuntimeBinding::Agent { .. }) => RuntimeRole::Agent,
-                Some(NodeRuntimeBinding::GitDelivery { .. }) => RuntimeRole::GitDelivery,
-                None => continue,
+            let Some(binding) = runtime.nodes().get(&declaration.name) else {
+                continue;
             };
+            let role = runtime_role(binding);
             if let Some(first) = resolved.get(&declaration.worker) {
                 if first.contract != declaration.contract || first.role != role {
                     return Err(NativeV2AdmissionError::InconsistentWorkerReuse {
@@ -496,3 +601,13 @@ impl WorkerRegistry for GraphBoundWorkerRegistry {
 #[cfg(test)]
 #[path = "native_v2_admission/tests.rs"]
 mod tests;
+
+fn runtime_role(binding: &NodeRuntimeBinding) -> RuntimeRole {
+    match binding {
+        NodeRuntimeBinding::Script { .. } => RuntimeRole::Script,
+        NodeRuntimeBinding::Agent { .. } => RuntimeRole::Agent,
+        NodeRuntimeBinding::Decision { .. } => RuntimeRole::Decision,
+        NodeRuntimeBinding::GitDelivery { .. } => RuntimeRole::GitDelivery,
+        NodeRuntimeBinding::CommentDelivery { .. } => RuntimeRole::CommentDelivery,
+    }
+}

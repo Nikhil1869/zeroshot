@@ -8,12 +8,13 @@ use std::path::Path;
 use std::pin::Pin;
 
 use openengine_cluster_protocol::{
-    ClaudeProvider, CodexProvider, DeclaredConnections, DeclaredEnvironment,
-    EnvironmentVariableName, GraphProfile, GraphSpec, IdempotencyKey, ModelId, NodeName,
-    NodeRuntimeBinding, PiProvider, ReasoningEffort, RunConnectionValues, RunSize, RunSubmitResult,
-    RunConnectionRequirements, RuntimePlan, SessionScope, StaticConnectionValues,
+    ActiveMemoryConfig, DeclaredConnections, GlobalAgentsConfig, GraphProfile, GraphSpec,
+    IdempotencyKey, ModelId, NodeName, MAX_MODEL_CONTEXT_WINDOW, MAX_MODEL_MAX_TOKENS,
+    MIN_MODEL_CONTEXT_WINDOW, MIN_MODEL_MAX_TOKENS, NodeRuntimeBinding, ReasoningEffort,
+    RunConnectionValues, RunSize, RunSubmitResult, RunConnectionRequirements, RuntimePlan,
+    SessionScope, StaticConnectionValues, deserialize_optional_model_limit,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 use super::super::{
     BuiltinGraphTemplate, CliOutcome, NativeV2CliBackend, NativeV2CliCommand, NativeV2CliError,
@@ -23,15 +24,30 @@ use super::super::{
 use super::{CliExecutionContext, write_json};
 use crate::native_v2_admission::{DeliveryPolicy, NativeV2Admission, executable_runtime_roles};
 use crate::native_v2_candidate::{ProviderAccessPlacement, materialize_provider_access};
-use crate::native_v2_delivery::GITHUB_TOKEN_ENV;
 
 #[path = "submission/profiles.rs"]
 mod profiles;
+#[path = "submission/review_input.rs"]
+mod review_input;
 
 #[path = "named_source.rs"]
 mod named_source;
 pub(super) use profiles::materialize_profile;
 use profiles::{ResolvedRunProfile, resolve_run_profile};
+
+struct SubmissionInput {
+    review: Option<crate::native_v2_review::PreparedReview>,
+    environment: Option<openengine_cluster_protocol::RuntimeEnvironment>,
+}
+
+impl SubmissionInput {
+    fn capture(run: &RunCommand) -> Result<Self, NativeV2CliError> {
+        Ok(Self {
+            review: None,
+            environment: read_run_environment(&run.environment)?,
+        })
+    }
+}
 
 /// Executes commands that need no target registry, credentials, or controller state.
 pub async fn try_execute_native_v2_preflight(
@@ -53,10 +69,29 @@ where
     if matches!(command, NativeV2CliCommand::Update) {
         return super::super::update::execute(output).await.map(Some);
     }
+    if let NativeV2CliCommand::Memory(command) = command {
+        let result = super::super::memory::execute(command).await?;
+        write_json(output, &result)?;
+        return Ok(Some(CliOutcome::Completed));
+    }
     let NativeV2CliCommand::Run(run) = command else {
         return Ok(None);
     };
+    validate_inline_run(run, output, environment).await
+}
+
+async fn validate_inline_run<F>(
+    run: &RunCommand,
+    output: &mut impl Write,
+    environment: F,
+) -> Result<Option<CliOutcome>, NativeV2CliError>
+where
+    F: Fn(&str) -> Option<OsString>,
+{
     if !run.validate_only {
+        return Ok(None);
+    }
+    if matches!(run.input, super::super::RunInput::TaskFrom(_)) {
         return Ok(None);
     }
     let RunSelection::Inline { graph, runtime } = &run.selection else {
@@ -71,6 +106,7 @@ where
             remote_selector: None,
         },
         environment,
+        SubmissionInput::capture(run)?,
     )
     .await?;
     write_json(output, &serde_json::json!({ "valid": true }))?;
@@ -81,19 +117,31 @@ pub fn try_execute_native_v2_static(
     command: &NativeV2CliCommand,
     output: &mut impl Write,
 ) -> Result<Option<CliOutcome>, NativeV2CliError> {
+    try_execute_native_v2_static_with_terminal(command, output, false)
+}
+
+/// Executes static commands with an explicit output destination capability.
+/// Callers writing to stdout supply its terminal status; other writers default to JSON.
+pub fn try_execute_native_v2_static_with_terminal(
+    command: &NativeV2CliCommand,
+    output: &mut impl Write,
+    is_terminal: bool,
+) -> Result<Option<CliOutcome>, NativeV2CliError> {
     if let Some(text) = command.product_info() {
         output.write_all(text.as_bytes())?;
         output.flush()?;
         return Ok(Some(CliOutcome::Completed));
     }
     let outcome = match command {
-        NativeV2CliCommand::PlanValidate { file } => {
-            return super::merge_plans::validate_file(file, output).map(Some);
+        NativeV2CliCommand::StackValidate { file } => {
+            return super::stacks::validate_file(file, output).map(Some);
         }
         NativeV2CliCommand::TemplateList => execute_template_list(output)?,
-        NativeV2CliCommand::TemplateShow { template, delivery } => {
-            execute_template_show(*template, *delivery, output)?
-        }
+        NativeV2CliCommand::TemplateShow {
+            template,
+            delivery,
+            json,
+        } => execute_template_show(*template, *delivery, is_terminal && !json, output)?,
         _ => return Ok(None),
     };
     Ok(Some(outcome))
@@ -111,12 +159,19 @@ fn execute_template_list(output: &mut impl Write) -> Result<CliOutcome, NativeV2
 fn execute_template_show(
     template: BuiltinGraphTemplate,
     delivery: TemplateDelivery,
+    tree: bool,
     output: &mut impl Write,
 ) -> Result<CliOutcome, NativeV2CliError> {
     let graph = template
         .materialize(delivery)
         .map_err(|error| NativeV2CliError::Usage(error.to_string()))?;
-    write_json(output, &graph)?;
+    if tree {
+        writeln!(output, "{} (delivery: {delivery})", template.name())?;
+        super::graph_tree::write_graph_tree(&graph, output)?;
+        output.flush()?;
+    } else {
+        write_json(output, &graph)?;
+    }
     Ok(CliOutcome::Completed)
 }
 
@@ -124,6 +179,7 @@ fn prepare_submission_with_environment<F>(
     run: &RunCommand,
     mut resolved: ResolvedRunProfile,
     available: F,
+    input: SubmissionInput,
 ) -> Result<PreparedRunRequest, NativeV2CliError>
 where
     F: Fn(&str) -> Option<OsString>,
@@ -135,12 +191,42 @@ where
     };
     materialize_provider_access(&mut resolved.runtime, placement)
         .map_err(|error| NativeV2CliError::Usage(error.to_string()))?;
-    let intent = prepare_intent(run, resolved.graph, resolved.runtime)?;
+    let initial_input = resolved_initial_input(&run.input, input.review.as_ref())?;
+    let profile = resolved.remote_selector.take();
+    let intent = prepare_intent(run, resolved, initial_input, input.environment)?;
     if run.target.is_none() {
         crate::native_v2_local::validate_local_environment(intent.environment.as_ref())
             .map_err(|error| NativeV2CliError::Usage(error.to_string()))?;
     }
-    let connections = select_connections(&intent.runtime, intent.environment.as_ref(), &available)?;
+    let (connections, github_token) = submission_credentials(run, &intent, &available)?;
+    Ok(PreparedRunRequest {
+        run_id: openengine_cluster_protocol::RunId::new(uuid::Uuid::now_v7().to_string()),
+        intent,
+        connections,
+        github_token,
+        git_credentials: None,
+        cwd: run.cwd.clone(),
+        source_connection: run.source_connection.clone(),
+        source: input.review.map(|review| super::super::NamedRunSource {
+            resolved: review.source,
+            dirty: false,
+        }),
+        profile,
+    })
+}
+
+fn submission_credentials<F>(
+    run: &RunCommand,
+    intent: &TargetRunIntent,
+    available: &F,
+) -> Result<(RunConnectionValues, Option<String>), NativeV2CliError>
+where
+    F: Fn(&str) -> Option<OsString>,
+{
+    if run.validate_only {
+        return Ok((RunConnectionValues::new(), None));
+    }
+    let connections = select_connections(&intent.runtime, intent.environment.as_ref(), available)?;
     let github_token = run
         .target
         .as_ref()
@@ -153,56 +239,120 @@ where
         .transpose()?
         .map(validate_github_token)
         .transpose()?;
-    Ok(PreparedRunRequest {
-        run_id: openengine_cluster_protocol::RunId::new(uuid::Uuid::now_v7().to_string()),
-        intent,
-        connections,
-        github_token,
-        git_credentials: None,
-        cwd: run.cwd.clone(),
-        source_connection: run.source_connection.clone(),
-        source: None,
-        profile: resolved.remote_selector,
-    })
+    Ok((connections, github_token))
 }
 
 async fn prepare_validated_submission_with_environment<F>(
     run: &RunCommand,
     resolved: ResolvedRunProfile,
     available: F,
+    input: SubmissionInput,
 ) -> Result<PreparedRunRequest, NativeV2CliError>
 where
     F: Fn(&str) -> Option<OsString>,
 {
-    let mut params = prepare_submission_with_environment(run, resolved, &available)?;
+    let mut params = prepare_submission_with_environment(run, resolved, &available, input)?;
+    if run.target.is_none() && matches!(run.input, super::super::RunInput::TaskFrom(_)) {
+        review_input::validate_local(&mut params).await?;
+    }
     NativeV2Admission
         .validate_intent(&params.intent, DeliveryPolicy::Optional)
         .await
         .map_err(NativeV2CliError::InvalidRun)?;
-    if run.target.is_none() && run.validate_only {
-        validate_local_workspace(&params)?;
+    crate::native_v2_cli::local::native_forge::select_local_source(run, &mut params)?;
+    validate_local_only_workspace(run, &params)?;
+    resolve_named_source(run, &mut params, &available).await?;
+    materialize_named_delivery_access(run, &mut params, &available)?;
+    Ok(params)
+}
+
+fn materialize_named_delivery_access<F>(
+    run: &RunCommand,
+    request: &mut PreparedRunRequest,
+    available: &F,
+) -> Result<(), NativeV2CliError>
+where
+    F: Fn(&str) -> Option<OsString>,
+{
+    if run.target.is_none() || run.validate_only {
+        return Ok(());
     }
+    let mut submission = crate::native_v2_local::local_submission(
+        &request.intent,
+        request
+            .source
+            .as_ref()
+            .map(|source| source.resolved.clone()),
+    );
+    crate::native_v2_admission::materialize_delivery_access(&mut submission)
+        .map_err(NativeV2CliError::InvalidRun)?;
+    request.intent.runtime = submission.runtime.clone();
+    let missing = submission
+        .runtime
+        .connection_requirements()
+        .into_iter()
+        .filter(|(key, _)| !request.connections.contains_key(key))
+        .map(|(key, fields)| (key, fields.into_iter().collect()))
+        .collect();
+    request
+        .connections
+        .extend(select_connection_requirements(missing, available)?);
+    Ok(())
+}
+
+fn resolved_initial_input(
+    input: &super::super::RunInput,
+    review: Option<&crate::native_v2_review::PreparedReview>,
+) -> Result<serde_json::Value, NativeV2CliError> {
+    match (input, review) {
+        (super::super::RunInput::File(path), _) => read_json("input", path),
+        (super::super::RunInput::TaskFrom(_), Some(review)) => Ok(review.initial_input.clone()),
+        _ => Err(NativeV2CliError::Usage(
+            "review input was not resolved".to_owned(),
+        )),
+    }
+}
+
+async fn resolve_named_source<F>(
+    run: &RunCommand,
+    params: &mut PreparedRunRequest,
+    available: &F,
+) -> Result<(), NativeV2CliError>
+where
+    F: Fn(&str) -> Option<OsString>,
+{
     let required_capabilities =
         crate::native_v2_admission::delivery_capabilities(&params.intent.graph.root);
-    if let Some(selected) = named_source::resolve(
-        named_source::NamedSourceRequest {
-            run,
-            token: params.github_token.as_deref(),
-            provided: &params.connections,
-            required_capabilities: &required_capabilities,
-        },
-        &available,
-    )
-    .await?
+    if params.source.is_none()
+        && let Some(selected) = named_source::resolve(
+            named_source::NamedSourceRequest {
+                run,
+                token: params.github_token.as_deref(),
+                provided: &params.connections,
+                required_capabilities: &required_capabilities,
+            },
+            available,
+        )
+        .await?
     {
         params.git_credentials = selected.git_credentials;
         params.source = Some(selected.source);
         let source = params.source.as_ref().map(|source| &source.resolved);
         crate::native_v2_admission::validate_source_delivery(source, &params.intent.graph)
             .map_err(NativeV2CliError::InvalidRun)?;
-        select_source_connections(&mut params)?;
+        select_source_connections(params)?;
     }
-    Ok(params)
+    Ok(())
+}
+
+fn validate_local_only_workspace(
+    run: &RunCommand,
+    params: &PreparedRunRequest,
+) -> Result<(), NativeV2CliError> {
+    if run.target.is_none() && run.validate_only {
+        validate_local_workspace(params)?;
+    }
+    Ok(())
 }
 
 fn validate_local_workspace(params: &PreparedRunRequest) -> Result<(), NativeV2CliError> {
@@ -217,20 +367,15 @@ fn validate_local_workspace(params: &PreparedRunRequest) -> Result<(), NativeV2C
 }
 
 fn select_source_connections(params: &mut PreparedRunRequest) -> Result<(), NativeV2CliError> {
-    let Some(remote) = params
-        .source
-        .as_ref()
-        .and_then(|source| source.resolved.remote.as_ref())
-    else {
+    let Some(source) = params.source.as_ref() else {
         return Ok(());
     };
-    if remote
-        .forge
-        .as_ref()
-        .is_none_or(|forge| forge.provider.as_str() != "source.github")
-    {
+    if !crate::native_v2_candidate::is_github_com_source(&source.resolved) {
         params.github_token = None;
     }
+    let Some(remote) = source.resolved.remote.as_ref() else {
+        return Ok(());
+    };
     let (Some(key), Some(credentials)) = (&remote.connection, &params.git_credentials) else {
         return Ok(());
     };
@@ -275,10 +420,12 @@ where
         () = detach.as_mut() => return Ok(RunSubmission::Interrupted),
         result = async {
             let resolved = resolve_run_profile(run, context.backend).await?;
+            let input = review_input::resolve(run, &resolved, context.backend).await?;
             prepare_validated_submission_with_environment(
                 run,
                 resolved,
                 context.environment,
+                input,
             )
             .await
         } => result?,
@@ -343,12 +490,13 @@ pub(super) fn validate_github_token(value: String) -> Result<String, NativeV2Cli
 
 fn prepare_intent(
     run: &RunCommand,
-    graph: GraphSpec,
-    runtime: RuntimePlan,
+    resolved: ResolvedRunProfile,
+    initial_input: serde_json::Value,
+    environment: Option<openengine_cluster_protocol::RuntimeEnvironment>,
 ) -> Result<TargetRunIntent, NativeV2CliError> {
-    validate_graph_profile(&graph)?;
-    let initial_input = read_json::<serde_json::Value>("input", &run.input)?;
-    graph
+    validate_graph_profile(&resolved.graph)?;
+    resolved
+        .graph
         .initial_input
         .validate_value(&initial_input)
         .map_err(|error| NativeV2CliError::InitialInput(error.to_string()))?;
@@ -358,19 +506,25 @@ fn prepare_intent(
         .map_or_else(fresh_submission_key, Ok)?;
     Ok(TargetRunIntent {
         title: run.title.clone(),
-        graph,
+        graph: resolved.graph,
         initial_input,
-        runtime,
-        environment: match &run.environment {
-            None => None,
-            Some(crate::native_v2_cli::RunEnvironmentInput::Empty) => Some(Default::default()),
-            Some(crate::native_v2_cli::RunEnvironmentInput::File(path)) => {
-                Some(read_json("run environment", path)?)
-            }
-        },
+        runtime: resolved.runtime,
+        environment,
         branch: run.branch.clone(),
         submission_key,
     })
+}
+
+fn read_run_environment(
+    input: &Option<crate::native_v2_cli::RunEnvironmentInput>,
+) -> Result<Option<openengine_cluster_protocol::RuntimeEnvironment>, NativeV2CliError> {
+    match input {
+        None => Ok(None),
+        Some(crate::native_v2_cli::RunEnvironmentInput::Empty) => Ok(Some(Default::default())),
+        Some(crate::native_v2_cli::RunEnvironmentInput::File(path)) => {
+            read_json("run environment", path).map(Some)
+        }
+    }
 }
 
 pub(super) fn select_connections<F>(
@@ -401,6 +555,9 @@ where
     for (key, fields) in requirements {
         let mut values = BTreeMap::new();
         for name in fields {
+            if name.as_str().eq_ignore_ascii_case("ZEROSHOT_API_KEY") {
+                continue;
+            }
             let Some(value) = available(name.as_str()) else {
                 continue;
             };
@@ -483,46 +640,64 @@ fn apply_template_runtime(
     Ok(runtime)
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
-enum UniformHarness {
-    Copilot,
-    Codex,
-    Claude,
-    Pi,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
-enum UniformProvider {
-    Github,
-    #[serde(rename = "openai")]
-    OpenAi,
-    #[serde(rename = "openrouter")]
-    OpenRouter,
-    Gateway,
-    Anthropic,
-    Bedrock,
-}
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct UniformRuntimePlan {
-    harness: UniformHarness,
-    provider: UniformProvider,
+    harness: openengine_cluster_protocol::HarnessId,
+    provider: openengine_cluster_protocol::ProviderId,
     #[serde(default = "medium_size")]
     size: RunSize,
+    #[serde(default = "default_workspace_checkpoints")]
+    workspace_checkpoints: bool,
     model: ModelId,
     #[serde(default)]
     effort: Option<ReasoningEffort>,
+    #[serde(default, deserialize_with = "deserialize_context_window")]
+    context_window: Option<u32>,
+    #[serde(default)]
+    harness_config: Option<openengine_cluster_protocol::HarnessConfiguration>,
+    #[serde(default, deserialize_with = "deserialize_max_tokens")]
+    max_tokens: Option<u32>,
     #[serde(default)]
     session_scope: Option<SessionScope>,
     #[serde(default)]
     connections: Option<DeclaredConnections>,
+    #[serde(default)]
+    active_memory: ActiveMemoryConfig,
+    #[serde(default)]
+    global_agents: GlobalAgentsConfig,
+}
+
+const fn default_workspace_checkpoints() -> bool {
+    true
 }
 
 const fn medium_size() -> RunSize {
     RunSize::Medium
+}
+
+fn deserialize_context_window<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_optional_model_limit(
+        deserializer,
+        "contextWindow",
+        MIN_MODEL_CONTEXT_WINDOW,
+        MAX_MODEL_CONTEXT_WINDOW,
+    )
+}
+
+fn deserialize_max_tokens<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_optional_model_limit(
+        deserializer,
+        "maxTokens",
+        MIN_MODEL_MAX_TOKENS,
+        MAX_MODEL_MAX_TOKENS,
+    )
 }
 
 impl UniformRuntimePlan {
@@ -532,10 +707,19 @@ impl UniformRuntimePlan {
         pull_request_feedback: crate::native_v2_contract::PullRequestFeedback,
         template: Option<BuiltinGraphTemplate>,
     ) -> Result<RuntimePlan, NativeV2CliError> {
-        let harness = self.harness;
+        let harness = self.harness.clone();
         let mut nodes = BTreeMap::new();
         let mode = crate::native_v2_admission::delivery_mode(&graph.root);
         for (name, delivery) in executable_runtime_roles(&graph.root) {
+            if is_comment_node(&graph.root, &name) {
+                nodes.insert(
+                    name,
+                    NodeRuntimeBinding::CommentDelivery {
+                        connections: DeclaredConnections::empty(),
+                    },
+                );
+                continue;
+            }
             let binding = self.binding(
                 (&name, mode.filter(|_| delivery)),
                 template,
@@ -559,6 +743,9 @@ impl UniformRuntimePlan {
             lane: None,
             model: self.model.clone(),
             effort: self.effort,
+            harness_config: self.harness_config.clone(),
+            context_window: self.context_window,
+            max_tokens: self.max_tokens,
             session_scope: self.session_scope.unwrap_or_else(|| {
                 template.map_or(SessionScope::Execution, |template| {
                     template.default_session_scope(name.as_str())
@@ -573,104 +760,44 @@ impl UniformRuntimePlan {
 
     fn into_runtime_plan(
         self,
-        harness: UniformHarness,
+        harness: openengine_cluster_protocol::HarnessId,
         nodes: BTreeMap<NodeName, NodeRuntimeBinding>,
     ) -> Result<RuntimePlan, NativeV2CliError> {
-        let incompatible = || {
-            NativeV2CliError::Usage(format!(
-                "provider {:?} is incompatible with harness {:?}",
-                self.provider, harness
-            ))
-        };
-        match harness {
-            UniformHarness::Copilot if self.provider == UniformProvider::Github => {
-                Ok(RuntimePlan::Copilot {
-                    provider: crate::native_v2_contract::CopilotProvider::Github,
-                    size: self.size,
-                    nodes,
-                })
-            }
-            UniformHarness::Codex => Ok(RuntimePlan::Codex {
-                provider: self.provider.codex().ok_or_else(incompatible)?,
-                size: self.size,
-                nodes,
-            }),
-            UniformHarness::Claude => Ok(RuntimePlan::Claude {
-                provider: self.provider.claude().ok_or_else(incompatible)?,
-                size: self.size,
-                nodes,
-            }),
-            UniformHarness::Pi => Ok(RuntimePlan::Pi {
-                provider: self.provider.pi().ok_or_else(incompatible)?,
-                size: self.size,
-                nodes,
-            }),
-            UniformHarness::Copilot => Err(incompatible()),
-        }
+        Ok(RuntimePlan {
+            harness,
+            provider: self.provider,
+            size: self.size,
+            workspace_checkpoints: self.workspace_checkpoints,
+            active_memory: self.active_memory,
+            global_agents: self.global_agents,
+            nodes,
+        })
     }
 }
 
-impl UniformProvider {
-    const fn codex(self) -> Option<CodexProvider> {
-        match self {
-            Self::OpenAi => Some(CodexProvider::OpenAi),
-            Self::OpenRouter => Some(CodexProvider::OpenRouter),
-            Self::Gateway => Some(CodexProvider::Gateway),
-            Self::Bedrock => Some(CodexProvider::Bedrock),
-            _ => None,
+fn is_comment_node(root: &openengine_cluster_protocol::GraphNode, name: &NodeName) -> bool {
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        if node.name() == name
+            && let openengine_cluster_protocol::GraphNode::Verifier(node) = node
+        {
+            return node.worker.as_str()
+                == crate::native_v2_comment_delivery::COMMENT_DELIVERY_WORKER_REF;
         }
+        pending.extend(openengine_cluster_server::graph_verifier::graph_node_children(node));
     }
-
-    const fn claude(self) -> Option<ClaudeProvider> {
-        match self {
-            Self::Anthropic => Some(ClaudeProvider::Anthropic),
-            Self::OpenRouter => Some(ClaudeProvider::OpenRouter),
-            Self::Gateway => Some(ClaudeProvider::Gateway),
-            Self::Bedrock => Some(ClaudeProvider::Bedrock),
-            _ => None,
-        }
-    }
-
-    const fn pi(self) -> Option<PiProvider> {
-        match self {
-            Self::Anthropic => Some(PiProvider::Anthropic),
-            Self::OpenAi => Some(PiProvider::OpenAi),
-            Self::OpenRouter => Some(PiProvider::OpenRouter),
-            Self::Gateway => Some(PiProvider::Gateway),
-            Self::Bedrock => Some(PiProvider::Bedrock),
-            _ => None,
-        }
-    }
+    false
 }
 
 fn git_delivery_binding(
     pull_request_feedback: crate::native_v2_contract::PullRequestFeedback,
-    mode: crate::native_v2_delivery::DeliveryMode,
+    _mode: crate::native_v2_delivery::DeliveryMode,
 ) -> Result<NodeRuntimeBinding, NativeV2CliError> {
-    let connections = if mode == crate::native_v2_delivery::DeliveryMode::Push {
-        DeclaredConnections::empty()
-    } else {
-        connection(
-            crate::native_v2_contract::GITHUB_CONNECTION_KEY,
-            &[GITHUB_TOKEN_ENV],
-        )?
-    };
+    let connections = DeclaredConnections::empty();
     Ok(NodeRuntimeBinding::GitDelivery {
         connections,
         pull_request_feedback,
     })
-}
-
-fn connection(key: &str, names: &[&str]) -> Result<DeclaredConnections, NativeV2CliError> {
-    let names = names
-        .iter()
-        .map(|name| EnvironmentVariableName::new(*name))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| NativeV2CliError::Usage(error.to_string()))?;
-    let environment = DeclaredEnvironment::new(names)
-        .map_err(|error| NativeV2CliError::Usage(error.to_string()))?;
-    DeclaredConnections::single(key, environment)
-        .map_err(|error| NativeV2CliError::Usage(error.to_string()))
 }
 
 fn insert_template_binding(
@@ -681,6 +808,16 @@ fn insert_template_binding(
 ) -> Result<(), NativeV2CliError> {
     let nodes = runtime.nodes_mut();
     if let Some(existing) = nodes.get_mut(&name) {
+        if matches!(binding, NodeRuntimeBinding::CommentDelivery { .. }) {
+            return if matches!(existing, NodeRuntimeBinding::CommentDelivery { .. }) {
+                Ok(())
+            } else {
+                Err(NativeV2CliError::Usage(format!(
+                    "runtime config must bind template-owned node {:?} as comment_delivery",
+                    name.as_str()
+                )))
+            };
+        }
         let NodeRuntimeBinding::GitDelivery {
             pull_request_feedback,
             ..

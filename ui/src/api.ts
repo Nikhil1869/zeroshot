@@ -1,6 +1,9 @@
 import type { WorkerOption } from './workers';
+import { validMachineCatalog, type MachineOption } from './machines';
 import type { Document, Template } from './domain';
 export type Summary = { id: string; name: string; isDefault: boolean };
+export type ProfileProblem = { name: string; isDefault: boolean; message: string };
+export type ProfileList = { profiles: Summary[]; problems?: ProfileProblem[] };
 export type Saved = { profile: Document & Summary; revision: string };
 export type ApiClient = <T>(
   path: string,
@@ -59,14 +62,40 @@ export function createApiClient(base: URL, fetcher: typeof fetch = fetch): ApiCl
   };
 }
 
-export type WorkspaceIdentity = { kind: 'local' | 'target' | 'cloud'; id: string };
+export type HarnessOption = {
+  id: string;
+  label: string;
+  providers: string[];
+  source?: 'core' | 'contributed';
+};
+
+export type WorkspaceIdentity = { kind: 'local' | 'target' | 'platform'; id: string };
 export type Bootstrap = {
   templates: Template[];
   workers?: WorkerOption[];
   runtimeSchema: any;
+  harnesses?: HarnessOption[];
+  machines?: MachineOption[];
   version: number;
   workspace: WorkspaceIdentity;
 };
+
+function validHarnessOption(value: unknown): value is HarnessOption {
+  const entry = value as Partial<HarnessOption> | null;
+  return (
+    !!entry &&
+    typeof entry.id === 'string' &&
+    !!entry.id.trim() &&
+    typeof entry.label === 'string' &&
+    !!entry.label.trim() &&
+    Array.isArray(entry.providers) &&
+    entry.providers.every((provider) => typeof provider === 'string' && !!provider.trim())
+  );
+}
+
+function validHarnessCatalog(value: unknown): boolean {
+  return value === undefined || (Array.isArray(value) && value.every(validHarnessOption));
+}
 
 export function readBootstrap(value: unknown): Bootstrap {
   const result = value as Partial<Bootstrap> | null;
@@ -79,7 +108,9 @@ export function readBootstrap(value: unknown): Bootstrap {
   if (
     !Array.isArray(result.templates) ||
     !result.runtimeSchema ||
-    !['local', 'target', 'cloud'].includes(result.workspace?.kind ?? '') ||
+    !validHarnessCatalog(result.harnesses) ||
+    !validMachineCatalog(result.machines) ||
+    !['local', 'target', 'platform'].includes(result.workspace?.kind ?? '') ||
     typeof result.workspace?.id !== 'string' ||
     !result.workspace.id.trim()
   )

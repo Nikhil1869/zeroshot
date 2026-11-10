@@ -1,7 +1,14 @@
+---
+description: 'Run the built-in software-change graph in a local folder with Git delivery disabled. Validate the input and runtime plan before starting.'
+---
+
 # Run a first task
 
 This example runs the built-in `software-change` graph in a local folder, with Git delivery disabled.
+The template normally creates a PR; this example explicitly uses `--delivery none`.
 Git is optional. Add `--cwd FOLDER` to select another folder; input files stay relative to the invoking folder.
+Use a project that already has a status command for this example, or replace the task with a change
+that fits your project.
 
 !!! warning "The worker edits the selected folder"
 
@@ -20,7 +27,8 @@ The template expects an object with a `task` string:
 ## 2. Choose the runtime
 
 A uniform runtime applies one agent configuration to every agent node. Replace the model placeholder
-with an identifier accepted by the selected provider.
+with an identifier accepted by the selected provider. Install and sign in to the selected native CLI
+first; check its version with `codex --version`, `claude --version`, `copilot --version`, or `pi --version`.
 
 ```json title="runtime.json"
 {
@@ -33,22 +41,50 @@ with an identifier accepted by the selected provider.
 
 Zeroshot passes model identifiers to the provider unchanged and does not keep its own model catalog.
 For this local run, Zeroshot reuses the installed Codex CLI's login and provider configuration; no
-placeholder API key or `openai` connection is required. A Docker or cloud run instead derives the
+placeholder API key or `openai` connection is required. A Docker or Platform run instead derives the
 canonical `OPENAI_API_KEY` requirement and resolves it from the submission environment or the
 target's connection store because it cannot inherit host login state.
+
+For another harness, use its file instead. A local run reuses that CLI's own login in the same way.
+
+```json title="runtime.json for Claude Code"
+{
+  "harness": "claude",
+  "provider": "anthropic",
+  "model": "YOUR_MODEL_ID",
+  "effort": "high"
+}
+```
+
+```json title="runtime.json for GitHub Copilot"
+{
+  "harness": "copilot",
+  "provider": "github",
+  "model": "YOUR_MODEL_ID"
+}
+```
+
+```json title="runtime.json for Pi"
+{
+  "harness": "pi",
+  "provider": "anthropic",
+  "model": "YOUR_MODEL_ID",
+  "effort": "high"
+}
+```
+
+See [Harness adapters](../project/harness-adapters.md) for available harness/provider pairs and
+contributed adapters. [Runtimes and connections](../concepts/runtimes-and-connections.md) explains
+native login and credential requirements.
 
 ## 3. Check the request without starting it
 
 `--validate-only` materializes the template and uniform runtime, then admits the request with its
-initial input. It does not contact a target or start a run.
+initial input. It does not contact a target, launch a harness, or start a run. The commands below
+use one line so they can be pasted into Bash, PowerShell, or Command Prompt.
 
 ```console
-zeroshot run \
-  --title "Add JSON status output" \
-  --template software-change \
-  --input input.json \
-  --uniform-runtime-config runtime.json \
-  --validate-only
+zeroshot run --title "Add JSON status output" --template software-change --delivery none --input input.json --uniform-runtime-config runtime.json --validate-only
 ```
 
 Successful validation writes `{"valid":true}`. A rejected request names the input, graph, or runtime
@@ -59,11 +95,7 @@ problem; the selected target checks connection availability later, when it recei
 Remove `--validate-only`:
 
 ```console
-zeroshot run \
-  --title "Add JSON status output" \
-  --template software-change \
-  --input input.json \
-  --uniform-runtime-config runtime.json
+zeroshot run --title "Add JSON status output" --template software-change --delivery none --input input.json --uniform-runtime-config runtime.json
 ```
 
 The foreground command streams newline-delimited JSON while the run advances. Ctrl-C closes that
@@ -92,8 +124,10 @@ its error lists the latest of those records, followed by the `zeroshot logs` com
 zeroshot template show single-worker
 ```
 
-`zeroshot template show software-change` prints the exact graph behind the first example as the same
-`GraphSpec` accepted by `--graph` and the Python SDK.
+`zeroshot template show software-change --delivery none` shows the graph behind the first example
+as a tree in a terminal. Names marked `*` need RuntimePlan bindings; template delivery bindings are
+supplied automatically. Add `--json` or redirect stdout to export the complete `GraphSpec` accepted
+by `--graph` and the Python SDK.
 
 `zeroshot template show auto-research` prints the research graph with its default of ten iterations.
 Supply a positive `options.iterations` integer in the run input to set the admitted loop bound. It keeps

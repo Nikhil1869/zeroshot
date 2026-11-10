@@ -8,16 +8,16 @@ use openengine_cluster_protocol::{
 };
 
 use super::{
-    AcpArgs, AttachArgs, Cli, CliCommand, ConnectionCommand, ConnectionScopeArg, PlanCommand,
-    PlanSelectorArgs, PlanSubmitArgs, RunArgs, RunCheckpointsArgs, RunResumeArgs, RunLogsArgs,
+    AcpArgs, AttachArgs, Cli, CliCommand, ConnectionCommand, ConnectionScopeArg, StackCommand,
+    StackSelectorArgs, StackSubmitArgs, RunArgs, RunCheckpointsArgs, RunResumeArgs, RunLogsArgs,
     RunSelectorArgs, RunWatchArgs, TargetCommand, TemplateCommand, TemplateName, UtilityCommand,
 };
 use crate::native_v2_cli::{
-    BuiltinGraphTemplate, ConnectionInput, ConnectionRoute, ConnectionSetCommand,
-    MergePlanSelector, MergePlanSubmitCommand, NativeV2CliCommand, NativeV2CliError,
-    ProfileQualifier, ProfileReference, RunCommand, RunGraph, RunLogsCommand, RunRepository,
-    RunRuntime, RunSelection, RunSelector, RunResumeCommand, RunCheckpointsCommand,
-    RunWatchCommand, TargetAdd, TargetServe, TemplateDelivery,
+    BuiltinGraphTemplate, ConnectionInput, ConnectionRoute, ConnectionSetCommand, StackSelector,
+    StackSubmitCommand, NativeV2CliCommand, NativeV2CliError, ProfileQualifier, ProfileReference,
+    RunCommand, RunGraph, RunLogsCommand, RunRepository, RunSourceForge, RunRuntime, RunSelection,
+    RunSelector, RunResumeCommand, RunCheckpointsCommand, RunWatchCommand, TargetAdd, TargetServe,
+    TemplateDelivery,
 };
 
 #[path = "convert/profile_commands.rs"]
@@ -61,15 +61,32 @@ impl Cli {
 impl CliCommand {
     fn into_command(self) -> Result<NativeV2CliCommand, NativeV2CliError> {
         match self {
-            Self::Acp(args) => args.into_command(),
-            Self::Ui { listen, target } => ui_command(listen, target),
+            Self::Memory { command } => Ok(NativeV2CliCommand::Memory(command)),
+            Self::Interface(command) => command.into_command(),
             Self::Target { command } => command.into_command(),
+            command => command.into_execution_command(),
+        }
+    }
+
+    fn into_execution_command(self) -> Result<NativeV2CliCommand, NativeV2CliError> {
+        match self {
+            Self::Delegation { command } => command.into_command(),
             Self::Connection { command } => command.into_command(),
             Self::Profile { command } => command.into_command(),
             Self::Template { command } => command.into_command(),
-            Self::Plan { command } => command.into_command(),
+            Self::Stack { command } => command.into_command(),
             Self::Run(args) => args.into_command(),
             Self::Utility(command) => command.into_command(),
+            _ => Err(usage("expected an execution or management command")),
+        }
+    }
+}
+
+impl super::InterfaceCommand {
+    fn into_command(self) -> Result<NativeV2CliCommand, NativeV2CliError> {
+        match self {
+            Self::Acp(args) => args.into_command(),
+            Self::Ui { listen, target } => ui_command(listen, target),
         }
     }
 }
@@ -151,14 +168,14 @@ fn connection_fields(
 
 fn connection_route(
     target: Option<String>,
-    scope: ConnectionScopeArg,
+    scope: Option<ConnectionScopeArg>,
 ) -> Result<ConnectionRoute, NativeV2CliError> {
     Ok(ConnectionRoute {
         target: validated_target(target)?,
-        scope: match scope {
+        scope: scope.map(|scope| match scope {
             ConnectionScopeArg::User => ConnectionScope::User,
             ConnectionScopeArg::Org => ConnectionScope::Org,
-        },
+        }),
     })
 }
 
@@ -258,30 +275,31 @@ impl TemplateCommand {
                 Ok(NativeV2CliCommand::TemplateShow {
                     template,
                     delivery: template_delivery(template, args.delivery.selection())?,
+                    json: args.json,
                 })
             }
         }
     }
 }
 
-impl PlanCommand {
+impl StackCommand {
     fn into_command(self) -> Result<NativeV2CliCommand, NativeV2CliError> {
         match self {
-            Self::Validate(args) => Ok(NativeV2CliCommand::PlanValidate { file: args.file }),
+            Self::Validate(args) => Ok(NativeV2CliCommand::StackValidate { file: args.file }),
             Self::Submit(args) => args.into_command(),
-            Self::Status(args) => plan_selector(args).map(NativeV2CliCommand::PlanStatus),
-            Self::Watch(args) => plan_selector(args).map(NativeV2CliCommand::PlanWatch),
-            Self::ForceStop(args) => plan_selector(args).map(NativeV2CliCommand::PlanForceStop),
+            Self::Status(args) => stack_selector(args).map(NativeV2CliCommand::StackStatus),
+            Self::Watch(args) => stack_selector(args).map(NativeV2CliCommand::StackWatch),
+            Self::ForceStop(args) => stack_selector(args).map(NativeV2CliCommand::StackForceStop),
         }
     }
 }
 
-impl PlanSubmitArgs {
+impl StackSubmitArgs {
     fn into_command(self) -> Result<NativeV2CliCommand, NativeV2CliError> {
         let target = required_target(self.target)?;
         let submission_key = IdempotencyKey::new(self.submission_key)
             .map_err(|error| usage(format!("invalid --submission-key: {error}")))?;
-        Ok(NativeV2CliCommand::PlanSubmit(MergePlanSubmitCommand {
+        Ok(NativeV2CliCommand::StackSubmit(StackSubmitCommand {
             target,
             file: self.file,
             detach: self.detach,
@@ -290,11 +308,11 @@ impl PlanSubmitArgs {
     }
 }
 
-fn plan_selector(args: PlanSelectorArgs) -> Result<MergePlanSelector, NativeV2CliError> {
-    validate_public_id(&args.plan_id, "plan ID")?;
-    Ok(MergePlanSelector {
+fn stack_selector(args: StackSelectorArgs) -> Result<StackSelector, NativeV2CliError> {
+    validate_public_id(&args.stack_id, "stack ID")?;
+    Ok(StackSelector {
         target: required_target(args.target)?,
-        plan_id: openengine_cluster_protocol::MergePlanId::new(args.plan_id),
+        stack_id: openengine_cluster_protocol::StackId::new(args.stack_id),
     })
 }
 
@@ -304,6 +322,9 @@ impl TemplateName {
             Self::SingleWorker => "single-worker",
             Self::SoftwareChange => "software-change",
             Self::AutoResearch => "auto-research",
+            Self::IssueReview => "issue-review",
+            Self::PrReview => "pr-review",
+            Self::CodeReview => "code-review",
         };
         BuiltinGraphTemplate::parse(name)
             .ok_or_else(|| usage("Clap template value is outside the built-in catalog"))
@@ -312,7 +333,13 @@ impl TemplateName {
 
 impl RunArgs {
     fn into_command(self) -> Result<NativeV2CliCommand, NativeV2CliError> {
+        validate_review_source(&self)?;
         let route = run_route(self.target, self.repository, self.branch, self.revision)?;
+        let source_forge = source_forge(
+            self.source_provider,
+            self.source_base_url,
+            route.repository.as_ref(),
+        )?;
         let selection = run_selection(RunSelectionArgs {
             profile: self.profile,
             graph: self.graph,
@@ -329,9 +356,10 @@ impl RunArgs {
                 .map(openengine_cluster_protocol::ConnectionKey::new)
                 .transpose()
                 .map_err(|error| usage(format!("invalid --source-connection: {error}")))?,
+            source_forge,
             title: RunTitle::new(self.title)
                 .map_err(|error| usage(format!("invalid --title: {error}")))?,
-            input: self.input,
+            input: run_input(self.input, self.task_from)?,
             environment: if self.no_environment {
                 Some(crate::native_v2_cli::RunEnvironmentInput::Empty)
             } else {
@@ -346,6 +374,57 @@ impl RunArgs {
             validate_only: self.validate_only,
             submission_key: submission_key(self.submission_key)?,
         })))
+    }
+}
+
+fn validate_review_source(args: &RunArgs) -> Result<(), NativeV2CliError> {
+    if args.task_from.is_some()
+        && (args.repository.is_some()
+            || args.source_connection.is_some()
+            || args.source_provider.is_some()
+            || args.source_base_url.is_some())
+    {
+        return Err(usage(
+            "--task-from selects its repository and does not accept source overrides",
+        ));
+    }
+    Ok(())
+}
+
+fn source_forge(
+    provider: Option<String>,
+    base_url: Option<String>,
+    repository: Option<&RunRepository>,
+) -> Result<Option<RunSourceForge>, NativeV2CliError> {
+    match (provider, base_url) {
+        (None, None) => Ok(None),
+        (Some(_), Some(_)) if matches!(repository, Some(RunRepository::GitHub(_))) => Err(usage(
+            "explicit source instances require a Git remote URL instead of GitHub owner/name shorthand",
+        )),
+        (Some(provider), Some(base_url)) => Ok(Some(RunSourceForge {
+            provider: openengine_cluster_protocol::SourceForgeProviderId::new(provider)
+                .map_err(|error| usage(format!("invalid --source-provider: {error}")))?,
+            base_url: openengine_cluster_protocol::SourceForgeBaseUrl::new(base_url)
+                .map_err(|error| usage(format!("invalid --source-base-url: {error}")))?,
+        })),
+        _ => Err(usage(
+            "--source-provider and --source-base-url must be supplied together",
+        )),
+    }
+}
+
+fn run_input(
+    file: Option<PathBuf>,
+    url: Option<String>,
+) -> Result<crate::native_v2_cli::RunInput, NativeV2CliError> {
+    match (file, url) {
+        (Some(path), None) => Ok(crate::native_v2_cli::RunInput::File(path)),
+        (None, Some(url)) => Ok(crate::native_v2_cli::RunInput::TaskFrom(
+            crate::native_v2_review::parse_review_url(&url)
+                .map_err(|error| usage(error.to_string()))?
+                .url,
+        )),
+        _ => Err(usage("exactly one of --input or --task-from is required")),
     }
 }
 
@@ -585,7 +664,11 @@ fn template_delivery(
     template: BuiltinGraphTemplate,
     (selected, push, pr, ship, no_pr_feedback): (Option<&str>, bool, bool, bool, bool),
 ) -> Result<TemplateDelivery, NativeV2CliError> {
-    let delivery = selected_delivery(selected, push, pr, ship)?;
+    let delivery = if selected.is_none() && !(push || pr || ship) {
+        template.default_delivery()
+    } else {
+        selected_delivery(selected, push, pr, ship)?
+    };
     validate_template_delivery(template, delivery, no_pr_feedback)?;
     Ok(delivery)
 }
@@ -611,13 +694,21 @@ fn validate_template_delivery(
     no_pr_feedback: bool,
 ) -> Result<(), NativeV2CliError> {
     if no_pr_feedback && !delivery_supports_feedback(delivery) {
-        return Err(usage("--no-pr-feedback requires --pr or --ship"));
+        return Err(usage(
+            "--no-pr-feedback requires pull-request or merge delivery",
+        ));
     }
     let supported = match template {
         BuiltinGraphTemplate::SingleWorker => delivery == TemplateDelivery::None,
-        BuiltinGraphTemplate::SoftwareChange => true,
+        BuiltinGraphTemplate::SoftwareChange => delivery != TemplateDelivery::Comment,
         BuiltinGraphTemplate::AutoResearch => {
             matches!(delivery, TemplateDelivery::None | TemplateDelivery::Push)
+        }
+        BuiltinGraphTemplate::IssueReview => {
+            matches!(delivery, TemplateDelivery::None | TemplateDelivery::Comment)
+        }
+        BuiltinGraphTemplate::PrReview | BuiltinGraphTemplate::CodeReview => {
+            delivery == TemplateDelivery::Comment
         }
     };
     if !supported {
@@ -636,6 +727,7 @@ fn named_delivery(mode: &str) -> Result<TemplateDelivery, NativeV2CliError> {
         "push" => Ok(TemplateDelivery::Push),
         "pull_request" => Ok(TemplateDelivery::PullRequest),
         "merge" => Ok(TemplateDelivery::Merge),
+        "comment" => Ok(TemplateDelivery::Comment),
         _ => Err(usage(format!("unknown template delivery mode {mode:?}"))),
     }
 }
@@ -684,7 +776,7 @@ fn optional_branch(branch: Option<String>) -> Result<Option<SourceBranchId>, Nat
         .map_err(|error| usage(format!("invalid --branch: {error}")))
 }
 
-fn validate_public_id(value: &str, kind: &str) -> Result<(), NativeV2CliError> {
+pub(super) fn validate_public_id(value: &str, kind: &str) -> Result<(), NativeV2CliError> {
     if value.is_empty() || value.chars().count() > 256 || value.chars().any(char::is_control) {
         return Err(usage(format!(
             "{kind} must be 1..=256 non-control characters"
@@ -693,6 +785,6 @@ fn validate_public_id(value: &str, kind: &str) -> Result<(), NativeV2CliError> {
     Ok(())
 }
 
-fn usage(message: impl Into<String>) -> NativeV2CliError {
+pub(super) fn usage(message: impl Into<String>) -> NativeV2CliError {
     NativeV2CliError::Usage(message.into())
 }

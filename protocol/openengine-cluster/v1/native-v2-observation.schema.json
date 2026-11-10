@@ -85,6 +85,66 @@
       ],
       "type": "object"
     },
+    "FailureContext": {
+      "additionalProperties": false,
+      "description": "The known runtime cause and recent recorded node failures are deliberately separate.\nRecorded failures are evidence; retries or parallel branches may have recovered from them.",
+      "properties": {
+        "incomplete": {
+          "default": false,
+          "type": "boolean"
+        },
+        "primary": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FailureDiagnostic"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "recorded": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/FailureDiagnostic"
+          },
+          "maxItems": 5,
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "FailureDiagnostic": {
+      "additionalProperties": false,
+      "description": "One recorded explanation, with an optional execution selector and retained log cursor.\nA missing cursor means there is no reference into the available durable history.",
+      "properties": {
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "execution": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ActiveExecution"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "message": {
+          "maxLength": 16384,
+          "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f]*$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "message"
+      ],
+      "type": "object"
+    },
     "JsonRpcError": {
       "properties": {
         "code": {
@@ -841,8 +901,11 @@
     },
     "RunMetadata": {
       "additionalProperties": false,
-      "description": "Additive metadata emitted only with a terminal run projection.",
+      "description": "Runtime-owned metadata accompanying terminal status and retained run history.",
       "properties": {
+        "deliveryReceipt": {
+          "description": "Confirmed native delivery evidence, independent of the graph's terminal output."
+        },
         "tokenUsage": {
           "anyOf": [
             {
@@ -860,7 +923,9 @@
       "enum": [
         "small",
         "medium",
-        "large"
+        "large",
+        "xl",
+        "gpu_t4"
       ],
       "type": "string"
     },
@@ -1088,6 +1153,16 @@
       "additionalProperties": false,
       "description": "Optional forge identity selects one registered source-code adapter.",
       "properties": {
+        "baseUrl": {
+          "description": "Canonical web base, including an optional installation path prefix.\nOmission selects the adapter's public service default when one exists.",
+          "maxLength": 2048,
+          "minLength": 8,
+          "pattern": "^https://[^\\s?#@]+$",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "provider": {
           "maxLength": 128,
           "minLength": 1,
@@ -1128,6 +1203,16 @@
         {
           "additionalProperties": false,
           "properties": {
+            "context": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/FailureContext"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "reason": {
               "maxLength": 128,
               "minLength": 1,

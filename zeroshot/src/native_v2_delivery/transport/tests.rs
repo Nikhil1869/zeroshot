@@ -4,6 +4,105 @@ use crate::source_code_provider::SourceGitCredential;
 
 const GIT_FIXTURE_BUDGET: Duration = Duration::from_secs(60);
 
+#[tokio::test]
+async fn workspace_git_retains_transport_native_configuration_for_reconciliation() {
+    use crate::native_v2_delivery::git::test_support::{ConfigLocation, GitFixture};
+    let fixture = GitFixture::new("[core]\n autocrlf = true\n", ConfigLocation::Home);
+    let base = fixture.seed();
+    fixture.edit();
+    let mut config = GitTransportConfig {
+        git_program: fixture.program.clone(),
+        workspace: fixture.workspace.clone(),
+        home_directory: fixture.root.path().join("hosted-home"),
+        private_directory: fixture.root.path().to_owned(),
+        identity: None,
+        local_environment: Some(fixture.environment.clone()),
+        deadline: GIT_FIXTURE_BUDGET,
+    };
+    let transport = GitTransport::new(config.clone(), "https://git.example/project.git");
+    let system = transport.workspace_git();
+    fixture
+        .assert_delivered(&system, &base, b"first\nchanged\n")
+        .await;
+    let command = transport.command(&fixture.workspace);
+    assert_eq!(command.as_std().get_program(), fixture.program.as_os_str());
+    assert!(!format!("{transport:?}").contains("autocrlf"));
+
+    config.local_environment = None;
+    let hosted = GitTransport::new(config, "https://git.example/project.git");
+    {
+        let command = hosted.command(&fixture.workspace);
+        let environment: BTreeMap<_, _> = command.as_std().get_envs().collect();
+        assert_eq!(
+            environment[OsStr::new("GIT_CONFIG_NOSYSTEM")],
+            Some(OsStr::new("1"))
+        );
+        assert_eq!(
+            environment[OsStr::new("GIT_CONFIG_GLOBAL")],
+            Some(OsStr::new("/dev/null"))
+        );
+        assert_ne!(
+            environment.get(OsStr::new("HOME")),
+            Some(&Some(OsStr::new(&fixture.environment["HOME"])))
+        );
+    }
+    std::fs::write(fixture.workspace.join("sample.txt"), b"first\r\nhosted\r\n").assert_value();
+    let revision = hosted
+        .workspace_git()
+        .prepare_revision(&fixture.workspace, &base, "hosted bytes")
+        .await
+        .assert_value();
+    assert_eq!(
+        fixture.git(&["show", &format!("{revision}:sample.txt")]),
+        b"first\r\nhosted\r\n"
+    );
+}
+
+#[tokio::test]
+async fn review_checkout_fetches_pr_head_and_retains_diverged_base() {
+    let repository = Repository::new();
+    git(&repository.workspace, &["checkout", "-b", "review-head"]);
+    std::fs::write(repository.workspace.join("change"), "reviewed change").assert_value();
+    git(&repository.workspace, &["add", "--all"]);
+    git(&repository.workspace, &["commit", "-m", "review head"]);
+    let head = git(&repository.workspace, &["rev-parse", "HEAD"]);
+    let remote = repository.remote.to_str().assert_value();
+    git(
+        &repository.workspace,
+        &["push", remote, "HEAD:refs/pull/17/head"],
+    );
+    git(&repository.workspace, &["checkout", "main"]);
+    std::fs::write(repository.workspace.join("upstream"), "new base").assert_value();
+    git(&repository.workspace, &["add", "--all"]);
+    git(&repository.workspace, &["commit", "-m", "advance base"]);
+    let base = git(&repository.workspace, &["rev-parse", "HEAD"]);
+    git(&repository.workspace, &["push", remote, "main"]);
+    let checkout = repository.root.path().join("review-checkout");
+    std::fs::create_dir(&checkout).assert_value();
+    let transport = repository
+        .transport(Path::new("git"), &checkout, repository.remote.as_os_str())
+        .with_checkout_references(vec!["refs/pull/17/head".to_owned(), base.clone()])
+        .assert_value();
+    transport
+        .checkout("main", &head, SourceDeliveryCredential::token(""))
+        .await
+        .assert_value();
+    assert_eq!(git(&checkout, &["rev-parse", "HEAD"]), head);
+    assert_eq!(
+        git(&checkout, &["rev-parse", "refs/zeroshot/review/base"]),
+        base
+    );
+    assert_eq!(
+        git(&checkout, &["merge-base", "HEAD", &base]),
+        repository.base
+    );
+    assert!(
+        transport
+            .with_checkout_references(vec!["--upload-pack=unexpected".to_owned()])
+            .is_err()
+    );
+}
+
 struct Repository {
     root: tempfile::TempDir,
     workspace: PathBuf,
@@ -759,4 +858,152 @@ async fn redacted_http_status_preserves_refusal_and_retry_routing() {
             )]
         );
     }
+}
+
+#[tokio::test]
+async fn runtime_commit_identity_is_pinned_after_native_environment() {
+    let repository = Repository::new();
+    let configuration = repository.root.path().join("caller.gitconfig");
+    std::fs::write(&configuration, "").assert_value();
+    let environment = BTreeMap::from([
+        ("GIT_AUTHOR_NAME".to_owned(), "Caller Author".to_owned()),
+        (
+            "GIT_AUTHOR_EMAIL".to_owned(),
+            "author@example.invalid".to_owned(),
+        ),
+        (
+            "GIT_COMMITTER_NAME".to_owned(),
+            "Caller Committer".to_owned(),
+        ),
+        (
+            "GIT_COMMITTER_EMAIL".to_owned(),
+            "committer@example.invalid".to_owned(),
+        ),
+    ]);
+    let transport =
+        repository.native_transport(repository.remote.as_os_str(), &configuration, environment);
+    transport
+        .execute(
+            &[
+                "commit".into(),
+                "--allow-empty".into(),
+                "--message".into(),
+                "fixed identity".into(),
+            ],
+            SourceDeliveryCredential::token(""),
+            GIT_FIXTURE_BUDGET,
+        )
+        .await
+        .assert_value()
+        .require_success()
+        .assert_value();
+    assert_eq!(
+        git(
+            &repository.workspace,
+            &["show", "-s", "--format=%an <%ae>|%cn <%ce>"]
+        ),
+        "Zeroshot <delivery@zeroshot.invalid>|Zeroshot <delivery@zeroshot.invalid>"
+    );
+}
+
+#[tokio::test]
+async fn host_commit_identity_authors_transport_and_reconciliation_commits() {
+    use crate::native_v2_candidate::test_support::{BOT_AUTHOR, bot_commit_identity, commit_authorship};
+    use crate::source_code_provider::{
+        SourceHeadReconciliation, SourceReconciliationOutcome, SourceReviewReceipt,
+    };
+
+    let repository = Repository::new();
+    let configuration = repository.root.path().join("caller.gitconfig");
+    std::fs::write(&configuration, "").assert_value();
+    let caller = BTreeMap::from([
+        ("GIT_AUTHOR_NAME".to_owned(), "Caller".to_owned()),
+        ("GIT_COMMITTER_NAME".to_owned(), "Caller".to_owned()),
+    ]);
+    let transport = repository
+        .native_transport(repository.remote.as_os_str(), &configuration, caller)
+        .with_commit_identity(Some(bot_commit_identity()));
+    let bot = format!("{BOT_AUTHOR}|{BOT_AUTHOR}");
+    transport
+        .execute(
+            &[
+                "commit".into(),
+                "--allow-empty".into(),
+                "--message".into(),
+                "host identity".into(),
+            ],
+            SourceDeliveryCredential::token(""),
+            GIT_FIXTURE_BUDGET,
+        )
+        .await
+        .assert_value()
+        .require_success()
+        .assert_value();
+    assert_eq!(commit_authorship(&repository.workspace, "HEAD"), bot);
+
+    let published_revision = repository.commit("published");
+    let local_revision = repository.commit("local-work");
+    git(
+        &repository.workspace,
+        &["checkout", "--detach", &published_revision],
+    );
+    let observed_revision = repository.commit("upstream-work");
+    let branch = "zeroshot/host-identity";
+    git(
+        &repository.workspace,
+        &[
+            "push",
+            repository.remote.to_str().assert_value(),
+            &format!("{observed_revision}:refs/heads/{branch}"),
+        ],
+    );
+    git(
+        &repository.workspace,
+        &["checkout", "--detach", &local_revision],
+    );
+    std::fs::write(repository.workspace.join("dirty"), "dirty").assert_value();
+    let published = SourceReviewReceipt {
+        review_id: String::new(),
+        repository: "git-source:opaque".to_owned(),
+        target_branch: "main".to_owned(),
+        head_branch: branch.to_owned(),
+        head_revision: published_revision,
+    };
+    let observed = SourceReviewReceipt {
+        head_revision: observed_revision.clone(),
+        ..published.clone()
+    };
+    let outcome = reconcile_head(
+        &transport,
+        SourceHeadReconciliation {
+            workspace: &repository.workspace,
+            published: &published,
+            observed: &observed,
+            commit_message: "Preserve local work",
+            authorized_update: false,
+            adopting_existing: false,
+        },
+        SourceDeliveryCredential::token(""),
+    )
+    .await
+    .assert_value();
+    assert!(
+        matches!(outcome, SourceReconciliationOutcome::NeedsWork(_)),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        git(&repository.workspace, &["rev-parse", "HEAD^2"]),
+        observed_revision
+    );
+    for (revision, kind) in [("HEAD", "reconcile merge"), ("HEAD^1", "prepared revision")] {
+        assert_eq!(
+            commit_authorship(&repository.workspace, revision),
+            bot,
+            "{kind}"
+        );
+    }
+    assert_eq!(
+        git(&repository.workspace, &["rev-parse", "HEAD^1^"]),
+        local_revision
+    );
 }

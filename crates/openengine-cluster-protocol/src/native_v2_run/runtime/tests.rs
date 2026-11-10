@@ -1,6 +1,47 @@
 use super::*;
 
 #[test]
+fn harness_config_is_bounded_and_lossless_per_node() {
+    for config in [
+        serde_json::json!({}),
+        serde_json::json!({"args":["--tools","Read,Grep,Glob"]}),
+        serde_json::json!({"options":{"unknownNativeKey":{"nested":[null,true,42]}}}),
+    ] {
+        let wire = serde_json::json!({"kind":"agent","model":"opaque","harnessConfig":config});
+        let binding: NodeRuntimeBinding = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(serde_json::to_value(binding).unwrap(), wire);
+    }
+    for config in [
+        serde_json::json!([]),
+        serde_json::json!({"args":"--tools"}),
+        serde_json::json!({"args":[42]}),
+        serde_json::json!({"args":["bad\u{0000}arg"]}),
+        serde_json::json!({"options":null}),
+        serde_json::json!({"extra":true}),
+        serde_json::json!({"options":{"large":"x".repeat(super::super::MAX_HARNESS_CONFIG_BYTES)}}),
+    ] {
+        let wire = serde_json::json!({"kind":"agent","model":"opaque","harnessConfig":config});
+        assert!(
+            serde_json::from_value::<NodeRuntimeBinding>(wire)
+                .unwrap_err()
+                .to_string()
+                .contains("harnessConfig")
+        );
+    }
+}
+
+#[test]
+fn runtime_round_trip_keeps_different_native_configs_on_one_lane() {
+    let wire = serde_json::json!({"harness":"claude","provider":"anthropic","size":"small","nodes":{
+        "writer":{"kind":"agent","model":"opaque","harnessConfig":{"args":["--tools","default"]}},
+        "reviewer":{"kind":"agent","model":"opaque","harnessConfig":{"args":["--tools","Read,Grep,Glob"]}}
+    }});
+    let runtime: super::super::RuntimePlan = serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(runtime.lanes().len(), 1);
+    assert_eq!(serde_json::to_value(runtime).unwrap(), wire);
+}
+
+#[test]
 fn pr_feedback_defaults_to_consider_and_runtime_can_select_ignore() {
     let default: NodeRuntimeBinding =
         serde_json::from_value(serde_json::json!({"kind":"git_delivery"})).unwrap();
@@ -34,15 +75,14 @@ fn pr_feedback_defaults_to_consider_and_runtime_can_select_ignore() {
 fn agent_lane_round_trips_exactly() {
     let wire = r#"{"kind":"agent","lane":{"harness":"claude","provider":"anthropic"},"model":"review-model"}"#;
     let binding: NodeRuntimeBinding = serde_json::from_str(wire).unwrap();
-    assert!(matches!(
-        binding,
-        NodeRuntimeBinding::Agent {
-            lane: Some(crate::RuntimeLane::Claude {
-                provider: crate::ClaudeProvider::Anthropic
-            }),
-            ..
-        }
-    ));
+    let NodeRuntimeBinding::Agent {
+        lane: Some(lane), ..
+    } = &binding
+    else {
+        panic!("expected an explicit agent lane");
+    };
+    assert_eq!(lane.harness_name(), "claude");
+    assert_eq!(lane.provider_name(), "anthropic");
     assert_eq!(serde_json::to_string(&binding).unwrap(), wire);
 }
 
@@ -52,6 +92,9 @@ fn agent_without_a_lane_serializes_without_a_lane_key() {
         lane: None,
         model: crate::ModelId::new("worker-model").unwrap(),
         effort: None,
+        harness_config: None,
+        context_window: None,
+        max_tokens: None,
         session_scope: SessionScope::Execution,
         connections: DeclaredConnections::empty(),
     };
@@ -61,6 +104,65 @@ fn agent_without_a_lane_serializes_without_a_lane_key() {
         serde_json::from_str::<NodeRuntimeBinding>(wire).unwrap(),
         binding
     );
+}
+
+#[test]
+fn caller_model_limits_are_optional_bounded_and_round_trip() {
+    let wire =
+        r#"{"kind":"agent","model":"worker-model","contextWindow":1000000,"maxTokens":32000}"#;
+    let binding: NodeRuntimeBinding = serde_json::from_str(wire).unwrap();
+    assert_eq!(binding.context_window(), Some(1_000_000));
+    assert_eq!(binding.max_tokens(), Some(32_000));
+    binding.validate_model_limits().unwrap();
+    assert_eq!(serde_json::to_string(&binding).unwrap(), wire);
+
+    // Absent limits keep every existing runtime file unchanged and delegate to Pi's defaults.
+    let absent: NodeRuntimeBinding =
+        serde_json::from_str(r#"{"kind":"agent","model":"worker-model"}"#).unwrap();
+    assert_eq!(absent.context_window(), None);
+    assert_eq!(absent.max_tokens(), None);
+    assert_eq!(
+        serde_json::to_string(&absent).unwrap(),
+        r#"{"kind":"agent","model":"worker-model"}"#
+    );
+
+    // Direct Rust construction must be inspected at admission rather than assumed valid.
+    let invalid = NodeRuntimeBinding::Agent {
+        lane: None,
+        model: crate::ModelId::new("worker-model").unwrap(),
+        effort: None,
+        harness_config: None,
+        context_window: Some(0),
+        max_tokens: Some(MAX_MODEL_MAX_TOKENS + 1),
+        session_scope: SessionScope::Execution,
+        connections: DeclaredConnections::empty(),
+    };
+    let error = invalid.validate_model_limits().unwrap_err();
+    assert!(
+        error.to_string().contains("contextWindow") && error.to_string().contains("1..=10000000"),
+        "{error}"
+    );
+
+    for (field, invalid_value) in [
+        ("contextWindow", serde_json::json!(0)),
+        (
+            "contextWindow",
+            serde_json::json!(MAX_MODEL_CONTEXT_WINDOW + 1),
+        ),
+        ("contextWindow", serde_json::json!(-1)),
+        ("maxTokens", serde_json::json!(0)),
+        ("maxTokens", serde_json::json!(MAX_MODEL_MAX_TOKENS + 1)),
+        ("maxTokens", serde_json::json!(-1)),
+    ] {
+        let mut wire = serde_json::json!({"kind": "agent", "model": "worker-model"});
+        wire[field] = invalid_value;
+        let error = serde_json::from_value::<NodeRuntimeBinding>(wire).unwrap_err();
+        assert!(error.to_string().contains(field), "{field}: {error}");
+        assert!(
+            error.to_string().contains("1..=10000000"),
+            "{field}: {error}"
+        );
+    }
 }
 
 #[test]
@@ -77,20 +179,23 @@ fn lane_is_rejected_on_git_delivery() {
 }
 
 #[test]
-fn lane_rejects_incompatible_pairs_and_unknown_or_missing_fields() {
+fn lane_defers_pair_compatibility_but_rejects_unknown_or_missing_fields() {
+    for (harness, provider) in [
+        ("codex", "anthropic"),
+        ("claude", "openai"),
+        ("copilot", "openai"),
+        ("contributed", "private-provider"),
+    ] {
+        let binding: NodeRuntimeBinding = serde_json::from_value(serde_json::json!({
+            "kind":"agent", "lane":{"harness":harness,"provider":provider}, "model":"opaque-model"
+        }))
+        .unwrap();
+        assert!(matches!(
+            binding,
+            NodeRuntimeBinding::Agent { lane: Some(_), .. }
+        ));
+    }
     for (lane, expected) in [
-        (
-            serde_json::json!({"harness": "codex", "provider": "anthropic"}),
-            "unknown variant `anthropic`",
-        ),
-        (
-            serde_json::json!({"harness": "claude", "provider": "openai"}),
-            "unknown variant `openai`",
-        ),
-        (
-            serde_json::json!({"harness": "copilot", "provider": "openai"}),
-            "unknown variant `openai`",
-        ),
         (
             serde_json::json!({"harness": "claude", "provider": "anthropic", "model": "m"}),
             "unknown field `model`",
@@ -154,4 +259,62 @@ fn declared_runtime_inputs_enforce_unique_bounded_connection_authority() {
             .as_map()
             .contains_key(&ConnectionKey::new("provider").unwrap())
     );
+}
+
+#[test]
+fn caller_model_limits_reject_null_float_and_units_and_skip_other_bindings() {
+    // Null behaves exactly like an omitted field, so an explicit JSON null stays caller-friendly.
+    let nulls: NodeRuntimeBinding = serde_json::from_value(serde_json::json!({
+        "kind": "agent",
+        "model": "worker-model",
+        "contextWindow": null,
+        "maxTokens": null
+    }))
+    .unwrap();
+    assert_eq!(nulls.context_window(), None);
+    assert_eq!(nulls.max_tokens(), None);
+
+    // Fractions are rejected by the typed visitor rather than truncated or rounded.
+    for field in ["contextWindow", "maxTokens"] {
+        let mut wire = serde_json::json!({"kind": "agent", "model": "worker-model"});
+        wire[field] = serde_json::json!(1.5);
+        let error = serde_json::from_value::<NodeRuntimeBinding>(wire).unwrap_err();
+        assert!(error.to_string().contains(field), "{field}: {error}");
+    }
+
+    // Both inclusive boundaries are accepted and round-trip through serialization.
+    for (context_window, max_tokens) in [
+        (MIN_MODEL_CONTEXT_WINDOW, MIN_MODEL_MAX_TOKENS),
+        (MAX_MODEL_CONTEXT_WINDOW, MAX_MODEL_MAX_TOKENS),
+    ] {
+        let binding = NodeRuntimeBinding::Agent {
+            lane: None,
+            model: crate::ModelId::new("worker-model").unwrap(),
+            effort: None,
+            harness_config: None,
+            context_window: Some(context_window),
+            max_tokens: Some(max_tokens),
+            session_scope: SessionScope::Execution,
+            connections: DeclaredConnections::empty(),
+        };
+        binding.validate_model_limits().unwrap();
+        let round_trip: NodeRuntimeBinding =
+            serde_json::from_str(&serde_json::to_string(&binding).unwrap()).unwrap();
+        assert_eq!(round_trip, binding);
+    }
+
+    // Non-agent bindings have no limits to validate.
+    for binding in [
+        NodeRuntimeBinding::GitDelivery {
+            pull_request_feedback: PullRequestFeedback::Consider,
+            connections: DeclaredConnections::empty(),
+        },
+        NodeRuntimeBinding::CommentDelivery {
+            connections: DeclaredConnections::empty(),
+        },
+    ] {
+        binding.validate_model_limits().unwrap();
+        assert_eq!(binding.context_window(), None);
+        assert_eq!(binding.max_tokens(), None);
+    }
 }

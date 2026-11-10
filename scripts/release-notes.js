@@ -22,12 +22,48 @@ const RECOVERED_COMMIT_SUMMARIES = new Map([
     'Update the development formatter Prettier from 3.9.6 to 3.9.8.',
   ],
   [
+    '7b098aab235f9cb1ee047470f886a73ff4d95bf3',
+    'Update the development formatter Prettier from 3.9.9 to 3.9.10.',
+  ],
+  [
     '6da880abae8fd454c60f80d2b23d94939c194859',
     "Clarify that Zeroshot runs the user's existing coding agent as workers and reviewers.",
   ],
   [
     '101ec9d9f50d6f7a5d871e5bc655dc03bfc54a99',
     "Clarify that the README's custom bugfinder/E2E topology is an example and only the review loop is built in.",
+  ],
+  [
+    'ed424368780b4c052fa8ad2fe8b1462036c3aa9b',
+    'Rewrite the README around installing Zeroshot and using its graph-design, planning and run skills through a coding agent.',
+  ],
+  [
+    '968ec77faa73b70dc69cd1f4837224a17bb9131c',
+    'Add the README blog link and starred-by banner, and explain local, branch, PR and merge delivery.',
+  ],
+  [
+    'd99ac445cd8fc14441e2d90adc59edb3bb02efbc',
+    'Address individual developers in the README introduction and keep shared Platform workflows in a separate team section.',
+  ],
+  [
+    '6a8cf31f0e404131683a0ead9ac5a992bdb5de5a',
+    'Explain independent reviews in the README, including fresh reviewer sessions and enforced repair cycles.',
+  ],
+  [
+    '40a6d49b6521bbb6f1ef36eb9bcc18f9928106b3',
+    "Clarify in the README that graphs customize workflow steps and select each step's tool and model.",
+  ],
+  [
+    '305ab185ab0a5193e494f0601103b24816ab21a1',
+    "Explain why independent reviewers check single-agent work and return failed checks through the graph's repair loop.",
+  ],
+  [
+    '516447fc32004bce940439dbc355030aca22d22a',
+    'Document the four installed skills, add an architecture diagram, and list common CLI commands in the README.',
+  ],
+  [
+    '8523568a8b4cca268e4302500ab8cacb088f62ae',
+    "Replace the README's boxed architecture diagram with a compact flow through admission, execution, adapters, durable state and delivery.",
   ],
 ]);
 const CATEGORIES = Object.freeze([
@@ -231,12 +267,17 @@ function renderReleaseNotes({ version, previousTag, commits }) {
       );
     }
   }
+  // The 10.4.0-10.8.0 updaters predate the Restic sidecar and reject every later archive.
   lines.push(
     '## Upgrade',
     '',
     '```bash',
     `npm install -g @the-open-engine-company/zeroshot@${version}`,
     '```',
+    '',
+    'Versions 10.4.0 through 10.8.0 cannot update themselves: `zeroshot update` fails with ' +
+      '`release archive contains unexpected entry restic` (`restic.exe` on Windows). ' +
+      'Upgrade those installations once with the npm command above.',
     ''
   );
   return lines.join('\n');

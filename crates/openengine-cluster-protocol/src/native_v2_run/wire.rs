@@ -10,97 +10,104 @@ use crate::{
 };
 
 use super::{
-    ClaudeProvider, CodexProvider, CopilotProvider, NodeRuntimeBinding, PiProvider, RunSize,
-    ResolvedSource, RuntimeLane,
+    NodeRuntimeBinding, RunSize, ResolvedSource, RuntimeLane, HarnessId, ProviderId,
+    ActiveMemoryConfig, GlobalAgentsConfig,
 };
 
+/// Portable runtime selection. Compatibility belongs to the host's installed harness registry.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, tag = "harness", rename_all = "snake_case")]
-pub enum RuntimePlan {
-    Copilot {
-        provider: CopilotProvider,
-        size: RunSize,
-        nodes: BTreeMap<NodeName, NodeRuntimeBinding>,
-    },
-    Codex {
-        provider: CodexProvider,
-        size: RunSize,
-        nodes: BTreeMap<NodeName, NodeRuntimeBinding>,
-    },
-    Claude {
-        provider: ClaudeProvider,
-        size: RunSize,
-        nodes: BTreeMap<NodeName, NodeRuntimeBinding>,
-    },
-    Pi {
-        provider: PiProvider,
-        size: RunSize,
-        nodes: BTreeMap<NodeName, NodeRuntimeBinding>,
-    },
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct RuntimePlan {
+    pub harness: HarnessId,
+    pub provider: ProviderId,
+    pub size: RunSize,
+    /// Local workspace snapshots. Run history remains durable when disabled.
+    #[serde(
+        default = "default_workspace_checkpoints",
+        skip_serializing_if = "workspace_checkpoints_enabled"
+    )]
+    pub workspace_checkpoints: bool,
+    #[serde(default, skip_serializing_if = "ActiveMemoryConfig::is_default")]
+    pub active_memory: ActiveMemoryConfig,
+    #[serde(default, skip_serializing_if = "GlobalAgentsConfig::is_default")]
+    pub global_agents: GlobalAgentsConfig,
+    pub nodes: BTreeMap<NodeName, NodeRuntimeBinding>,
 }
 
 impl RuntimePlan {
     #[must_use]
-    pub const fn size(&self) -> RunSize {
-        match self {
-            Self::Copilot { size, .. }
-            | Self::Codex { size, .. }
-            | Self::Claude { size, .. }
-            | Self::Pi { size, .. } => *size,
+    pub fn new(
+        lane: RuntimeLane,
+        size: RunSize,
+        nodes: BTreeMap<NodeName, NodeRuntimeBinding>,
+    ) -> Self {
+        Self {
+            harness: lane.harness,
+            provider: lane.provider,
+            size,
+            workspace_checkpoints: true,
+            active_memory: ActiveMemoryConfig::default(),
+            global_agents: GlobalAgentsConfig::default(),
+            nodes,
         }
+    }
+
+    #[must_use]
+    pub const fn active_memory(&self) -> &ActiveMemoryConfig {
+        &self.active_memory
+    }
+
+    pub fn active_memory_mut(&mut self) -> &mut ActiveMemoryConfig {
+        &mut self.active_memory
+    }
+
+    #[must_use]
+    pub const fn global_agents(&self) -> &GlobalAgentsConfig {
+        &self.global_agents
+    }
+
+    pub fn global_agents_mut(&mut self) -> &mut GlobalAgentsConfig {
+        &mut self.global_agents
+    }
+
+    #[must_use]
+    pub const fn size(&self) -> RunSize {
+        self.size
     }
 
     #[must_use]
     pub const fn nodes(&self) -> &BTreeMap<NodeName, NodeRuntimeBinding> {
-        match self {
-            Self::Copilot { nodes, .. }
-            | Self::Codex { nodes, .. }
-            | Self::Claude { nodes, .. }
-            | Self::Pi { nodes, .. } => nodes,
-        }
+        &self.nodes
     }
 
     #[must_use]
     pub fn nodes_mut(&mut self) -> &mut BTreeMap<NodeName, NodeRuntimeBinding> {
-        match self {
-            Self::Copilot { nodes, .. }
-            | Self::Codex { nodes, .. }
-            | Self::Claude { nodes, .. }
-            | Self::Pi { nodes, .. } => nodes,
-        }
+        &mut self.nodes
     }
 
     #[must_use]
-    pub const fn lane(&self) -> RuntimeLane {
-        match self {
-            Self::Copilot { provider, .. } => RuntimeLane::Copilot {
-                provider: *provider,
-            },
-            Self::Codex { provider, .. } => RuntimeLane::Codex {
-                provider: *provider,
-            },
-            Self::Claude { provider, .. } => RuntimeLane::Claude {
-                provider: *provider,
-            },
-            Self::Pi { provider, .. } => RuntimeLane::Pi {
-                provider: *provider,
-            },
+    pub fn lane(&self) -> RuntimeLane {
+        RuntimeLane {
+            harness: self.harness.clone(),
+            provider: self.provider.clone(),
         }
     }
 
-    /// The binding's own lane, else the run-level lane; Git delivery bindings have no lane.
+    /// The binding's own lane, else the run-level lane; trusted delivery has no model lane.
     #[must_use]
-    pub const fn effective_lane(&self, binding: &NodeRuntimeBinding) -> Option<RuntimeLane> {
+    pub fn effective_lane(&self, binding: &NodeRuntimeBinding) -> Option<RuntimeLane> {
         match binding {
-            NodeRuntimeBinding::Agent {
-                lane: Some(lane), ..
-            } => Some(*lane),
-            NodeRuntimeBinding::Agent { lane: None, .. } => Some(self.lane()),
-            NodeRuntimeBinding::GitDelivery { .. } => None,
+            NodeRuntimeBinding::Agent { lane, .. } => {
+                Some(lane.clone().unwrap_or_else(|| self.lane()))
+            }
+            NodeRuntimeBinding::Script { .. }
+            | NodeRuntimeBinding::Decision { .. }
+            | NodeRuntimeBinding::GitDelivery { .. }
+            | NodeRuntimeBinding::CommentDelivery { .. } => None,
         }
     }
 
-    /// Distinct effective lanes of the agent bindings, in harness and then provider order.
+    /// Distinct effective lanes of the agent bindings, ordered by opaque harness/provider names.
     #[must_use]
     pub fn lanes(&self) -> BTreeSet<RuntimeLane> {
         self.nodes()
@@ -133,6 +140,14 @@ impl RuntimePlan {
         }
         requirements
     }
+}
+
+const fn default_workspace_checkpoints() -> bool {
+    true
+}
+
+const fn workspace_checkpoints_enabled(enabled: &bool) -> bool {
+    *enabled
 }
 
 /// Immutable, secret-free native-v2 submission admitted by the selected target.
@@ -242,6 +257,10 @@ pub struct RunResumeParams {
     /// Fresh generic Git authority, excluded from immutable source and submission identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_credentials: Option<super::GitTransportCredentials>,
+    /// Author and committer of every commit the successor's delivery creates. Omission keeps the
+    /// target's default delivery identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_identity: Option<crate::CommitIdentity>,
 }
 
 impl std::fmt::Debug for RunResumeParams {
@@ -258,6 +277,7 @@ impl std::fmt::Debug for RunResumeParams {
                 &self.github_token.as_ref().map(|_| "[REDACTED]"),
             )
             .field("git_credentials", &self.git_credentials)
+            .field("commit_identity", &self.commit_identity)
             .finish()
     }
 }

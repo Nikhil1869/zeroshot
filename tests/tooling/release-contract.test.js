@@ -114,16 +114,19 @@ describe('Python release publication contract', () => {
     assert.equal(releaseInput.type, 'boolean');
     assert.equal(releaseInput.default, true);
     assert.equal(releaseInput.required, true);
-    assert.equal(
-      release.jobs['python-sdk-release'].with.publish_pypi,
-      '${{ inputs.publish_pypi }}'
-    );
+    const dispatch = release.jobs['python-sdk-release'];
+    assert.equal(dispatch.env.PUBLISH_PYPI, '${{ inputs.publish_pypi }}');
+    assert.equal(dispatch.env.RELEASE_VERSION, '${{ needs.plan.outputs.version }}');
+    assert.equal(dispatch.env.RELEASE_COMMIT, '${{ needs.plan.outputs.commit }}');
+    assert.deepEqual(dispatch.permissions, { actions: 'write', checks: 'read' });
+    assert.equal(dispatch.uses, undefined);
+    assert.equal(dispatch['timeout-minutes'], 360);
+    assert.deepEqual(dispatch.needs, ['plan', 'shim-publish']);
 
-    for (const trigger of ['workflow_dispatch', 'workflow_call']) {
-      const input = pythonRelease.on[trigger].inputs.publish_pypi;
-      assert.equal(input.type, 'boolean', trigger);
-      assert.equal(input.default, true, trigger);
-    }
+    const input = pythonRelease.on.workflow_dispatch.inputs.publish_pypi;
+    assert.equal(input.type, 'boolean');
+    assert.equal(input.default, true);
+    assert.equal(pythonRelease.on.workflow_call, undefined);
 
     const publishSteps = new Map(pythonRelease.jobs.publish.steps.map((step) => [step.name, step]));
     assert.equal(publishSteps.get('Setup Python 3.12').if, 'inputs.publish_pypi');
@@ -209,6 +212,18 @@ describe('Embedded UI distribution', () => {
     assert.match(ignore, /^\*\*\/node_modules$/m);
   });
 
+  it('includes contributed adapters locally and excludes them from the default target image', () => {
+    const manifest = read('zeroshot/Cargo.toml');
+    const dockerfile = read('docker/zeroshot-target/Dockerfile');
+    const release = yaml.load(read('.github/workflows/release.yml'));
+    const commands = release.jobs.binaries.steps.map((step) => step.run || '').join('\n');
+    assert.match(manifest, /^default = \["contributed-harnesses"\]$/m);
+    assert.match(manifest, /^contributed-harnesses = \[[^\n]*\]$/m);
+    assert.match(dockerfile, /cargo build[^\n]+--no-default-features --features ui/);
+    assert.doesNotMatch(commands, /cargo build[^\n]+--no-default-features/);
+    assert.doesNotMatch(dockerfile, /opencode-ai|contributed-harnesses/);
+  });
+
   it('checks library and UI feature lanes plus native and Docker lifecycle smoke', () => {
     const workflow = yaml.load(read('.github/workflows/ci.yml'));
     const commands = workflow.jobs['native-check'].steps.map((step) => step.run || '').join('\n');
@@ -239,13 +254,15 @@ describe('CI efficiency contract', () => {
       group: '${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}',
       'cancel-in-progress': "${{ github.event_name == 'pull_request' }}",
     });
-    assert.match(source, /git diff --no-renames --name-only -z/);
+    assert.match(source, /bash \.github\/select-ci-lanes\.sh/);
+    assert.match(read('.github/select-ci-lanes.sh'), /git diff --no-renames --name-only -z/);
     assert.deepEqual(Object.keys(workflow.jobs.classify.outputs), [
       'native',
       'python',
       'tooling',
       'npm',
       'docs',
+      'readme',
     ]);
   });
 
@@ -312,9 +329,10 @@ describe('Native coverage contract', () => {
     const publish = coverage.steps.find((step) => step.name === 'Publish coverage');
     const enforce = coverage.steps.find((step) => step.name === 'Enforce coverage quality');
 
-    assert.deepEqual(workflow.on.push.branches, ['main']);
-    assert.deepEqual(workflow.on.pull_request.branches, ['main']);
+    assert.equal(Object.hasOwn(workflow.on, 'workflow_call'), true);
     assert.equal(Object.hasOwn(workflow.on, 'workflow_dispatch'), true);
+    assert.equal(Object.hasOwn(workflow.on, 'push'), false);
+    assert.equal(Object.hasOwn(workflow.on, 'pull_request'), false);
     assert.deepEqual(workflow.permissions, { contents: 'read' });
     assert.match(commands, /npm --prefix ui run build/);
     assert.match(commands, /cargo llvm-cov clean --workspace/);
@@ -455,12 +473,10 @@ describe('v8 hard cutover contract', () => {
   it('keeps the target data volume independent of internal protocol names', () => {
     const dockerfile = read('docker/zeroshot-target/Dockerfile');
     const targetReadme = read('docker/zeroshot-target/README.md');
-    const readme = read('README.md');
 
     assert.match(dockerfile, /VOLUME \["\/var\/lib\/zeroshot"\]/);
     assert.doesNotMatch(dockerfile, /VOLUME \["\/var\/lib\/zeroshot\//);
     assert.match(targetReadme, /zeroshot-data:\/var\/lib\/zeroshot(?:\s|\\)/);
-    assert.match(readme, /zeroshot-data:\/var\/lib\/zeroshot(?:\s|\\)/);
   });
 
   it('keeps repository-owned agent guidance aligned with v8', () => {

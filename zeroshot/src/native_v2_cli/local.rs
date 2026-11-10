@@ -28,18 +28,18 @@ use super::oecp::{ChannelSubscription, spawn_attach, spawn_logs, spawn_watch};
 use super::support::{CommitPaths, cleanup_temporary, write_and_commit};
 use super::{
     CliRunForceResult, CliRunListResult, CliRunStatusResult, CliRunWatchEventNotification,
-    LocalRunProfileStore, NativeV2CliBackend, NativeV2CliError, PreparedRunRequest, TargetAdd,
-    default_local_state_root,
+    CliProfileListResult, LocalRunProfileStore, NativeV2CliBackend, NativeV2CliError,
+    PreparedRunRequest, TargetAdd, default_local_state_root,
 };
 use crate::execution::platform::{ControllerChild as Child, FileAccess, private_file};
 use crate::native_v2_admission::{DeliveryPolicy, NativeV2Admission};
-use crate::native_v2_cloud::submission_digest;
+use crate::native_v2_platform::submission_digest;
 use crate::native_v2_local::{PreparedLocalRun, prepare_local_run};
 use crate::native_v2_supervisor::RunEnvironment;
 use crate::native_v2_portable_controller::{
     ControllerLease, ControllerLeaseError, PortableControllerBootstrap, PortableControllerError,
     PortableControllerPaths, PortableControllerServer, PortableRunController, read_ready,
-    write_bootstrap_file,
+    take_startup_failure, write_bootstrap_file,
 };
 use crate::native_v2_portable_controller::process::{PortableControllerTransport, connect_transport};
 use crate::v2_run_ledger::sqlite::SqliteRunLedger;
@@ -55,6 +55,9 @@ use connections::LocalConnectionStore;
 
 #[path = "local/backend.rs"]
 mod backend;
+
+#[path = "local/native_forge.rs"]
+pub(super) mod native_forge;
 
 /// Private process mode intercepted by the shipped binary before public CLI parsing.
 #[doc(hidden)]
@@ -203,17 +206,39 @@ impl LocalCliBackend {
             .validate_intent(&request.intent, DeliveryPolicy::Optional)
             .await
             .map_err(NativeV2CliError::InvalidRun)?;
+
         let prepared = self.prepare_run(request).await?;
         let digest = submission_digest(&prepared.submission).map_err(local_error)?;
-        let _submission_lock = self.acquire_submission_lock().await?;
-        if let Some(run_id) = self
-            .existing_submission(
+
+        let existing = || {
+            self.existing_submission(
                 &prepared.submission.submission_key,
                 &digest,
                 &prepared.workspace,
             )
-            .await?
+        };
+        if crate::native_v2_admission::delivery_capabilities(&prepared.submission.graph.root)
+            .contains(&crate::source_code_provider::SourceCapability::PullRequest)
         {
+            {
+                let _submission_lock = self.acquire_submission_lock().await?;
+                if let Some(run_id) = existing().await? {
+                    return Ok(run_id);
+                }
+            }
+            // Remote I/O must not hold the shared submission lock.
+            crate::native_v2_local::validate_remote_base_branch(
+                &prepared,
+                &self.git_program,
+                &self.state_root,
+            )
+            .await
+            .map_err(|error| NativeV2CliError::Usage(error.to_string()))?;
+        }
+
+        // A concurrent submitter may have accepted this request during remote validation.
+        let _submission_lock = self.acquire_submission_lock().await?;
+        if let Some(run_id) = existing().await? {
             return Ok(run_id);
         }
         self.start_prepared_controller(prepared).await
@@ -223,6 +248,9 @@ impl LocalCliBackend {
         &self,
         mut request: PreparedRunRequest,
     ) -> Result<PreparedLocalRun, NativeV2CliError> {
+        let native_environment = native_forge::capture_native_environment(&self.current_directory)?;
+        self.enrich_local_source(&mut request, &native_environment)
+            .await?;
         let (workspace, source) = crate::native_v2_local::prepare_local_source(
             &request,
             &self.current_directory,
@@ -231,20 +259,83 @@ impl LocalCliBackend {
         .map_err(|error| NativeV2CliError::Usage(error.to_string()))?;
         crate::native_v2_local::validate_workspace_state(&workspace, &self.state_root)
             .map_err(|error| NativeV2CliError::Usage(error.to_string()))?;
-        let submission = crate::native_v2_local::local_submission(&request.intent, source.clone());
-        request.connections = LocalConnectionStore::new(self.state_root.clone())
+        let mut submission =
+            crate::native_v2_local::local_submission(&request.intent, source.clone());
+        native_forge::materialize_local_access(
+            &mut submission,
+            native_forge::NativeContext {
+                environment: &native_environment,
+                directory: &workspace,
+            },
+            request.github_token.is_some(),
+        )?;
+        request.intent.runtime = submission.runtime.clone();
+        let store = LocalConnectionStore::new(self.state_root.clone());
+        native_forge::fill_missing(
+            &submission,
+            &mut request.connections,
+            &store,
+            native_forge::NativeContext {
+                environment: &native_environment,
+                directory: &workspace,
+            },
+        )
+        .await?;
+        request.connections = store
             .resolve_submission(&submission, &request.connections)?
             .bootstrap_values();
         request.git_credentials =
             RunEnvironment::exact_for_submission(&submission, request.connections.clone())?
                 .resolve_git_source()
                 .await?;
+
         request.cwd = Some(workspace);
         request.source = source.map(|resolved| super::NamedRunSource {
             resolved,
             dirty: false,
         });
         prepare_local_run(request, &self.current_directory, &self.git_program).map_err(local_error)
+    }
+
+    async fn enrich_local_source(
+        &self,
+        request: &mut PreparedRunRequest,
+        environment: &std::collections::BTreeMap<String, String>,
+    ) -> Result<(), NativeV2CliError> {
+        let selected = request.cwd.as_deref().unwrap_or(&self.current_directory);
+        let selected = if selected.is_absolute() {
+            selected.to_owned()
+        } else {
+            self.current_directory.join(selected)
+        };
+        if request.source.is_none() {
+            let (_, source) =
+                crate::native_v2_local::local_resolved_source(&selected, &self.git_program)
+                    .map_err(local_error)?;
+            request.source = source.map(|mut resolved| {
+                if let Some(remote) = &mut resolved.remote {
+                    remote.connection = request.source_connection.clone();
+                }
+                super::NamedRunSource {
+                    resolved,
+                    dirty: false,
+                }
+            });
+        }
+        let capabilities =
+            crate::native_v2_admission::delivery_capabilities(&request.intent.graph.root);
+        let needs_forge = native_forge::needs_forge(&capabilities);
+        if needs_forge && let Some(source) = &mut request.source {
+            native_forge::enrich_source(
+                &mut source.resolved,
+                native_forge::NativeContext {
+                    environment,
+                    directory: &selected,
+                },
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     async fn start_prepared_controller(
@@ -281,6 +372,12 @@ impl LocalCliBackend {
         }
         let adopt_existing_delivery = resumed_from.is_some();
         let paths = self.paths(&prepared.run_id)?;
+        let ready_timeout = self.ready_timeout.saturating_add(
+            crate::native_v2_admission::comment_node(&prepared.submission.graph.root)
+                .map_or(Duration::ZERO, |_| {
+                    crate::native_v2_review::LOCAL_CHECKOUT_TIMEOUT
+                }),
+        );
         let storage = self.create_run_storage(&prepared.run_id)?;
         self.write_recovery_document(
             &prepared.run_id,
@@ -296,6 +393,11 @@ impl LocalCliBackend {
         let checkpoint_repository = self.checkpoint_repository(&prepared.delivery_run_id)?;
         let bootstrap_path = storage.join(BOOTSTRAP_FILE);
         let bootstrap = PortableControllerBootstrap {
+            memory_storage: Some(
+                self.state_root
+                    .join("active-memory")
+                    .join("lessons.sqlite3"),
+            ),
             checkpoint,
             run_id: prepared.run_id.clone(),
             delivery_run_id: prepared.delivery_run_id,
@@ -322,10 +424,12 @@ impl LocalCliBackend {
             }
         };
         if let Err(error) =
-            wait_for_controller(&mut child, &paths, &prepared.run_id, self.ready_timeout).await
+            wait_for_controller(&mut child, &paths, &prepared.run_id, ready_timeout).await
         {
             let _ = child.kill().await;
             remove_private_bootstrap(&bootstrap_path);
+            // A controller past the deadline may still have recorded why; nobody will read it.
+            let _ = take_startup_failure(&paths);
             return Err(error);
         }
         Ok(prepared.run_id)
@@ -849,7 +953,12 @@ async fn wait_for_controller(
             }
         }
         if child.try_wait().map_err(local_io)?.is_some() {
-            return Err(local_message("controller exited before becoming ready"));
+            return Err(match take_startup_failure(paths) {
+                Some(reason) => {
+                    local_message(format!("controller exited before becoming ready: {reason}"))
+                }
+                None => local_message("controller exited before becoming ready"),
+            });
         }
         if Instant::now() >= deadline {
             return Err(local_message(
@@ -907,3 +1016,65 @@ mod recovery_claim_tests;
 #[cfg(test)]
 #[path = "local/tests.rs"]
 mod local_contract_tests;
+
+fn checked_review_token(value: String) -> Result<String, NativeV2CliError> {
+    if value.is_empty() || value.len() > 4096 || value.contains('\0') {
+        return Err(local_message("GitHub credential is invalid"));
+    }
+    Ok(value)
+}
+
+fn review_environment_token() -> Result<Option<String>, NativeV2CliError> {
+    for name in ["GH_TOKEN", "GITHUB_TOKEN"] {
+        if let Some(value) = std::env::var_os(name) {
+            let value = value
+                .into_string()
+                .map_err(|_| local_message("GitHub credential must be UTF-8"))?;
+            return checked_review_token(value).map(Some);
+        }
+    }
+    Ok(None)
+}
+
+async fn review_token(directory: &Path) -> Result<String, NativeV2CliError> {
+    if let Some(token) = review_environment_token()? {
+        return Ok(token);
+    }
+    let environment =
+        crate::native_v2_local::capture_local_native_environment(directory).map_err(local_error)?;
+    let executable = crate::execution::platform::find_executable("gh", &environment, directory)
+        .ok_or_else(|| local_message("review resolution requires GitHub CLI on PATH"))?;
+    let mut command = Command::new(executable);
+    command
+        .env_clear()
+        .current_dir(directory)
+        .args(["auth", "token", "--hostname", "github.com"]);
+    for name in [
+        "HOME",
+        "PATH",
+        "GH_CONFIG_DIR",
+        "XDG_CONFIG_HOME",
+        "APPDATA",
+        "USERPROFILE",
+        "SystemRoot",
+    ] {
+        if let Some(value) = environment.get(name) {
+            command.env(name, value);
+        }
+    }
+    let result = crate::native_v2_delivery::command::capture_sensitive(
+        &mut command,
+        Duration::from_secs(10),
+        &[],
+    )
+    .await
+    .map_err(|_| {
+        local_message("GitHub login is unavailable; sign in with gh or supply GH_TOKEN")
+    })?;
+    if result.stdout_truncated() || result.diagnostic().exit_status != Some(0) {
+        return Err(local_message(
+            "GitHub login is unavailable; sign in with gh or supply GH_TOKEN",
+        ));
+    }
+    checked_review_token(result.stdout().trim().to_owned())
+}

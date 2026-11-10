@@ -6,18 +6,20 @@ from collections.abc import Mapping
 from typing import Literal, TypeAlias, cast
 
 from .errors import ProtocolError
-from .plans import MergePlanRunStatus, MergePlanStatus
 from .runs import (
     ActiveExecution,
+    FailureContext,
+    FailureDiagnostic,
     LogEvent,
     RunResult,
     RunStatus,
     RunSummary,
 )
 from .source import ResolvedGitRemote, ResolvedSource, SourceForgeIdentity
+from .stacks import StackRunStatus, StackStatus
 from .values import JsonValue
 
-_Size: TypeAlias = Literal["small", "medium", "large"]
+_Size: TypeAlias = Literal["small", "medium", "large", "xl", "gpu_t4"]
 _Phase: TypeAlias = Literal["admitted", "running", "stopping", "finished"]
 _Level: TypeAlias = Literal["debug", "info", "error"]
 _MAX_JAVASCRIPT_SAFE_INTEGER = 9_007_199_254_740_991
@@ -50,6 +52,7 @@ def _status(value: object) -> RunStatus:
         result = _terminal_result(
             _string(root, "runId", "run status"),
             native_status.get("terminalResult"),
+            native_status.get("metadata"),
         )
     return RunStatus(
         run_id=_string(root, "runId", "run status"),
@@ -60,7 +63,7 @@ def _status(value: object) -> RunStatus:
             _enum_string(
                 root,
                 "size",
-                {"small", "medium", "large"},
+                {"small", "medium", "large", "xl", "gpu_t4"},
                 "run status",
             ),
         ),
@@ -138,7 +141,12 @@ def _remote(value: object) -> ResolvedGitRemote | None:
     )
 
 
-def _terminal_result(run_id: str, value: object) -> RunResult:
+def _terminal_result(run_id: str, value: object, metadata: object = None) -> RunResult:
+    receipt = None
+    if metadata is not None:
+        fields = _mapping(metadata, "run status.status.metadata")
+        if fields.get("deliveryReceipt") is not None:
+            receipt = cast(JsonValue, dict(_mapping(fields["deliveryReceipt"], "delivery receipt")))
     terminal = _mapping(value, "run status.status.terminalResult")
     kind = _enum_string(
         terminal,
@@ -152,12 +160,53 @@ def _terminal_result(run_id: str, value: object) -> RunResult:
         return RunResult(
             run_id=run_id,
             succeeded=True,
+            delivery_receipt=receipt,
             output=cast(JsonValue, terminal["output"]),
         )
     return RunResult(
         run_id=run_id,
         succeeded=False,
+        delivery_receipt=receipt,
         failure=_string(terminal, "reason", "run status.status.terminalResult"),
+        context=_failure_context(terminal.get("context")),
+    )
+
+
+def _failure_context(value: object) -> FailureContext | None:
+    if value is None:
+        return None
+    context = _mapping(value, "failure context")
+    primary = context.get("primary")
+    incomplete = context.get("incomplete", False)
+    if not isinstance(incomplete, bool):
+        raise ProtocolError("Zeroshot emitted malformed failure context.incomplete")
+    return FailureContext(
+        primary=_failure_diagnostic(primary) if primary is not None else None,
+        recorded=tuple(
+            _failure_diagnostic(item)
+            for item in _mapping_list(context.get("recorded", []), "failure context.recorded")
+        ),
+        incomplete=incomplete,
+    )
+
+
+def _failure_diagnostic(value: object) -> FailureDiagnostic:
+    diagnostic = _mapping(value, "failure diagnostic")
+    execution = diagnostic.get("execution")
+    active = None
+    if execution is not None:
+        identity = _mapping(execution, "failure diagnostic.execution")
+        active = ActiveExecution(
+            execution=_string(identity, "execution", "failure diagnostic.execution"),
+            node=_string(identity, "node", "failure diagnostic.execution"),
+        )
+    cursor = diagnostic.get("cursor")
+    if cursor is not None and not isinstance(cursor, str):
+        raise ProtocolError("Zeroshot emitted malformed failure diagnostic.cursor")
+    return FailureDiagnostic(
+        message=_string(diagnostic, "message", "failure diagnostic"),
+        execution=active,
+        cursor=cursor,
     )
 
 
@@ -211,34 +260,35 @@ def _enum_string(
     return selected
 
 
-def _plan_status(value: object) -> MergePlanStatus:
-    root = _mapping(value, "merge plan status")
+def _stack_status(value: object) -> StackStatus:
+    kind = "stack status"
+    root = _mapping(value, kind)
     runs = tuple(
-        _plan_run_status(item) for item in _mapping_list(root.get("runs"), "merge plan status.runs")
+        _stack_run_status(item) for item in _mapping_list(root.get("runs"), f"{kind}.runs")
     )
-    return MergePlanStatus(
-        plan_id=_string(root, "planId", "merge plan status"),
-        title=_string(root, "title", "merge plan status"),
+    return StackStatus(
+        stack_id=_string(root, "stackId", kind),
+        title=_string(root, "title", kind),
         state=cast(
             Literal["queued", "running", "succeeded", "failed", "cancelled", "expired"],
             _enum_string(
                 root,
                 "state",
                 {"queued", "running", "succeeded", "failed", "cancelled", "expired"},
-                "merge plan status",
+                kind,
             ),
         ),
-        repository=_string(root, "repository", "merge plan status"),
-        branch=_string(root, "branch", "merge plan status"),
-        submitted_at=_string(root, "submittedAt", "merge plan status"),
-        expires_at=_string(root, "expiresAt", "merge plan status"),
+        repository=_string(root, "repository", kind),
+        branch=_string(root, "branch", kind),
+        submitted_at=_string(root, "submittedAt", kind),
+        expires_at=_string(root, "expiresAt", kind),
         runs=runs,
     )
 
 
-def _plan_run_status(value: Mapping[str, object]) -> MergePlanRunStatus:
-    kind = "merge plan status.runs"
-    return MergePlanRunStatus(
+def _stack_run_status(value: Mapping[str, object]) -> StackRunStatus:
+    kind = "stack status.runs"
+    return StackRunStatus(
         name=_string(value, "name", kind),
         run_id=_string(value, "runId", kind),
         state=cast(
@@ -273,6 +323,7 @@ def _plan_run_status(value: Mapping[str, object]) -> MergePlanRunStatus:
             ),
         ),
         needs=_string_list(value, "needs", kind),
+        source_branch=_nullable_string(value, "sourceBranch", kind),
         source_revision=_nullable_string(value, "sourceRevision", kind),
         ready_at=_nullable_string(value, "readyAt", kind),
         queue_expires_at=_nullable_string(value, "queueExpiresAt", kind),

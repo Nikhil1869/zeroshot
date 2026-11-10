@@ -9,13 +9,10 @@ use openengine_cluster_protocol::{
     RunTitle, ResolvedSource, StructuralBounds, TerminationWitness, WorkerRef,
 };
 use serde_json::{json, Value};
-use tokio::sync::watch;
-#[cfg(unix)]
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 
 use super::*;
 use crate::native_v2_candidate::test_support::full_graph;
-use crate::native_v2_contract::{CodexProvider, RuntimePlan};
 use crate::worker_catalog::ReasoningEffort;
 
 impl DurableOutput {
@@ -45,6 +42,9 @@ pub(crate) fn binding(scope: SessionScope) -> NodeRuntimeBinding {
         lane: None,
         model: crate::worker_catalog::ModelId::new("gpt-5.6").assert_value(),
         effort: Some(ReasoningEffort::Max),
+        harness_config: None,
+        context_window: None,
+        max_tokens: None,
         session_scope: scope,
         connections: DeclaredConnections::empty(),
     }
@@ -140,11 +140,10 @@ pub(crate) fn admitted() -> AdmittedRun {
             },
         },
         initial_input: Value::Null,
-        runtime: RuntimePlan::Codex {
-            provider: CodexProvider::OpenAi,
-            size: RunSize::Medium,
-            nodes: runtime_nodes,
-        },
+        runtime: crate::native_v2_candidate::test_support::codex_runtime(
+            RunSize::Medium,
+            runtime_nodes,
+        ),
         source: Some(source()),
     }
 }
@@ -159,6 +158,7 @@ pub(crate) fn request(run: &str, node: &str, identity: (u64, u64)) -> NodeRunReq
         .assert_value()
         .clone();
     NodeRunRequest {
+        dispatch: Default::default(),
         invocation: NodeInvocation {
             reference: ExecutionRef {
                 run_id: RunId::new(run),
@@ -182,6 +182,40 @@ pub(crate) fn request(run: &str, node: &str, identity: (u64, u64)) -> NodeRunReq
             binding: binding.clone(),
         },
         environment: ResolvedEnvironment::exact(&binding, BTreeMap::new()).assert_value(),
+    }
+}
+
+pub(crate) fn node_started(
+    reference: &ExecutionRef,
+    input: Value,
+) -> crate::v2_run_ledger::RunEvent {
+    crate::v2_run_ledger::RunEvent::NodeStarted {
+        reference: reference.clone(),
+        occurrence: crate::full_v1_reducer::StructuralOccurrence {
+            node: reference.node.clone(),
+            map_indices: Vec::new(),
+        },
+        attempt: PositiveInteger::new(1).assert_value(),
+        input,
+    }
+}
+
+pub(crate) struct CountingSession {
+    pub(crate) closed: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl NodeSession for CountingSession {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    async fn is_live(&self) -> bool {
+        true
+    }
+
+    async fn close(&self) {
+        self.closed.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -388,7 +422,7 @@ impl NodeDriver for FakeDriver {
                         diagnostic: Value::Null,
                         artifacts: Vec::new(),
                     },
-                    NodeRole::Worker | NodeRole::GitDelivery => WorkerOutcome::Verified {
+                    NodeRole::Worker | NodeRole::GitDelivery | NodeRole::CommentDelivery => WorkerOutcome::Verified {
                         output: Value::Null,
                         artifacts: Vec::new(),
                     },
@@ -423,14 +457,16 @@ use openengine_cluster_testkit::assertions::{AssertValue};
 
 /// A driver control for tests that drive one turn directly: nothing is cancelled, the live channel
 /// holds one event, and the caller drains the durable channel it gets back.
-///
-/// Only the Unix-gated provider lifecycle tests drive a turn themselves, so this is compiled for the
-/// same platforms as its callers.
-#[cfg(unix)]
 pub(crate) fn control() -> (watch::Sender<bool>, DriverControl, DurableOutput) {
+    control_with_capacity(1)
+}
+
+pub(crate) fn control_with_capacity(
+    capacity: usize,
+) -> (watch::Sender<bool>, DriverControl, DurableOutput) {
     let (cancel, cancellation) = watch::channel(false);
     let (live_output, _) = broadcast::channel(1);
-    let (durable_output, durable) = super::output::durable_event_channel_with_capacity(1);
+    let (durable_output, durable) = super::output::durable_event_channel_with_capacity(capacity);
     (
         cancel,
         DriverControl {

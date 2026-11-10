@@ -11,7 +11,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use openengine_cluster_protocol::{
-    GraphNode, NodeInstructions, NodeName, RunId, UnixTimestampMillis, WorkerOutcome, WorkerRef,
+    FailureDiagnosticKind, GraphNode, NodeInstructions, NodeName, RunId, UnixTimestampMillis,
+    WorkerOutcome, WorkerRef,
 };
 use tokio::sync::{broadcast, oneshot, watch, Mutex};
 
@@ -64,8 +65,27 @@ pub(crate) async fn refresh_environment(
     environment::refreshed(environment).await
 }
 
+/// Transient reducer dispatch facts, separate from durable invocations and provider sessions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NodeDispatchMetadata {
+    /// One-based reducer attempt within the current node visit.
+    pub attempt: u64,
+    /// Innermost authored loop iteration, or zero outside authored loops.
+    pub iteration: u64,
+}
+
+impl Default for NodeDispatchMetadata {
+    fn default() -> Self {
+        Self {
+            attempt: 1,
+            iteration: 0,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct NodeRunRequest {
+    pub dispatch: NodeDispatchMetadata,
     pub invocation: NodeInvocation,
     pub environment: ResolvedEnvironment,
 }
@@ -81,6 +101,7 @@ pub enum LiveOutputStream {
 pub struct LiveOutput {
     pub stream: LiveOutputStream,
     pub text: String,
+    pub diagnostic: Option<FailureDiagnosticKind>,
 }
 
 impl LiveOutput {
@@ -89,7 +110,20 @@ impl LiveOutput {
         if text.len() > MAX_LIVE_OUTPUT_BYTES || text.contains('\0') {
             return Err(NodeRunnerError::UnsafeOutput);
         }
-        Ok(Self { stream, text })
+        Ok(Self {
+            stream,
+            text,
+            diagnostic: None,
+        })
+    }
+
+    /// The producer must redact owned credentials before constructing a public diagnostic.
+    pub(crate) fn diagnostic(kind: FailureDiagnosticKind, message: impl Into<String>) -> Self {
+        Self {
+            stream: LiveOutputStream::Error,
+            text: bounded_log_text(message.into(), MAX_LIVE_OUTPUT_BYTES / 2),
+            diagnostic: Some(kind),
+        }
     }
 }
 
@@ -140,6 +174,11 @@ pub trait NodeSession: Any + Send + Sync {
     async fn close(&self);
 }
 
+/// Optional run-global work is a runner lifecycle contract, independent of graph execution.
+pub use crate::active_memory::postmortem::{
+    PostmortemError, PostmortemReport, PostmortemRequest, RunPostmortem,
+};
+
 /// Returned error details enter user logs; implementations must redact owned credentials.
 #[async_trait]
 pub trait SessionFactory: Send + Sync {
@@ -150,8 +189,17 @@ pub trait SessionFactory: Send + Sync {
     ) -> Result<Arc<dyn NodeSession>, NodeRunnerError>;
 }
 
+/// Supplies bounded, nonsecret host facts and guidance for the current agent turn.
+/// Implementations must return promptly and must not execute workspace-controlled programs.
+pub trait AgentContextProvider: Send + Sync {
+    fn context(&self) -> String;
+}
+
 #[derive(Clone)]
 pub struct DriverInvocation {
+    pub dispatch: NodeDispatchMetadata,
+    /// Transient host context; never part of the authored graph or durable invocation.
+    pub host_context: Option<String>,
     pub node: NodeInvocation,
     pub role: NodeRole,
     pub response: NodeResponseContract,
@@ -162,6 +210,32 @@ pub struct DriverInvocation {
 }
 
 impl DriverInvocation {
+    pub(crate) fn agent_prompt(&self) -> Result<String, NodeRunnerError> {
+        let prompt =
+            render_agent_prompt(self.agent_instructions()?, &self.node.input, &self.response)?;
+        Ok(self.with_host_context(prompt))
+    }
+
+    pub(crate) fn agent_prompt_with_schema(
+        &self,
+        dialect: ProviderSchemaDialect,
+    ) -> Result<String, NodeRunnerError> {
+        let prompt = render_agent_prompt_with_schema(
+            self.agent_instructions()?,
+            &self.node.input,
+            &self.response,
+            dialect,
+        )?;
+        Ok(self.with_host_context(prompt))
+    }
+
+    fn with_host_context(&self, prompt: String) -> String {
+        match self.host_context.as_deref().filter(|text| !text.is_empty()) {
+            Some(context) => format!("Runtime-owned execution context:\n{context}\n\n{prompt}"),
+            None => prompt,
+        }
+    }
+
     pub(crate) fn agent_instructions(&self) -> Result<&NodeInstructions, NodeRunnerError> {
         if !matches!(&self.node.binding, NodeRuntimeBinding::Agent { .. }) {
             return Err(NodeRunnerError::InvalidRole);
@@ -219,6 +293,10 @@ impl DriverControl {
         Ok(())
     }
 
+    pub(crate) fn mark_diagnostics_incomplete(&self) {
+        self.durable_output.mark_diagnostics_incomplete();
+    }
+
     pub async fn record_token_usage(
         &self,
         usage: Option<TokenUsageDelta>,
@@ -251,6 +329,11 @@ pub trait NodeDriver: Send + Sync {
 
 #[async_trait]
 pub trait NodeRunner: Send + Sync {
+    /// Optional host-owned global work, separate from reducer executions and checkpoints.
+    fn postmortem(&self) -> Option<Arc<dyn RunPostmortem>> {
+        None
+    }
+
     /// Reserves execution and returns ownership before asynchronous provider startup.
     /// This future must be cancellation-safe: dropping it before a handle is returned
     /// leaves no running work behind. Once returned, cancel and drain the handle to
@@ -259,8 +342,69 @@ pub trait NodeRunner: Send + Sync {
     async fn close_run(&self, run_id: &RunId);
 }
 
+/// Run-owned capability to create isolated built-in global-agent sessions on the same adapters.
+#[async_trait]
+pub trait AuxiliaryRunnerFactory: Send + Sync {
+    fn fork(&self, admitted: &AdmittedRun) -> Result<Arc<dyn NodeRunner>, NodeRunnerError>;
+    async fn close_run(&self, _run_id: &RunId) {}
+}
+
+struct NativeAuxiliaryRunnerFactory {
+    agent_context: Option<Arc<dyn AgentContextProvider>>,
+    driver: Arc<dyn NodeDriver>,
+    sessions: Arc<dyn SessionFactory>,
+    state: std::sync::Mutex<AuxiliaryRunners>,
+}
+
+#[derive(Default)]
+struct AuxiliaryRunners {
+    closed: bool,
+    runners: Vec<Arc<dyn NodeRunner>>,
+}
+
+pub(crate) const AUXILIARY_PROVIDER_SLOT_OFFSET: u64 =
+    openengine_cluster_server::graph_verifier::FULL_V1_MAX_NODE_EXECUTIONS;
+
+#[async_trait]
+impl AuxiliaryRunnerFactory for NativeAuxiliaryRunnerFactory {
+    fn fork(&self, admitted: &AdmittedRun) -> Result<Arc<dyn NodeRunner>, NodeRunnerError> {
+        let runner: Arc<dyn NodeRunner> = Arc::new(NativeNodeRunner {
+            agent_context: self.agent_context.clone(),
+            driver: self.driver.clone(),
+            sessions: SessionPool::new(self.sessions.clone()),
+            roles: NodeRolePlan::from_admitted(admitted)?
+                .offset_provider_slots(AUXILIARY_PROVIDER_SLOT_OFFSET)?,
+            activity: ActivityRegistry::default(),
+        });
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.closed {
+            return Err(NodeRunnerError::RunClosed);
+        }
+        state.runners.push(runner.clone());
+        Ok(runner)
+    }
+
+    async fn close_run(&self, run_id: &RunId) {
+        let runners = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.closed = true;
+            state.runners.clone()
+        };
+        for runner in runners {
+            runner.close_run(run_id).await;
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct NativeNodeRunner {
+    agent_context: Option<Arc<dyn AgentContextProvider>>,
     driver: Arc<dyn NodeDriver>,
     sessions: SessionPool,
     roles: NodeRolePlan,
@@ -268,12 +412,29 @@ pub struct NativeNodeRunner {
 }
 
 impl NativeNodeRunner {
+    /// Attach transient host context without changing the admitted graph or runtime plan.
+    #[must_use]
+    pub fn with_agent_context(mut self, context: Option<Arc<dyn AgentContextProvider>>) -> Self {
+        self.agent_context = context;
+        self
+    }
+
+    #[must_use]
+    pub fn auxiliary_factory(&self) -> Arc<dyn AuxiliaryRunnerFactory> {
+        Arc::new(NativeAuxiliaryRunnerFactory {
+            agent_context: self.agent_context.clone(),
+            driver: self.driver.clone(),
+            sessions: self.sessions.factory(),
+            state: std::sync::Mutex::default(),
+        })
+    }
     pub fn new(
         admitted: &AdmittedRun,
         driver: Arc<dyn NodeDriver>,
         sessions: Arc<dyn SessionFactory>,
     ) -> Result<Self, NodeRunnerError> {
         Ok(Self {
+            agent_context: None,
             driver,
             sessions: SessionPool::new(sessions),
             roles: NodeRolePlan::from_admitted(admitted)?,
@@ -291,6 +452,7 @@ impl NativeNodeRunner {
         sessions: Arc<dyn SessionFactory>,
     ) -> Result<Self, NodeRunnerError> {
         Ok(Self {
+            agent_context: None,
             driver,
             sessions: SessionPool::new_owner_scoped(sessions),
             roles: NodeRolePlan::from_admitted(admitted)?,
@@ -325,6 +487,7 @@ impl NodeRunner for NativeNodeRunner {
             .register(&reference, cancel_sender.clone())
             .await?;
         let runtime = RunnerTaskRuntime {
+            agent_context: self.agent_context.clone(),
             driver: self.driver.clone(),
             sessions: self.sessions.clone(),
         };
@@ -369,6 +532,7 @@ impl NodeRunner for NativeNodeRunner {
 }
 
 struct RunnerTaskRuntime {
+    agent_context: Option<Arc<dyn AgentContextProvider>>,
     driver: Arc<dyn NodeDriver>,
     sessions: SessionPool,
 }
@@ -408,7 +572,20 @@ async fn execute(
         return Err(NodeRunnerError::Cancelled);
     }
     let response = task.response;
+    let host_context = if matches!(
+        &task.request.invocation.binding,
+        NodeRuntimeBinding::Agent { .. }
+    ) {
+        runtime
+            .agent_context
+            .as_ref()
+            .map(|provider| provider.context())
+    } else {
+        None
+    };
     let driver_invocation = DriverInvocation {
+        dispatch: task.request.dispatch,
+        host_context,
         node: task.request.invocation.clone(),
         role: task.role,
         response: response.clone(),
@@ -465,7 +642,10 @@ async fn wait_for_cancellation(receiver: &mut watch::Receiver<bool>) {
 fn session_scope(binding: &NodeRuntimeBinding) -> Result<SessionScope, NodeRunnerError> {
     match binding {
         NodeRuntimeBinding::Agent { session_scope, .. } => Ok(*session_scope),
-        NodeRuntimeBinding::GitDelivery { .. } => Ok(SessionScope::Execution),
+        NodeRuntimeBinding::Script { .. }
+        | NodeRuntimeBinding::Decision { .. }
+        | NodeRuntimeBinding::GitDelivery { .. }
+        | NodeRuntimeBinding::CommentDelivery { .. } => Ok(SessionScope::Execution),
     }
 }
 

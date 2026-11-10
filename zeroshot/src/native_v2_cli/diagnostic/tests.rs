@@ -31,7 +31,16 @@ fn request_diagnostics_keep_stable_recovery_context() {
             json!({}),
         ),
         (
-            NativeV2CliError::InvalidRun(NativeV2AdmissionError::MergePlanAgentGitHubToken {
+            NativeV2CliError::InvalidRun(NativeV2AdmissionError::InvalidRuntimeBinding {
+                node: node(),
+                detail: "contextWindow must be in 1..=10000000".to_owned(),
+            }),
+            "runtime.invalid_binding",
+            None,
+            json!({}),
+        ),
+        (
+            NativeV2CliError::InvalidRun(NativeV2AdmissionError::StackAgentGitHubToken {
                 node: node(),
             }),
             "runtime.invalid_environment",
@@ -268,13 +277,13 @@ fn protocol_and_fallback_diagnostics_remain_distinct() {
         ),
         (
             NativeV2CliError::TargetTransport {
-                name: "cloud".to_owned(),
+                name: "platform".to_owned(),
                 origin: "https://api.example.test".to_owned(),
                 message: "offline".to_owned(),
             },
             "target",
             "target.unavailable",
-            json!({"target": "cloud", "origin": "https://api.example.test"}),
+            json!({"target": "platform", "origin": "https://api.example.test"}),
         ),
         (
             NativeV2CliError::Protocol("invalid frame".to_owned()),

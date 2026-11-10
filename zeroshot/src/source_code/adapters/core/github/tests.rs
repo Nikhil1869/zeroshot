@@ -7,6 +7,107 @@ use super::observation::test_support::{authority, shell_literal, write_executabl
 use super::merge_policy::MergeMethod;
 use crate::native_v2_delivery::SourceChecks;
 
+#[tokio::test]
+async fn configured_transport_owns_workspace_git_context_and_hosted_isolation() {
+    use crate::native_v2_delivery::git::test_support::{ConfigLocation, GitFixture};
+    use crate::native_v2_delivery::transport::{GitTransport, GitTransportConfig};
+
+    for local in [true, false] {
+        let mut fixture = GitFixture::new("[core]\n autocrlf = true\n", ConfigLocation::Home);
+        fixture
+            .environment
+            .insert("GIT_USERNAME".to_owned(), "true".to_owned());
+        let base = fixture.seed();
+        fixture.edit();
+        let home = PathBuf::from(&fixture.environment["HOME"]);
+        let mut config = GhCliAuthorityConfig::hosted(home.clone());
+        config.git_program = fixture.root.path().join("unconfigured-git-must-not-run");
+        let mut transport_config = GitTransportConfig {
+            git_program: fixture.program.clone(),
+            workspace: fixture.workspace.clone(),
+            home_directory: home,
+            private_directory: fixture.root.path().to_owned(),
+            identity: None,
+            local_environment: local.then(|| fixture.environment.clone()),
+            deadline: Duration::from_secs(20),
+        };
+        let authority = GhCliDeliveryAuthority::new(config).with_git_transport(GitTransport::new(
+            transport_config.clone(),
+            "https://github.com/fixture/project.git",
+        ));
+        let git = authority
+            .git_transport(&fixture.workspace, "fixture/project")
+            .workspace_git();
+        let revision = git
+            .prepare_revision(&fixture.workspace, &base, "fix: captured Git context")
+            .await
+            .assert_value();
+        assert_eq!(
+            fixture.git(&["show", "HEAD:sample.txt"]),
+            if local {
+                b"first\nchanged\n".as_slice()
+            } else {
+                b"first\r\nchanged\r\n".as_slice()
+            }
+        );
+        assert_eq!(
+            git.workspace_state(&fixture.workspace).await.assert_value(),
+            (revision.clone(), false)
+        );
+        let output = bounded_git_output(
+            local_git_command(&authority, &fixture.workspace).args([
+                "config",
+                "--get",
+                "core.autocrlf",
+            ]),
+            Duration::from_secs(20),
+            128,
+        )
+        .await;
+        if local {
+            assert_eq!(output.assert_value().stdout(), "true\n");
+            let output = bounded_git_output(
+                local_git_command(&authority, &fixture.workspace).args([
+                    "config",
+                    "--get",
+                    "core.autocrlf",
+                ]),
+                Duration::from_secs(20),
+                1,
+            )
+            .await
+            .unwrap_err();
+            assert!(output.to_string().contains("[REDACTED]"));
+            assert!(!output.to_string().contains("true"));
+            // Head adoption compares raw object IDs while retaining printable diagnostics.
+            transport_config
+                .local_environment
+                .as_mut()
+                .assert_value()
+                .insert("GIT_USERNAME".to_owned(), revision[..1].to_owned());
+            let authority = authority.with_git_transport(GitTransport::new(
+                transport_config,
+                "https://github.com/fixture/project.git",
+            ));
+            let mut review = review();
+            review.head_revision = revision;
+            head::synchronize_review_head(
+                &authority,
+                SourceHeadSynchronization {
+                    workspace: &fixture.workspace,
+                    previous: &review,
+                    updated: &review,
+                },
+                SourceDeliveryCredential::token("fixture-token"),
+            )
+            .await
+            .assert_value();
+        } else {
+            assert!(output.is_err());
+        }
+    }
+}
+
 #[cfg(unix)]
 #[path = "merge_tests.rs"]
 mod merge_tests;
@@ -14,6 +115,9 @@ mod merge_tests;
 #[cfg(unix)]
 #[path = "queue/tests.rs"]
 mod queue_tests;
+
+#[path = "policy/rules_tests.rs"]
+mod rules_tests;
 
 pub(super) fn review() -> SourceReviewReceipt {
     SourceReviewReceipt {
@@ -33,6 +137,7 @@ fn check_run(name: &str, status: &str, conclusion: Option<&str>, required: bool)
         "conclusion": conclusion,
         "detailsUrl": "https://github.com/acme/project/actions/runs/17",
         "databaseId": 91,
+        "checkSuite": {"app": {"databaseId": 15368}},
         "isRequired": required
     })
 }
@@ -186,12 +291,15 @@ fn write_review_fixture(
         }
     });
     let source = format!(
-        "#!/bin/sh\ncase \"$2:$4\" in\n\
+        "#!/bin/sh\ncase \"$*\" in\n\
+         *'--header X-GitHub-Api-Version: 2026-03-10') ;;\n\
+         *) exit 18 ;;\n\
+         esac\ncase \"$2:$4\" in\n\
          repos/acme/project/pulls:GET) printf '%s\\n' {} ;;\n\
          repos/acme/project/pulls:POST) printf '%s\\n' {} ;;\n\
          repos/acme/project/pulls/17:GET) printf '%s\\n' {} ;;\n\
          repos/acme/project/pulls/17:PATCH) printf '%s\\n' {} ;;\n\
-         repos/acme/project/git/ref/heads/zeroshot/v2-run:) \
+         repos/acme/project/git/ref/heads/zeroshot/v2-run:'X-GitHub-Api-Version: 2026-03-10') \
            printf '%s\\n' {} ;;\n\
          *) exit 19 ;;\n\
          esac\n",
@@ -223,6 +331,9 @@ fn write_policy_fixture(
     let source = format!(
         "#!/bin/sh\ncase \"$2\" in\n\
          graphql) printf '%s\\n' {} ;;\n\
+         'repos/acme/project/rules/branches/main?per_page=100') \
+           printf '%s\\n' \"$@\" >> \"$HOME/rules-reads\"; \
+           if [ -f \"$HOME/branch-rules.json\" ]; then /bin/cat \"$HOME/branch-rules.json\"; else printf '[[]]\\n'; fi ;;\n\
          repos/acme/project/actions/jobs/91/logs) {} ;;\n\
          *) exit 19 ;;\n\
          esac\n",
@@ -261,6 +372,7 @@ fn policy_query_is_repository_generic_and_paginates_required_contexts() {
         .find(|argument| argument.starts_with("query="))
         .assert_value();
     assert!(query.contains("isRequired(pullRequestNumber: $number)"));
+    assert!(query.contains("checkSuite { app { databaseId } }"));
     assert!(query.contains("statusCheckRollup"));
     assert!(query.contains("isMergeQueueEnabled"));
     assert!(!query.contains("mergeCommitAllowed"));
@@ -838,6 +950,7 @@ fn merge_actions_preserve_terminal_authority_and_queue_ownership() {
         is_merge_queue_enabled: queued,
         head_update: None,
         pull_request_ready: false,
+        observed_required_checks: Default::default(),
     };
     for (state, expected) in [
         (

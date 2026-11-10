@@ -667,6 +667,8 @@ fn local_runtime() -> Value {
         "harness":"codex",
         "provider":"openai",
         "size":"small",
+        // Prompt and argument captures describe graph workers, not optional global work.
+        "activeMemory":{"repository":false,"graph":false},
         "nodes":{
             "worker":{
                 "kind":"agent",
@@ -689,6 +691,9 @@ fn write_json(path: &Path, value: &Value) {
 
 #[path = "harness_environment.rs"]
 mod harness_environment;
+
+#[path = "restic_selector.rs"]
+mod restic_selector;
 
 #[cfg(target_os = "linux")]
 #[path = "agent_tmpdir.rs"]

@@ -1,10 +1,15 @@
+---
+description: 'The engine for autonomous software production. Orchestrate coding agents through implementation, code review, testing, repair and delivery.'
+---
+
 <p class="docs-kicker">Core documentation</p>
 
-# Build and review software through a graph
+# The engine for autonomous software production
 
 <p class="docs-lede">
-A Zeroshot graph records implementation, review, repair, and delivery as bounded execution steps.
-Its authored transitions determine which node runs next.
+zeroshot is an open-source workflow engine for coding agents. Turn your team's development and
+QA process into a reusable multi-agent graph of implementation, independent code review, testing,
+repair and delivery. The engine enforces the graph's transitions and retry limits.
 </p>
 
 [Run a first task](getting-started/first-run.md){ .md-button .md-button--primary }
@@ -31,8 +36,10 @@ Authored edges then route review, retries, and the final result.
 [![Zeroshot built-in workflow: implementation, parallel independent acceptance and code review, bounded repair, optional Git delivery, and delivery repair returning to both reviews.](assets/zeroshot-workflow-mobile.svg){ loading=lazy }](assets/zeroshot-workflow-mobile.svg){ .docs-graph-tall }
 
 The built-in `software-change` template uses the route shown above. For work that does not need its
-review loop, use `single-worker`. For ten rounds of measured, reversible research against a durable
-charter, use `auto-research`; custom graphs follow the same protocol contracts.
+review loop, use `single-worker`. To review a pull request, use `pr-review`, or `code-review` for a
+deeper review. For research, use `auto-research`. It runs ten rounds of experiments by default, and a
+new result replaces the current one only when the progress judge accepts it. Custom graphs follow
+the same protocol contracts.
 
 ## Choose where it runs
 
@@ -54,16 +61,28 @@ charter, use `auto-research`; custom graphs follow the same protocol contracts.
 
     [Understand targets](concepts/targets.md)
 
-- **Zeroshot Cloud**
+- **Zeroshot Platform**
 
-    Cloud accepts the same graph and runtime plan through a managed target. Its documentation covers
+    Platform accepts the same graph and runtime plan through a managed target. Its documentation covers
     accounts, organization policy, and queue behavior.
 
-    [Open the Cloud docs](https://cloud.zeroshot.sh/docs)
+    [Open the Platform docs](https://app.zeroshot.sh/docs)
 
 </div>
 
 <!-- prettier-ignore-end -->
+
+### Where code is processed
+
+The execution target and model provider are separate choices. Local and self-hosted runs keep
+the checkout and run ledger on your infrastructure, but a harness using an external model provider
+sends that provider the code and context it needs. Self-hosting zeroshot does not make model
+processing local. Check the selected provider's data-handling terms before using client code.
+
+For Platform-hosted execution, see the [Platform privacy notice](https://app.zeroshot.sh/legal/privacy)
+for data locations and [retention](https://app.zeroshot.sh/legal/privacy#retention).
+[Runtime connections](concepts/runtimes-and-connections.md) describe how to select providers and
+supply credentials.
 
 ## Read more
 

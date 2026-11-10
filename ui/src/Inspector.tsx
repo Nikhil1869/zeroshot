@@ -1,3 +1,5 @@
+import { activityLabel } from './node-presentation';
+import { DecisionControls } from './DecisionControls';
 import { useEffect, useRef, useState } from 'react';
 import { Field } from './Field';
 import { InspectorPanel } from './InspectorPanel';
@@ -10,13 +12,12 @@ import {
   children,
   clone,
   executable,
-  labels,
   replaceNode,
   type Document,
   type GraphNode,
 } from './domain';
 import { WorkerControl } from './WorkerControl';
-import type { WorkerOption } from './workers';
+import { isDeliveryKind, type WorkerOption } from './workers';
 import { GuardEditor } from './GuardEditor';
 import { reviewSources } from './simple-controls';
 import { ModelPicker } from './ModelPicker';
@@ -55,7 +56,7 @@ export function Inspector(p: InspectorProps) {
     if (scroll.current) scroll.current.scrollTop = 0;
   }, [node?.name]);
   const binding = node ? bindingFor(doc.runtime, node.name) : undefined;
-  const delivery = binding?.kind === 'git_delivery';
+  const delivery = isDeliveryKind(binding?.kind);
   const foldedFailures = new Set(
     analyzeWorkflowOutcomes(doc)
       .policies.filter((policy) => policy.choiceName === node?.name)
@@ -83,7 +84,9 @@ export function Inspector(p: InspectorProps) {
             <div className="inspector-heading">
               <h2>
                 {delivery
-                  ? 'Git delivery'
+                  ? binding?.kind === 'comment_delivery'
+                    ? 'Comment delivery'
+                    : 'Git delivery'
                   : node.name === doc.graph.root.name
                     ? 'Run settings'
                     : node.kind === 'choice'
@@ -92,7 +95,7 @@ export function Inspector(p: InspectorProps) {
                         ? 'Run result'
                         : node.kind === 'fail'
                           ? 'Stop outcome'
-                          : labels[node.kind]}
+                          : activityLabel(node.kind, binding?.kind)}
               </h2>
             </div>
             <NameField
@@ -358,14 +361,19 @@ function ActivitySettings({
       )}
       {executable(node) && !delivery && (
         <>
-          <Field label="Instructions">
-            <textarea
-              rows={7}
-              value={node.instructions ?? ''}
-              onChange={(e) => graphChange('instructions', e.target.value)}
-              placeholder="What should this agent do?"
-            />
-          </Field>
+          {binding?.kind !== 'script' && (
+            <Field label="Instructions">
+              <textarea
+                rows={7}
+                value={node.instructions ?? ''}
+                onChange={(e) => graphChange('instructions', e.target.value)}
+                placeholder="What should this agent do?"
+              />
+            </Field>
+          )}
+          {binding?.kind === 'decision' && (
+            <DecisionControls node={node.name} binding={binding} onChange={bindingChange} />
+          )}
           {binding?.kind === 'agent' && (
             <>
               <ModelPicker

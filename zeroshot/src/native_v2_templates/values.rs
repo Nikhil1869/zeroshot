@@ -219,7 +219,13 @@ pub(super) fn record_type(
     Ok(PayloadType::Record { fields })
 }
 
-fn record_fields(
+pub(super) fn array(items: PayloadType) -> PayloadType {
+    PayloadType::Array {
+        items: Box::new(items),
+    }
+}
+
+pub(super) fn record_fields(
     payload: PayloadType,
 ) -> Result<BTreeMap<FieldName, RecordField>, BuiltinTemplateError> {
     match payload {

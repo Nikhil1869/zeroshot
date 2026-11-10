@@ -26,11 +26,15 @@ pub(super) fn request(run: &str, execution: u64) -> NodeRunRequest {
         lane: None,
         model: worker_catalog::ModelId::new("gpt-5.6").assert_value(),
         effort: Some(ReasoningEffort::Max),
+        harness_config: None,
+        context_window: None,
+        max_tokens: None,
         session_scope: SessionScope::Execution,
         connections: DeclaredConnections::empty(),
     };
     let environment = ResolvedEnvironment::exact(&binding, BTreeMap::new()).assert_value();
     NodeRunRequest {
+        dispatch: Default::default(),
         invocation: NodeInvocation {
             reference: ExecutionRef {
                 run_id: RunId::new(run),
@@ -52,6 +56,7 @@ pub(super) fn request(run: &str, execution: u64) -> NodeRunRequest {
 
 #[derive(Default)]
 struct TestRunner {
+    requests: StdMutex<Vec<NodeRunRequest>>,
     proceed: Arc<Notify>,
     started: Arc<Notify>,
     cleaned: Arc<AtomicBool>,
@@ -60,6 +65,7 @@ struct TestRunner {
 #[async_trait]
 impl NodeRunner for TestRunner {
     async fn start(&self, request: NodeRunRequest) -> Result<NodeHandle, NodeRunnerError> {
+        self.requests.lock().assert_value().push(request.clone());
         let reference = request.invocation.reference;
         let (handle, mut bridge) = remote_node_handle(reference.clone());
         let proceed = self.proceed.clone();
@@ -118,7 +124,12 @@ async fn proxy_preserves_durable_live_and_normalized_completion() {
     let local = Arc::new(TestRunner::default());
     let endpoint = Arc::new(NativeCapsuleNodeEndpoint::new(local.clone()));
     let proxy = RemoteCapsuleNodeRunner::new(endpoint);
-    let mut handle = proxy.start(request("roundtrip", 1)).await.assert_value();
+    let mut visit = request("roundtrip", 1);
+    visit.dispatch = crate::native_v2_runner::NodeDispatchMetadata {
+        attempt: 2,
+        iteration: 3,
+    };
+    let mut handle = proxy.start(visit.clone()).await.assert_value();
     let mut durable = handle.take_initial_output().assert_value();
     let mut live = handle.attach();
     local.proceed.notify_one();
@@ -137,6 +148,10 @@ async fn proxy_preserves_durable_live_and_normalized_completion() {
     assert_eq!(usage.cache_read_input_tokens.assert_value().get(), 20);
     assert!(usage.cache_creation_input_tokens.is_none());
     let completion = handle.completion().await.assert_value();
+    let received = local.requests.lock().assert_value();
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0].dispatch, visit.dispatch);
+    assert_eq!(received[0].invocation, visit.invocation);
     assert_eq!(
         completion.reference.execution,
         native_v2_contract::ExecutionId::new(1).assert_value()
@@ -384,6 +399,7 @@ fn boundary_contract_capsule_wire_mappings_preserve_streams_and_failure_classifi
         let output = CapsuleOutput {
             stream: wire,
             text: "detail".to_owned(),
+            diagnostic: None,
         };
         let mapped = output.clone().into_live().assert_value();
         assert_eq!(mapped.stream, live);

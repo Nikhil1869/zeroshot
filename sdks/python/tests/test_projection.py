@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from zeroshot._projection import _log_event, _plan_status, _status, _summary
+from zeroshot._projection import _log_event, _stack_status, _status, _summary
 from zeroshot.errors import ProtocolError
 
 
@@ -38,9 +38,9 @@ def test_log_event_rejects_missing_timestamp() -> None:
         _log_event(value)
 
 
-def plan_status() -> dict[str, object]:
+def stack_status() -> dict[str, object]:
     return {
-        "planId": "plan-1",
+        "stackId": "stack-1",
         "title": "Release",
         "state": "queued",
         "repository": "owner/repo",
@@ -53,6 +53,7 @@ def plan_status() -> dict[str, object]:
                 "runId": "run-1",
                 "state": "blocked",
                 "needs": [],
+                "sourceBranch": None,
                 "sourceRevision": None,
                 "readyAt": None,
                 "queueExpiresAt": None,
@@ -64,21 +65,32 @@ def plan_status() -> dict[str, object]:
     }
 
 
-def test_merge_plan_projection_preserves_explicit_nullable_fields() -> None:
-    status = _plan_status(plan_status())
-    assert status.plan_id == "plan-1"
+def test_stack_projection_preserves_explicit_nullable_fields() -> None:
+    status = _stack_status(stack_status())
+    assert status.stack_id == "stack-1"
+    assert status.runs[0].source_branch is None
     assert status.runs[0].source_revision is None
     assert status.runs[0].waiting_reason == "dependencies_pending"
     assert not status.terminal
 
 
-def test_merge_plan_projection_rejects_omitted_nullable_fields() -> None:
-    value = plan_status()
+def test_stack_projection_preserves_the_stacked_source_branch() -> None:
+    value = stack_status()
     runs = value["runs"]
     assert isinstance(runs, list)
-    del runs[0]["queueExpiresAt"]
-    with pytest.raises(ProtocolError, match="queueExpiresAt"):
-        _plan_status(value)
+    runs[0]["sourceBranch"] = "zeroshot/v2-0123456789abcdef0123"
+    status = _stack_status(value)
+    assert status.runs[0].source_branch == "zeroshot/v2-0123456789abcdef0123"
+
+
+@pytest.mark.parametrize("field", ["sourceBranch", "queueExpiresAt"])
+def test_stack_projection_rejects_omitted_nullable_fields(field: str) -> None:
+    value = stack_status()
+    runs = value["runs"]
+    assert isinstance(runs, list)
+    del runs[0][field]
+    with pytest.raises(ProtocolError, match=field):
+        _stack_status(value)
 
 
 def local_status() -> dict[str, object]:
@@ -131,3 +143,113 @@ def test_present_malformed_source_remains_a_protocol_error(source: object) -> No
     value["source"] = source
     with pytest.raises(ProtocolError, match="source"):
         _status(value)
+
+
+def failed_status(context: object = None) -> dict[str, object]:
+    value = local_status()
+    terminal = {"status": "failed", "reason": "delivery_failed"}
+    if context is not None:
+        terminal["context"] = context
+    value["status"] = {"phase": "finished", "terminalResult": terminal}
+    return value
+
+
+def test_failed_status_retains_immutable_structured_evidence_without_inventing_a_cause() -> None:
+    from dataclasses import FrozenInstanceError
+
+    from zeroshot import ActiveExecution, FailureContext, FailureDiagnostic
+
+    context = {
+        "primary": {"message": "Runtime cleanup failed"},
+        "recorded": [
+            {
+                "message": "GitHub API request failed: HTTP 404 — base branch not found",
+                "execution": {"execution": "opaque:execution:1", "node": "deliver"},
+                "cursor": "v2:3",
+            }
+        ],
+        "incomplete": True,
+    }
+    result = _status(failed_status(context)).result
+    assert result is not None
+    assert result.failure == "delivery_failed"
+    assert result.context == FailureContext(
+        primary=FailureDiagnostic(message="Runtime cleanup failed"),
+        recorded=(
+            FailureDiagnostic(
+                message="GitHub API request failed: HTTP 404 — base branch not found",
+                execution=ActiveExecution(execution="opaque:execution:1", node="deliver"),
+                cursor="v2:3",
+            ),
+        ),
+        incomplete=True,
+    )
+    context["recorded"].clear()
+    assert len(result.context.recorded) == 1
+    with pytest.raises(FrozenInstanceError):
+        result.context.recorded[0].message = "changed"
+
+
+def test_old_failed_status_has_no_inferred_context() -> None:
+    result = _status(failed_status()).result
+    assert result is not None
+    assert result.failure == "delivery_failed"
+    assert result.context is None
+
+
+@pytest.mark.parametrize(
+    "context",
+    [
+        False,
+        "failure",
+        {"incomplete": "true"},
+        {"recorded": None},
+        {"recorded": [{"message": 123}]},
+        {"primary": {"message": "failed", "execution": "1"}},
+        {"primary": {"message": "failed", "cursor": 3}},
+    ],
+)
+def test_failed_status_rejects_malformed_failure_evidence(context: object) -> None:
+    with pytest.raises(ProtocolError, match="failure"):
+        _status(failed_status(context))
+
+
+@pytest.mark.parametrize("size", ["small", "medium", "large", "xl", "gpu_t4"])
+def test_machine_sizes_survive_status_and_summary_projection(size: str) -> None:
+    value = local_status()
+    value["size"] = size
+    status = _status(value)
+    assert status.size == size
+    assert _summary(status).size == size
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_terminal_receipt_is_independent_of_graph_output(failed: bool) -> None:
+    value = local_status()
+    terminal = (
+        {"status": "failed", "reason": "rejected"}
+        if failed
+        else {"status": "succeeded", "output": {"summary": "authored report"}}
+    )
+    receipt = {"receipt": {"mode": "comment", "outcome": "posted"}}
+    value["status"] = {
+        "phase": "finished",
+        "terminalResult": terminal,
+        "metadata": {"deliveryReceipt": receipt},
+    }
+    result = _status(value).result
+    assert result is not None
+    assert result.succeeded is not failed
+    assert result.delivery_receipt == receipt
+    assert result.output == (None if failed else {"summary": "authored report"})
+
+
+def test_graph_output_cannot_supply_a_delivery_receipt() -> None:
+    value = local_status()
+    value["status"] = {
+        "phase": "finished",
+        "terminalResult": {"status": "succeeded", "output": {"mode": "merge", "outcome": "merged"}},
+    }
+    result = _status(value).result
+    assert result is not None
+    assert result.delivery_receipt is None

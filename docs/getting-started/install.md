@@ -1,6 +1,10 @@
+---
+description: 'Install the zeroshot CLI and its agent skills, connect Cloud, open the workspace UI and prepare a local run.'
+---
+
 # Install Zeroshot
 
-Install the `zeroshot` command and its agent skill through the npm delivery package, which requires
+Install the `zeroshot` command and its agent skills through the npm delivery package, which requires
 Node.js 18 or newer. The installer selects the release target declared for the current system and
 checks the downloaded archive against `SHA256SUMS` before writing the native executable.
 
@@ -8,8 +12,8 @@ checks the downloaded archive against `SHA256SUMS` before writing the native exe
 npm install --global @the-open-engine-company/zeroshot
 ```
 
-A canonical CLI release can update its executable and managed agent skill in place. The command
-selects the newest GitHub release for the current platform, verifies its archive and skill asset
+A canonical CLI release can update its executable and managed agent skills in place. The command
+selects the newest GitHub release for the current platform, verifies its archive and skill assets
 against that release's `SHA256SUMS`, and verifies the new executable before replacing the old one:
 
 ```console
@@ -21,14 +25,48 @@ Unchanged managed skill copies are installed or refreshed for Codex, GitHub Copi
 Code. A user-edited or conflicting skill is preserved, and the command fails with its exact path
 after completing any safe updates.
 
+Versions 10.4.0 through 10.8.0 cannot update themselves to a current release. Their updater accepts
+only the `zeroshot` executable, but every archive since 10.9.0 also contains the `restic` sidecar,
+so `zeroshot update` always fails with `release archive contains unexpected entry restic`
+(`restic.exe` on Windows) and leaves the installation unchanged. Install the latest release through
+npm once; later updates can use `zeroshot update` again:
+
+```console
+npm install --global @the-open-engine-company/zeroshot@latest
+```
+
+Older updaters install only the skills they know. If `zeroshot-graph-design` or `zeroshot-plan` is
+missing after an executable upgrade, run `zeroshot update` again. The current updater refreshes all
+managed skills even when the executable version is already current.
+
 Release builds cover Linux x64 and arm64, macOS x64 and arm64, and Windows x64. Node.js is only an
 installer dependency; the command itself is a Rust executable.
 
-The package installs one managed skill for Codex, GitHub Copilot, and Pi under `$HOME/.agents/skills`,
-and for Claude Code under `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills`. No agent selection or
+The package installs the `zeroshot`, `zeroshot-memory-init`, `zeroshot-graph-design`, and
+[`zeroshot-plan`](../guides/planning.md) skills for Codex, GitHub Copilot, and Pi under
+`$HOME/.agents/skills/<name>`, and for Claude Code under
+`${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/<name>`. No agent selection or
 per-project installation is needed. npm 7 and newer do not run uninstall hooks; after removing the
-package, delete its two skill directories manually only if their `SKILL.md` files remain unmodified.
-When set, `CLAUDE_CONFIG_DIR` must be absolute so the global skill has one stable location.
+package, remove only unmodified managed skill directories from these locations.
+With automatic skill installation enabled, `CLAUDE_CONFIG_DIR` must be absolute when set so the
+global skills have stable locations.
+Use `zeroshot-graph-design` for a guided interview to design a graph for your repository.
+
+To install or update only the executables, set `ZEROSHOT_SKIP_SKILLS=1`:
+
+```console
+ZEROSHOT_SKIP_SKILLS=1 npm install --global @the-open-engine-company/zeroshot
+ZEROSHOT_SKIP_SKILLS=1 zeroshot update
+```
+
+Only the exact value `1` enables the opt-out. Both commands skip all user-scope skill installation
+and leave existing skills untouched, even when destinations conflict or are unwritable.
+Export the variable in your shell configuration to keep future updates from recreating skills you
+remove. In PowerShell, set `$env:ZEROSHOT_SKIP_SKILLS = '1'` before running either command.
+Unset the variable to restore automatic installation and refresh of unchanged managed skills.
+
+See [Active Memory storage and backups](../guides/active-memory.md#persistence-and-run-completion)
+for the local lesson database and how to preserve it when moving or reinstalling Zeroshot.
 
 On Windows, the CLI and local in-process runs work natively from PowerShell or Command Prompt.
 Install Git for Windows and put Git and your chosen harness on `PATH`; npm-installed `.cmd`
@@ -40,16 +78,16 @@ For Codex, complete its [native Windows sandbox setup](https://developers.openai
 if your Codex permission settings require it. Workers and reviewers use the same permission handling;
 Zeroshot does not install the sandbox.
 
-## Connect Zeroshot Cloud
+## Connect Zeroshot Platform
 
-The Cloud target is built in. Sign in once; organization selection happens in the browser:
+The Platform target is built in. Sign in once; organization selection happens in the browser:
 
 ```console
-zeroshot target login cloud
+zeroshot target login platform
 ```
 
-Cloud runs use `--target cloud`. Omit `--target` for local execution. The
-[Zeroshot Cloud docs](https://cloud.zeroshot.sh/docs) cover organizations, the GitHub App, and saved
+Platform runs use `--target platform`. Omit `--target` for local execution. The
+[Zeroshot Platform docs](https://app.zeroshot.sh/docs) cover organizations, the GitHub App, and saved
 connections.
 
 ## Open the workspace UI
@@ -68,7 +106,7 @@ To inspect runs on a configured target while keeping profiles in the local CLI s
 zeroshot ui --target docker
 ```
 
-Use `--target cloud` after signing in to inspect Cloud runs through the same local UI.
+Use `--target platform` after signing in to inspect Platform runs through the same local UI.
 
 **Profiles** edits graphs and runtime settings; the info icon explains authoring defaults.
 Saved profiles share the CLI's configuration store (`ZEROSHOT_CONFIG_DIR`); without `--target`,
@@ -80,7 +118,7 @@ zeroshot run --title "My task" --profile local:my-profile --input input.json
 
 Open **Runs** for [live monitoring and replay](../guides/observe-and-control.md#browser).
 The [Docker target](../concepts/targets.md#direct-target) serves its own profiles and runs at `/ui/`.
-Cloud embedding remains tracked in [zero-cloud #301](https://github.com/the-open-engine/zero-cloud/issues/301).
+Platform embedding remains tracked in [zero-cloud #301](https://github.com/the-open-engine/zero-cloud/issues/301).
 
 Release executables embed the UI. To build it from source:
 
@@ -97,36 +135,34 @@ can leave the `ui` feature disabled.
 ## Prepare a local run
 
 Choose an existing working folder with `--cwd FOLDER`, or use the invoking folder. Local runs without
-Git delivery do not need a repository. Install each agent harness named by the runtime plan:
-
-- install and sign in to Codex for `"harness": "codex"`;
-- install and sign in to Claude Code for `"harness": "claude"`;
-- install GitHub Copilot CLI 1.0.86 for `"harness": "copilot"` with `"provider": "github"`;
-- install and sign in to Pi for `"harness": "pi"`.
+Git delivery do not need a repository. Install a current version of each native harness CLI named by
+the runtime plan and put it on `PATH`. Official local builds include contributed OpenCode and Hermes adapters; see
+[Harness adapters](../project/harness-adapters.md) for availability and provider support.
 
 Local GitHub pull request delivery (`--pr` or `--ship`) also needs the GitHub CLI, `gh`, on `PATH`.
 Zeroshot runs the `gh` that `PATH` finds and rejects the run before any agent starts if there is
 none.
+See [forge setup](../guides/forge-delivery.md) for host logins and token connections.
 
-Local Codex/OpenAI, Claude/Anthropic, Copilot/GitHub, Pi/Anthropic, and Pi/OpenAI lanes reuse the
-installed harness's native login and configuration. Other provider lanes can read declared values
-from the current environment or the private Zeroshot connection store. For example, this command
-prompts without echo and keeps
-an OpenAI value out of runtime JSON for a contained target:
+Local lanes with native-login support reuse the installed harness's login and configuration. Other
+provider lanes can read declared values from the current environment or the private Zeroshot
+connection store. For example, this command prompts without echo and keeps an OpenAI value out of
+runtime JSON for a contained target:
 
 ```console
 zeroshot connection set openai --field OPENAI_API_KEY
 ```
 
-Use `openrouter`, `anthropic`, `bedrock`, or `gateway` as the connection key when the effective
+Use `openrouter`, `anthropic`, `bedrock`, `foundry`, or `gateway` as the connection key when the effective
 runtime declares that provider. [Runtimes and connections](../concepts/runtimes-and-connections.md)
 lists the automatic requirements and explains the separation.
 
 ## Other installation paths
 
 Each [GitHub release](https://github.com/the-open-engine/zeroshot/releases) includes native archives,
-the canonical `zeroshot-skill.md`, and `SHA256SUMS`; archive names contain the release version and
-target triple.
+the canonical `zeroshot-skill.md`, `zeroshot-memory-init-skill.md`,
+`zeroshot-graph-design-skill.md`, and `zeroshot-plan-skill.md`, and `SHA256SUMS`; archive
+names contain the release version and target triple.
 
 The Python SDK requires Python 3.11 or newer and ships the matching executable inside each platform
 wheel. Download the wheel for your [OS and CPU](../guides/python-sdk.md#install-and-run) from [Python SDK releases](https://github.com/the-open-engine/zeroshot/releases?q=zeroshot-python-v).
@@ -143,8 +179,8 @@ For a long-running target, use `ghcr.io/the-open-engine/zeroshot-target`. See th
 
 ## GitHub Copilot
 
-Copilot uses your GitHub user identity and Copilot entitlement. Local runs reuse the login stored by
-`copilot login` in `COPILOT_HOME` or the system credential store. Ambient
+Copilot's `github` lane uses your GitHub user identity and Copilot entitlement. Local runs on that
+lane reuse the login stored by `copilot login` in `COPILOT_HOME` or the system credential store. Ambient
 `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN` values stay in private RPC and are excluded
 from agent tool environments. For a contained target, store a user OAuth token or fine-grained
 personal token with Copilot Requests permission in the `github` connection's
@@ -176,7 +212,7 @@ Model IDs pass unchanged to the Copilot process. When a registry entry with `api
 Copilot's singular provider contract, its authored `modelId` becomes the RPC session model and its
 authored `wireModel` still names the provider request model. Zeroshot uses headless RPC schema output
 and validates each response locally, allowing at most two correction turns in the same session.
-Install the pinned CLI version above; the target image already includes it.
+The target image already includes the native Copilot CLI.
 
 Hosted connection resolvers may additionally declare `COPILOT_GITHUB_TOKEN_EXPIRES_AT` (Unix
 seconds). Copilot then requests credentials through the resolver throughout a long execution.

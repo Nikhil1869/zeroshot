@@ -16,7 +16,7 @@ import {
 export type WorkerOption = {
   id: string;
   label: string;
-  runtimeKind: 'agent' | 'git_delivery';
+  runtimeKind: 'agent' | 'decision' | 'git_delivery' | 'comment_delivery';
   workerRefs: string[];
   node?: GraphNode;
   runtimeBinding: Binding;
@@ -28,12 +28,12 @@ export function workerOption(
   workers: WorkerOption[]
 ): WorkerOption | undefined {
   const delivery = workers.find(
-    (option) => option.runtimeKind === 'git_delivery' && option.workerRefs.includes(node.worker)
+    (option) => isDeliveryKind(option.runtimeKind) && option.workerRefs.includes(node.worker)
   );
   if (delivery) return delivery;
-  return binding?.kind === 'agent'
-    ? workers.find((option) => option.runtimeKind === 'agent')
-    : undefined;
+  return workers.find(
+    (option) => !isDeliveryKind(option.runtimeKind) && option.runtimeKind === binding?.kind
+  );
 }
 
 export function applyWorker(
@@ -48,18 +48,29 @@ export function applyWorker(
   const current = workerOption(node, binding, workers.length ? workers : [option]);
   if (current?.id === option.id && binding?.kind === option.runtimeKind) return document;
   let replacement: GraphNode;
-  if (option.runtimeKind === 'git_delivery') {
+  if (option.runtimeKind === 'decision') {
+    if (option.node?.kind !== 'verifier')
+      throw new Error('The decision contract is unavailable. Reload the editor.');
+    replacement = {
+      ...clone(option.node),
+      name,
+      worker: uniqueAgentReference(document.graph.root, name),
+      inputBindings: [],
+      writeBindings: [],
+    };
+  } else if (isDeliveryKind(option.runtimeKind)) {
     if (!option.node || option.node.kind !== 'verifier')
       throw new Error('The native delivery contract is unavailable. Reload the editor.');
     const anotherDelivery = allNodes(document.graph.root).some(
       (other) =>
         other.name !== name &&
         executable(other) &&
-        (bindingFor(document.runtime, other.name)?.kind === 'git_delivery' ||
-          workerOption(other, bindingFor(document.runtime, other.name), workers)?.runtimeKind ===
-            'git_delivery')
+        (isDeliveryKind(bindingFor(document.runtime, other.name)?.kind) ||
+          isDeliveryKind(
+            workerOption(other, bindingFor(document.runtime, other.name), workers)?.runtimeKind
+          ))
     );
-    if (anotherDelivery) throw new Error('A profile can contain only one Git delivery worker.');
+    if (anotherDelivery) throw new Error('A profile can contain only one delivery worker.');
     replacement = {
       ...clone(option.node),
       name,
@@ -77,4 +88,16 @@ export function applyWorker(
   const next = replaceNode(document, name, replacement);
   next.runtime.nodes = { ...next.runtime.nodes, [name]: clone(option.runtimeBinding) };
   return next;
+}
+
+export function isDeliveryKind(kind: unknown): boolean {
+  return kind === 'git_delivery' || kind === 'comment_delivery';
+}
+
+export function scriptCommandLabel(command: unknown): string {
+  return Array.isArray(command) &&
+    command.length > 0 &&
+    command.every((arg) => typeof arg === 'string')
+    ? command.join(' ')
+    : 'Invalid command';
 }

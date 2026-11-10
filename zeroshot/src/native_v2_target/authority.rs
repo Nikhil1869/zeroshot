@@ -7,7 +7,7 @@ use openengine_cluster_protocol::{
     ConnectionDeleteRequest, ConnectionDeleteResult, ConnectionListRequest, ConnectionListResult,
     ConnectionMutationResult, ConnectionSetRequest,
 };
-use openengine_cluster_protocol::{MergePlan, MergePlanId, MergePlanSubmitRequest};
+use openengine_cluster_protocol::{Stack, StackId, StackSubmitRequest};
 use openengine_cluster_protocol::{
     RunForceParams, RunListParams, RunLogEventNotification, RunLogsParams, RunStatusParams,
     RunSubmitResult, RunWatchParams, TargetOecpSessionRequest, TargetRunRequest,
@@ -24,11 +24,48 @@ use zeroshot_engine::native_v2_cli::{
 
 use super::{TargetAuthorityError, TargetOecpAccess, TargetRecord};
 
-/// The external contract which hosting must implement before the native-v2 CLI can reach cloud.
+/// The external contract which hosting must implement before the native-v2 CLI can reach Platform.
 #[async_trait]
 pub trait TargetControlAuthority: Send + Sync {
+    fn redact_error(&self, error: TargetAuthorityError) -> TargetAuthorityError {
+        error
+    }
+
+    async fn review_cache_namespace(
+        &self,
+        _target: &TargetRecord,
+    ) -> Result<Option<String>, TargetAuthorityError> {
+        Ok(None)
+    }
+
+    async fn resolve_review(
+        &self,
+        _target: &TargetRecord,
+        _request: zeroshot_engine::native_v2_review::ReviewResolutionRequest,
+        _runtime: &openengine_cluster_protocol::RuntimePlan,
+    ) -> Result<zeroshot_engine::native_v2_review::PreparedReview, TargetAuthorityError> {
+        Err(TargetAuthorityError::new(
+            "target does not advertise task resolution",
+        ))
+    }
+
     async fn discover(&self, target: &TargetRecord) -> Result<(), TargetAuthorityError>;
     async fn login(&self, target: &TargetRecord) -> Result<(), TargetAuthorityError>;
+    async fn default_resource_scope(
+        &self,
+        _target: &TargetRecord,
+    ) -> Result<openengine_cluster_protocol::ConnectionScope, TargetAuthorityError> {
+        Ok(openengine_cluster_protocol::ConnectionScope::User)
+    }
+    async fn delegation(
+        &self,
+        _target: &TargetRecord,
+        _action: zeroshot_engine::native_v2_cli::DelegationAction,
+    ) -> Result<zeroshot_engine::native_v2_cli::DelegationResult, TargetAuthorityError> {
+        Err(TargetAuthorityError::new(
+            "target does not advertise delegation management",
+        ))
+    }
     async fn submit(
         &self,
         target: &TargetRecord,
@@ -114,26 +151,26 @@ pub trait TargetControlAuthority: Send + Sync {
     ) -> Result<RunSubmitResult, TargetAuthorityError> {
         Err(TargetAuthorityError::new("profile runs are unavailable"))
     }
-    async fn merge_plan_submit(
+    async fn stack_submit(
         &self,
         _target: &TargetRecord,
-        _request: &MergePlanSubmitRequest,
-    ) -> Result<MergePlan, TargetAuthorityError> {
-        merge_plan_unavailable()
+        _request: &StackSubmitRequest,
+    ) -> Result<Stack, TargetAuthorityError> {
+        stack_unavailable()
     }
-    async fn merge_plan_status(
+    async fn stack_status(
         &self,
         _target: &TargetRecord,
-        _plan_id: &MergePlanId,
-    ) -> Result<MergePlan, TargetAuthorityError> {
-        merge_plan_unavailable()
+        _stack_id: &StackId,
+    ) -> Result<Stack, TargetAuthorityError> {
+        stack_unavailable()
     }
-    async fn merge_plan_force(
+    async fn stack_force(
         &self,
         _target: &TargetRecord,
-        _plan_id: &MergePlanId,
-    ) -> Result<MergePlan, TargetAuthorityError> {
-        merge_plan_unavailable()
+        _stack_id: &StackId,
+    ) -> Result<Stack, TargetAuthorityError> {
+        stack_unavailable()
     }
     async fn hosted_run_resume(
         &self,
@@ -189,10 +226,8 @@ pub trait TargetControlAuthority: Send + Sync {
     ) -> Result<CliRunForceResult, TargetAuthorityError>;
 }
 
-fn merge_plan_unavailable<T>() -> Result<T, TargetAuthorityError> {
-    Err(TargetAuthorityError::new(
-        "hosted merge plans are unavailable",
-    ))
+fn stack_unavailable<T>() -> Result<T, TargetAuthorityError> {
+    Err(TargetAuthorityError::new("hosted stacks are unavailable"))
 }
 
 fn profile_unavailable<T>() -> Result<T, TargetAuthorityError> {

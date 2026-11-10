@@ -1,5 +1,5 @@
 site_name: Zeroshot
-site_description: Versioned documentation for the Zeroshot CLI, protocol, and Python SDK
+site_description: The engine for autonomous software production. A workflow engine for coding agents, code review and QA automation. CLI, protocol and Python SDK docs.
 site_url: https://zeroshot.sh/docs/
 repo_url: https://github.com/the-open-engine/zeroshot
 repo_name: the-open-engine/zeroshot
@@ -12,14 +12,14 @@ exclude_docs: |
   brand/README.md
   requirements.lock
   requirements.txt
+  overrides/
 
 theme:
   name: material
+  custom_dir: docs/overrides
   logo: brand/oec-crow.png
   favicon: brand/oec-favicon.svg
-  font:
-    text: Spline Sans
-    code: Roboto Mono
+  font: false
   features:
     - content.code.copy
     - navigation.footer
@@ -54,8 +54,14 @@ nav:
       - Runtimes and connections: concepts/runtimes-and-connections.md
       - Targets: concepts/targets.md
   - Guides:
+      - Plan work before running it: guides/planning.md
       - Prepare a runtime environment: guides/runtime-environments.md
+      - Active Memory: guides/active-memory.md
       - Build a review loop: guides/review-loop.md
+      - Review an issue or PR: guides/review.md
+      - Review a PR in depth: guides/code-review.md
+      - GitHub and GitLab delivery: guides/forge-delivery.md
+      - Submit a stack: guides/stacks.md
       - Observe and control runs: guides/observe-and-control.md
       - Use a local graph as an ACP agent: guides/acp.md
       - Python SDK: guides/python-sdk.md
@@ -80,7 +86,8 @@ nav:
       - Documentation versions: project/versioning.md
       - Distribution contract: zeroshot-distribution.md
       - Source-code adapters: project/source-code-adapters.md
-  - Zeroshot Cloud: https://cloud.zeroshot.sh/docs
+      - Harness adapters: project/harness-adapters.md
+  - Zeroshot Platform: https://app.zeroshot.sh/docs
   - zeroshot.sh: https://zeroshot.sh/?utm_source=github&utm_medium=docs&utm_campaign=zeroshot
 
 plugins:
@@ -129,6 +136,7 @@ markdown_extensions:
       permalink: true
 
 extra_css:
+  - assets/fonts/fonts.css
   - stylesheets/extra.css
 
 extra:
@@ -147,4 +155,4 @@ extra:
     - icon: fontawesome/brands/linkedin
       link: https://www.linkedin.com/company/the-open-engine-company
     - icon: fontawesome/brands/x-twitter
-      link: https://x.com/OpenEngineHQ
+      link: https://x.com/OpenEngineCo

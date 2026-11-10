@@ -3,15 +3,15 @@ use openengine_cluster_protocol::GraphSpec;
 use super::*;
 use crate::native_v2_candidate::test_support::git_delivery_node;
 
-pub(super) const CODEX_OPENAI: RuntimeLane = RuntimeLane::Codex {
-    provider: CodexProvider::OpenAi,
-};
-pub(super) const CLAUDE_ANTHROPIC: RuntimeLane = RuntimeLane::Claude {
-    provider: ClaudeProvider::Anthropic,
-};
-pub(super) const COPILOT_GITHUB: RuntimeLane = RuntimeLane::Copilot {
-    provider: CopilotProvider::Github,
-};
+pub(super) fn codex_openai() -> RuntimeLane {
+    RuntimeLane::new("codex", "openai").assert_value()
+}
+pub(super) fn claude_anthropic() -> RuntimeLane {
+    RuntimeLane::new("claude", "anthropic").assert_value()
+}
+pub(super) fn copilot_github() -> RuntimeLane {
+    RuntimeLane::new("copilot", "github").assert_value()
+}
 
 #[derive(Clone, Copy)]
 pub(super) enum RuntimePlanKind {
@@ -26,8 +26,8 @@ pub(super) enum RuntimePlanKind {
 impl RuntimePlanKind {
     fn reviewer_lane(self) -> Option<RuntimeLane> {
         match self {
-            Self::ClaudeReviewer => Some(CLAUDE_ANTHROPIC),
-            Self::CopilotReviewer => Some(COPILOT_GITHUB),
+            Self::ClaudeReviewer => Some(claude_anthropic()),
+            Self::CopilotReviewer => Some(copilot_github()),
             Self::Codex | Self::Claude | Self::ClaudeOverride | Self::Pi => None,
         }
     }
@@ -38,6 +38,9 @@ pub(super) fn agent_binding(lane: Option<RuntimeLane>, model: &str) -> NodeRunti
         lane,
         model: worker_catalog::ModelId::new(model).assert_value_with("model"),
         effort: Some(ReasoningEffort::Max),
+        harness_config: None,
+        context_window: None,
+        max_tokens: None,
         session_scope: SessionScope::Execution,
         connections: DeclaredConnections::empty(),
     }
@@ -63,7 +66,9 @@ pub(super) fn runtime(kind: RuntimePlanKind) -> RuntimePlan {
         | RuntimePlanKind::ClaudeReviewer
         | RuntimePlanKind::CopilotReviewer => agent_binding(None, "gpt-5.6-sol"),
         RuntimePlanKind::Claude => agent_binding(None, "claude-sonnet-5"),
-        RuntimePlanKind::ClaudeOverride => agent_binding(Some(CLAUDE_ANTHROPIC), "claude-sonnet-5"),
+        RuntimePlanKind::ClaudeOverride => {
+            agent_binding(Some(claude_anthropic()), "claude-sonnet-5")
+        }
         RuntimePlanKind::Pi => agent_binding(None, "claude-sonnet-5"),
     };
     let mut nodes = BTreeMap::from([
@@ -82,26 +87,15 @@ pub(super) fn runtime(kind: RuntimePlanKind) -> RuntimePlan {
             agent_binding(Some(lane), "claude-sonnet-5"),
         );
     }
-    match kind {
+    let lane = match kind {
         RuntimePlanKind::Codex
         | RuntimePlanKind::ClaudeOverride
         | RuntimePlanKind::ClaudeReviewer
-        | RuntimePlanKind::CopilotReviewer => RuntimePlan::Codex {
-            provider: CodexProvider::OpenAi,
-            size: RunSize::Medium,
-            nodes,
-        },
-        RuntimePlanKind::Claude => RuntimePlan::Claude {
-            provider: ClaudeProvider::Anthropic,
-            size: RunSize::Medium,
-            nodes,
-        },
-        RuntimePlanKind::Pi => RuntimePlan::Pi {
-            provider: crate::native_v2_contract::PiProvider::Anthropic,
-            size: RunSize::Medium,
-            nodes,
-        },
-    }
+        | RuntimePlanKind::CopilotReviewer => codex_openai(),
+        RuntimePlanKind::Claude => claude_anthropic(),
+        RuntimePlanKind::Pi => RuntimeLane::new("pi", "anthropic").assert_value(),
+    };
+    RuntimePlan::new(lane, RunSize::Medium, nodes)
 }
 
 pub(super) fn shipping_graph(kind: RuntimePlanKind) -> GraphSpec {
@@ -221,6 +215,8 @@ pub(super) fn candidate_config(
     github: Arc<ScriptedGitHub>,
 ) -> NativeV2CandidateConfig {
     NativeV2CandidateConfig {
+        active_memory: None,
+        comment_delivery: None,
         lanes: runtime(kind)
             .lanes()
             .into_iter()
@@ -232,6 +228,7 @@ pub(super) fn candidate_config(
                 delivery_run_id: RunId::new("candidate-fixture"),
                 adopt_existing_delivery: false,
                 git_identity: None,
+                commit_identity: None,
                 workspace: repository.workspace.clone(),
                 git_program: PathBuf::from("/usr/bin/git"),
                 target: DeliveryTarget::new("acme/project", "main", repository.base.clone())
@@ -244,67 +241,50 @@ pub(super) fn candidate_config(
     }
 }
 
+pub(super) fn as_local(mut config: NativeV2CandidateConfig) -> NativeV2CandidateConfig {
+    for harness in &mut config.lanes {
+        harness.context.host = crate::harnesses::HarnessHost::Local {
+            home: None,
+            environment: Default::default(),
+        };
+    }
+    config
+}
+
+pub(super) fn local_candidate_config(
+    kind: RuntimePlanKind,
+    repository: &TempRepository,
+    github: Arc<ScriptedGitHub>,
+) -> NativeV2CandidateConfig {
+    as_local(candidate_config(kind, repository, github))
+}
+
 pub(super) fn harness_config(
     lane: RuntimeLane,
     repository: &TempRepository,
 ) -> NativeV2HarnessConfig {
-    let pool = HostedProcessPool::new(10_002, 10_002, 20_000).assert_value_with("pool");
-    match lane {
-        RuntimeLane::Copilot { .. } => NativeV2HarnessConfig::Copilot(CopilotConfig {
+    let runtime_home = repository
+        .root
+        .child(&format!("{}-runtime", lane.harness_name()));
+    crate::harnesses::HarnessRegistry::core()
+        .configure(crate::harnesses::HarnessBuildContext {
+            lane,
             executable: PathBuf::from("/usr/bin/false"),
             workspace: repository.workspace.clone(),
-            runtime_home: repository.root.child("copilot-runtime"),
-            local_user: None,
+            runtime_home,
+            prefix_arguments: Vec::new(),
+            search_path: "/usr/bin:/bin".to_owned(),
             base_environment: BTreeMap::new(),
-            local_command_environment: BTreeMap::new(),
-            search_path: "/usr/bin:/bin".to_owned(),
-            process_pool: pool,
-        }),
-        RuntimeLane::Codex { provider } => NativeV2HarnessConfig::Codex(NativeV2CodexConfig {
-            base_environment: Default::default(),
-            provider,
-            executable: PathBuf::from("/usr/bin/false"),
-            workspace: repository.workspace.clone(),
-            runtime_home: repository.root.child("codex-home"),
-            local_user: None,
-            native_environment: Default::default(),
-            search_path: "/usr/bin:/bin".to_owned(),
-            process_pool: pool,
-        }),
-        RuntimeLane::Claude { provider } => NativeV2HarnessConfig::Claude(ClaudeAdapterConfig {
-            provider,
-            executable: "/usr/bin/false".to_owned(),
-            prefix_arguments: Vec::new(),
-            workspace: repository.workspace.clone(),
-            runtime_home: repository.root.child("claude-runtime"),
-            local_user_home: None,
-            native_environment: Default::default(),
-            base_environment: ClaudeProcessEnvironment::new(BTreeMap::from([
-                (
-                    "HOME".to_owned(),
-                    repository.root.path().to_string_lossy().into_owned(),
-                ),
-                ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
-            ]))
-            .assert_value_with("Claude environment"),
-            process_pool: pool,
-        }),
-        RuntimeLane::Pi { provider } => NativeV2HarnessConfig::Pi(PiConfig {
-            provider,
-            executable: "/usr/bin/false".to_owned(),
-            prefix_arguments: Vec::new(),
-            workspace: repository.workspace.clone(),
-            runtime_home: repository.root.child("pi-runtime"),
-            local_user_home: None,
-            native_environment: Default::default(),
-            base_environment: PiProcessEnvironment::default(),
-            process_pool: pool,
-        }),
-    }
+            host: crate::harnesses::HarnessHost::Contained {
+                process_pool: HostedProcessPool::new(10_002, 10_002, 20_000)
+                    .assert_value_with("pool"),
+            },
+        })
+        .assert_value_with("registered harness configuration")
 }
 
 pub(super) async fn wait_for_terminal(
-    controller: &NativeV2CloudController,
+    controller: &NativeV2PlatformController,
     run_id: &RunId,
 ) -> TerminalResult {
     tokio::time::timeout(Duration::from_secs(5), async {

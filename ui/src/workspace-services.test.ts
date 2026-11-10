@@ -66,6 +66,39 @@ test('incompatible or unidentified workspaces fail before profile data can be re
   }
 });
 
+test('bootstrap accepts the platform workspace tag and rejects its retired spelling', () => {
+  const value = {
+    ...bootstrap(),
+    workspace: { kind: 'platform', id: 'cloud:user-a:org-a:user' },
+  };
+  assert.deepEqual(readBootstrap(value), value);
+  assert.throws(
+    () => readBootstrap({ ...value, workspace: { ...value.workspace, kind: 'cloud' } }),
+    (cause: unknown) => cause instanceof ApiError && cause.code === 'invalid_bootstrap'
+  );
+});
+
+test('bootstrap accepts host harness metadata and rejects malformed adapter choices', () => {
+  const value = {
+    ...bootstrap(),
+    harnesses: [{ id: 'opencode', label: 'OpenCode', providers: ['openai', 'anthropic'] }],
+  };
+  assert.deepEqual(readBootstrap(value), value);
+  for (const harnesses of [
+    null,
+    'opencode',
+    [null],
+    [{ id: '', label: 'OpenCode', providers: ['openai'] }],
+    [{ id: 'opencode', label: '', providers: ['openai'] }],
+    [{ id: 'opencode', label: 'OpenCode', providers: [5] }],
+  ]) {
+    assert.throws(
+      () => readBootstrap({ ...value, harnesses }),
+      (cause: unknown) => cause instanceof ApiError && cause.code === 'invalid_bootstrap'
+    );
+  }
+});
+
 test('profile and history services remain on the injected mount and forward cancellation', async () => {
   const requests: { url: string; init?: RequestInit }[] = [];
   const fetcher: typeof fetch = async (url, init) => {
@@ -293,4 +326,36 @@ test('an old save cannot acknowledge a newly opened document, even when its cont
       ),
     /different profile/
   );
+});
+
+test('host machine metadata is bounded, unique and explicit without inventing local resources', () => {
+  const machine = {
+    size: 'large',
+    label: 'Large',
+    vcpus: 4,
+    memoryMiB: 16384,
+    diskGiB: 128,
+    laneUnits: 2,
+    gpu: null,
+  };
+  const value = { ...bootstrap(), machines: [machine] };
+  assert.deepEqual(readBootstrap(value), value);
+  assert.deepEqual(readBootstrap({ ...value, machines: [] }).machines, []);
+  for (const machines of [
+    null,
+    'large',
+    [null],
+    [machine, machine],
+    [{ ...machine, size: '' }],
+    [{ ...machine, label: 'Large\n' }],
+    [{ ...machine, laneUnits: 0 }],
+    [{ ...machine, vcpus: 1.5 }],
+    [{ ...machine, memoryMiB: Number.MAX_SAFE_INTEGER + 1 }],
+    [{ ...machine, gpu: { name: 'T4', memoryMiB: -1 } }],
+  ]) {
+    assert.throws(
+      () => readBootstrap({ ...value, machines }),
+      (cause: unknown) => cause instanceof ApiError && cause.code === 'invalid_bootstrap'
+    );
+  }
 });

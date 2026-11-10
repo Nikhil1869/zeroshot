@@ -2,7 +2,7 @@
 
 mod native_v2_target;
 
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 
 use thiserror::Error;
@@ -10,12 +10,13 @@ use zeroshot_engine::native_v2_cli::local::{LOCAL_CONTROLLER_MODE, LocalCliBacke
 use zeroshot_engine::native_v2_cli::oecp::NamedTargetCliBackend;
 use zeroshot_engine::native_v2_cli::{
     execute_native_v2_cli, parse_native_v2_args, try_execute_native_v2_preflight, serve_local_acp,
-    try_execute_native_v2_static, AcpServeError, CtrlCDetachSignal, NativeV2CliBackend,
-    NativeV2CliCommand, NativeV2CliDiagnostic, NativeV2CliError, ERROR_FORMAT_ENV,
-    JSON_ERROR_FORMAT,
+    try_execute_native_v2_static_with_terminal, AcpServeError, CtrlCDetachSignal,
+    NativeV2CliBackend, NativeV2CliCommand, NativeV2CliDiagnostic, NativeV2CliError,
+    ERROR_FORMAT_ENV, JSON_ERROR_FORMAT,
 };
 use zeroshot_engine::native_v2_portable_controller::{
-    PortableControllerError, guard_controller_process, run_controller_process,
+    PortableControllerError, guard_controller_process, record_unloaded_startup_failure,
+    run_controller_process,
 };
 
 use native_v2_target::{
@@ -66,7 +67,10 @@ async fn run_private_controller(arguments: &[std::ffi::OsString]) -> Result<bool
     let Some(bootstrap) = private_controller_bootstrap(arguments)? else {
         return Ok(false);
     };
-    guard_controller_process()?;
+    if let Err(error) = guard_controller_process() {
+        record_unloaded_startup_failure(&bootstrap, &error);
+        return Err(error.into());
+    }
     run_controller_process(&bootstrap).await?;
     Ok(true)
 }
@@ -74,14 +78,15 @@ async fn run_private_controller(arguments: &[std::ffi::OsString]) -> Result<bool
 async fn run_public_command(command: NativeV2CliCommand) -> Result<(), ProcessError> {
     let stdout = std::io::stdout();
     let mut output = stdout.lock();
-    execute_public_command(command, &mut output).await
+    execute_public_command(command, &mut output, stdout.is_terminal()).await
 }
 
 async fn execute_public_command(
     command: NativeV2CliCommand,
     output: &mut impl Write,
+    is_terminal: bool,
 ) -> Result<(), ProcessError> {
-    if try_execute_native_v2_static(&command, output)?.is_some() {
+    if try_execute_native_v2_static_with_terminal(&command, output, is_terminal)?.is_some() {
         return Ok(());
     }
     if try_execute_native_v2_preflight(&command, output)
@@ -187,8 +192,25 @@ fn private_controller_bootstrap(
     Ok(arguments.get(2).cloned().map(PathBuf::from))
 }
 
+fn main() {
+    let arguments: Vec<_> = std::env::args_os().skip(1).collect();
+    if arguments
+        .first()
+        .is_some_and(|arg| arg == "__active-memory-hook")
+    {
+        if let [_, capability] = arguments.as_slice() {
+            // This hot path avoids starting Tokio's worker pool for each tool signal.
+            let _ = zeroshot_engine::native_v2_cli::run_active_memory_hook(std::path::Path::new(
+                capability,
+            ));
+        }
+        return;
+    }
+    main_runtime();
+}
+
 #[tokio::main]
-async fn main() {
+async fn main_runtime() {
     if let Err(error) = run().await {
         write_process_error(&error);
         std::process::exit(1);

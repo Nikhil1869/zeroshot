@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
+use openengine_cluster_protocol::FailureDiagnosticKind;
 
 use crate::execution::{SessionScope, WorkspaceAccessMode};
 use crate::execution::process::{
@@ -19,11 +20,13 @@ use crate::native_v2_runner::{
 };
 use crate::worker_catalog::ReasoningEffort;
 
+mod context;
+pub(crate) use context::{apply_execution_environment, is_execution_environment_name};
+
 mod environment;
 pub(crate) use environment::{
-    CLAUDE_LOCAL_ENVIRONMENT, CODEX_LOCAL_ENVIRONMENT, COPILOT_LOCAL_ENVIRONMENT,
-    PI_LOCAL_ENVIRONMENT, LocalHarnessEnvironment, current_process_environment,
-    provider_redactions, merge_local_environment, extend_declared_environment,
+    LocalHarnessEnvironment, current_process_environment, extend_declared_environment,
+    merge_local_environment, private_local_values, provider_redactions,
 };
 pub(crate) mod text;
 pub(crate) mod turn;
@@ -75,7 +78,7 @@ pub(crate) fn agent_workspace_access(
 ) -> Result<WorkspaceAccessMode, NodeRunnerError> {
     match role {
         NodeRole::Worker | NodeRole::Verifier => Ok(WorkspaceAccessMode::ReadWrite),
-        NodeRole::GitDelivery => Err(NodeRunnerError::Driver),
+        NodeRole::GitDelivery | NodeRole::CommentDelivery => Err(NodeRunnerError::Driver),
     }
 }
 
@@ -194,8 +197,19 @@ pub(crate) async fn open_provider_process(
     command: ProcessSessionCommand,
     control: &DriverControl,
 ) -> Result<Result<ProviderProcess, ProcessRunnerError>, NodeRunnerError> {
+    open_provider_process_with_cancellation(files, command, control, control.cancellation()).await
+}
+
+/// Adapters with native detached jobs first request and confirm native cleanup, then trip their
+/// bounded kill signal. Other adapters retain the ordinary immediate cancellation behavior.
+pub(crate) async fn open_provider_process_with_cancellation(
+    files: Arc<ProviderExecutionFiles>,
+    command: ProcessSessionCommand,
+    control: &DriverControl,
+    cancellation: crate::execution::driver::DriverCancellation,
+) -> Result<Result<ProviderProcess, ProcessRunnerError>, NodeRunnerError> {
     files.begin_process();
-    match files.runner.open(command, control.cancellation()).await {
+    match files.runner.open(command, cancellation).await {
         Ok(process) => Ok(Ok(ProviderProcess::new(process, files))),
         Err(error) => {
             if error.launch_evidence() == ProcessLaunchEvidence::MayHaveStarted {
@@ -238,6 +252,44 @@ macro_rules! impl_provider_node_session {
 }
 
 pub(crate) use impl_provider_node_session;
+
+/// Agent sessions share role admission while each adapter constructs its native session state.
+macro_rules! impl_provider_session_factory {
+    ($adapter:ty, $session:expr) => {
+        #[async_trait::async_trait]
+        impl crate::native_v2_runner::SessionFactory for $adapter {
+            async fn open(
+                &self,
+                invocation: &crate::native_v2_contract::NodeInvocation,
+                _environment: &crate::native_v2_runner::ResolvedEnvironment,
+            ) -> Result<
+                std::sync::Arc<dyn crate::native_v2_runner::NodeSession>,
+                crate::native_v2_runner::NodeRunnerError,
+            > {
+                if !matches!(
+                    invocation.binding,
+                    crate::native_v2_contract::NodeRuntimeBinding::Agent { .. }
+                ) {
+                    return Err(crate::native_v2_runner::NodeRunnerError::SessionOpen);
+                }
+                Ok(std::sync::Arc::new($session))
+            }
+        }
+    };
+}
+
+pub(crate) use impl_provider_session_factory;
+
+/// Drivers resolve only the session type owned by their admitted lane's factory.
+pub(crate) fn invocation_session<T: crate::native_v2_runner::NodeSession>(
+    invocation: &DriverInvocation,
+) -> Result<&T, NodeRunnerError> {
+    invocation
+        .session
+        .as_any()
+        .downcast_ref::<T>()
+        .ok_or(NodeRunnerError::Driver)
+}
 
 #[derive(Clone, Copy)]
 pub(crate) enum ClosedSessionFailure {
@@ -326,7 +378,7 @@ pub(crate) fn process_scope(
         (NodeRole::Verifier, SessionScope::Execution) => {
             Ok(HostedProcessScope::VerifierExecution(execution))
         }
-        (NodeRole::GitDelivery, _) => Err(NodeRunnerError::Driver),
+        (NodeRole::GitDelivery | NodeRole::CommentDelivery, _) => Err(NodeRunnerError::Driver),
     }
 }
 
@@ -361,9 +413,18 @@ pub(crate) fn process_failure_context(
     if output.cancelled || externally_cancelled {
         return Err(NodeRunnerError::Cancelled);
     }
+    Ok(process_failure_evidence(output, provider_output_failed))
+}
+
+/// Captured process facts remain useful when cleanup fails, even after cancellation.
+/// This only formats evidence; callers still own cancellation and cleanup classification.
+pub(crate) fn process_failure_evidence(
+    output: &ProcessSessionOutput,
+    provider_output_failed: bool,
+) -> Option<ProviderProcessFailure> {
     let mut failures = process_failure_reasons(output);
     if failures.is_empty() && !provider_output_failed {
-        return Ok(None);
+        return None;
     }
     let kind = if failures.is_empty() {
         ProviderProcessFailureKind::Stderr
@@ -375,10 +436,10 @@ pub(crate) fn process_failure_context(
         &output.stderr_tail,
         output.stderr_tail_truncated,
     );
-    Ok((!failures.is_empty()).then(|| ProviderProcessFailure {
+    (!failures.is_empty()).then(|| ProviderProcessFailure {
         kind,
         detail: failures.join("; "),
-    }))
+    })
 }
 
 fn process_failure_reasons(output: &ProcessSessionOutput) -> Vec<String> {
@@ -511,9 +572,17 @@ impl ProviderFailureRetry {
     pub(crate) async fn report_correction(
         &self,
         control: &DriverControl,
-        error: &NodeRunnerError,
+        response: &crate::native_v2_runner::AgentResponse,
+        terminal: bool,
     ) -> Result<(), NodeRunnerError> {
-        report_provider_error(self.provider, error, &self.redactions, control).await
+        if let Some(error) = response.correction_error()
+            && let Some(mut output) =
+                provider_error_output(self.provider, &error, &self.redactions)?
+        {
+            output.diagnostic = terminal.then_some(FailureDiagnosticKind::Failure);
+            control.emit(output).await?;
+        }
+        Ok(())
     }
 }
 
@@ -524,15 +593,39 @@ pub(crate) async fn report_provider_error(
     redactions: &[String],
     control: &DriverControl,
 ) -> Result<(), NodeRunnerError> {
+    if let Some(output) = provider_error_output(provider, error, redactions)? {
+        control.emit(output).await?;
+    }
+    Ok(())
+}
+
+/// Cleanup failure must settle even if its durable consumer has stopped reading.
+pub(crate) async fn report_cleanup_failure(control: &DriverControl, diagnostic: String) {
+    let publication = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        control.emit(LiveOutput::diagnostic(
+            FailureDiagnosticKind::Failure,
+            diagnostic,
+        )),
+    )
+    .await;
+    if !matches!(publication, Ok(Ok(()))) {
+        control.mark_diagnostics_incomplete();
+    }
+}
+
+pub(crate) fn provider_error_output(
+    provider: &str,
+    error: &NodeRunnerError,
+    redactions: &[String],
+) -> Result<Option<LiveOutput>, NodeRunnerError> {
     let detail = match error {
         NodeRunnerError::Driver => None,
         NodeRunnerError::DriverDetail(detail) => Some(detail.as_str()),
-        _ => return Ok(()),
+        _ => return Ok(None),
     };
     let diagnostic = provider_failure_diagnostic(provider, detail, None, redactions);
-    control
-        .emit(LiveOutput::new(LiveOutputStream::Error, diagnostic)?)
-        .await
+    LiveOutput::new(LiveOutputStream::Error, diagnostic).map(Some)
 }
 
 pub(crate) fn redaction_values<'a>(values: impl Iterator<Item = &'a str>) -> Vec<String> {

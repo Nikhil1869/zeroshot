@@ -1,3 +1,4 @@
+mod comment;
 mod environment_hooks;
 use environment_hooks::HookContext;
 mod identity_leases;
@@ -22,22 +23,21 @@ use tokio::sync::{Mutex, watch};
 use crate::execution::process::{HostedProcessIdentity, HostedProcessPool, HostedProcessScope};
 use crate::native_v2_admission::writer_nodes;
 use crate::native_v2_candidate::{
-    NativeV2CandidateConfig, NativeV2CandidateDelivery, build_native_v2_candidate_with_github_token,
+    NativeV2CandidateConfig, NativeV2CandidateCommentDelivery, NativeV2CandidateDelivery,
+    build_native_v2_candidate_with_github_token,
 };
-use crate::source_code_provider::adapters::core::{SourceDeliveryFactoryRequest, delivery_authority};
+use crate::source_code_provider::adapters::core::SourceDeliveryFactoryRequest;
 use crate::native_v2_capsule::{
     CapsuleFilesystem, CapsuleFilesystemSpec, NativeCapsuleNodeEndpoint, RemoteCapsuleNodeRunner,
     prepare_capsule_filesystem,
 };
-use crate::native_v2_claude::ClaudeProcessEnvironment;
-use crate::native_v2_cloud::{
+use crate::native_v2_platform::{
     AllocatedCapsule, CapsuleAllocationRequest, CapsuleAllocationUnavailable, CapsuleAllocator,
     CapsuleCleanup, CapsulePreparation, CapsuleCleanupUnavailable, CapsuleDestroyed,
     ControllerClaimUnavailable, ExclusiveControllerClaim, RetainedAllocationRequest,
     RetainedAllocationUnavailable,
 };
 use crate::native_v2_contract::AdmittedRun;
-use crate::native_v2_pi::PiProcessEnvironment;
 use crate::native_v2_delivery::{DeliveryLineage, NativeV2DeliveryConfig};
 use crate::native_v2_portable_controller::WorkspaceIdentity;
 use crate::native_v2_supervisor::RunRuntimeExit;
@@ -48,30 +48,12 @@ use crate::native_v2_target_authority::OperatorDiagnosticStore;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    HostedWorkspace, HostedWorkspaceRequest, HostedWorkspaceStorage, ProductionHostingError,
+    HostedWorkspace, HostedWorkspaceRequest, ProductionHostingConfig, ProductionHostingError,
     set_traversable_directory,
 };
 use super::environment::{self, EnvironmentProcesses, HookPhase};
 use super::repository::{RepositoryInstall, install_repository, production_source};
 use identity_leases::{ActiveRunProcessPool, ActiveRunProcessPools};
-
-pub(super) struct ProductionCapsuleConfig {
-    pub storage_root: PathBuf,
-    pub copilot_executable: PathBuf,
-    pub codex_executable: PathBuf,
-    pub claude_executable: String,
-    pub claude_prefix_arguments: Vec<String>,
-    pub claude_process_environment: ClaudeProcessEnvironment,
-    pub pi_executable: String,
-    pub pi_prefix_arguments: Vec<String>,
-    pub pi_process_environment: PiProcessEnvironment,
-    pub executable_search_path: String,
-    pub git_program: PathBuf,
-    pub gh_program: PathBuf,
-    pub process_pool: HostedProcessPool,
-    pub operator_diagnostics: Arc<OperatorDiagnosticStore>,
-    pub workspace_storage: Option<Arc<dyn HostedWorkspaceStorage>>,
-}
 
 type FilesystemPreparer =
     fn(&Path, &Path, HostedProcessPool) -> Result<CapsuleFilesystem, CapsuleAllocationUnavailable>;
@@ -100,6 +82,7 @@ struct CapsuleBuildRequest<'a> {
     admitted: &'a AdmittedRun,
     github_token: Option<&'a str>,
     git_credentials: Option<&'a GitTransportCredentials>,
+    commit_identity: Option<&'a openengine_cluster_protocol::CommitIdentity>,
     install_source: bool,
     transfer_retained_workspace: bool,
     preparation: CapsulePreparation,
@@ -166,7 +149,8 @@ struct CleanupRunRequest<'a> {
 }
 
 pub(super) struct ProductionCapsuleAllocator {
-    config: Arc<ProductionCapsuleConfig>,
+    config: Arc<ProductionHostingConfig>,
+    operator_diagnostics: Arc<OperatorDiagnosticStore>,
     process_pools: ActiveRunProcessPools,
     active: Arc<Mutex<BTreeMap<RunId, Arc<ProductionCapsuleState>>>>,
     allocated: Mutex<BTreeSet<RunId>>,
@@ -177,7 +161,10 @@ pub(super) struct ProductionCapsuleAllocator {
 }
 
 impl ProductionCapsuleAllocator {
-    pub fn new(config: ProductionCapsuleConfig) -> Result<Self, ProductionHostingError> {
+    pub fn new(
+        config: Arc<ProductionHostingConfig>,
+        operator_diagnostics: Arc<OperatorDiagnosticStore>,
+    ) -> Result<Self, ProductionHostingError> {
         if config.copilot_executable.as_os_str().is_empty()
             || config.codex_executable.as_os_str().is_empty()
             || config.claude_executable.is_empty()
@@ -192,7 +179,8 @@ impl ProductionCapsuleAllocator {
         reconcile_retained_allocations(&config.storage_root)
             .map_err(|_| ProductionHostingError::CapsuleConfiguration)?;
         Ok(Self {
-            config: Arc::new(config),
+            config,
+            operator_diagnostics,
             process_pools,
             active: Arc::new(Mutex::new(BTreeMap::new())),
             allocated: Mutex::new(BTreeSet::new()),
@@ -212,6 +200,7 @@ impl ProductionCapsuleAllocator {
             admitted,
             github_token,
             git_credentials,
+            commit_identity,
             preparation,
         } = request;
         let allocation = self
@@ -222,6 +211,7 @@ impl ProductionCapsuleAllocator {
                 admitted,
                 github_token,
                 git_credentials,
+                commit_identity,
                 install_source: true,
                 transfer_retained_workspace: false,
                 preparation,
@@ -367,15 +357,17 @@ impl ProductionCapsuleAllocator {
                 paths,
             },
         )
+        .await
     }
 
-    fn finish_capsule(
+    async fn finish_capsule(
         &self,
         pending: PendingCapsule<'_>,
         request: &CapsuleBuildRequest<'_>,
         prepared: PreparedCapsule,
     ) -> Result<AllocatedCapsule, CapsuleAllocationUnavailable> {
         let delivery = self.candidate_delivery(request, &pending, &prepared)?;
+        let comment_delivery = self.candidate_comment_delivery(request, &pending, &prepared)?;
         let PendingCapsule {
             run_id,
             state,
@@ -387,9 +379,26 @@ impl ProductionCapsuleAllocator {
             hosted_workspace,
             ..
         } = prepared;
+        let memory = crate::active_memory::runtime::PreparedActiveMemory::prepare_hosted(
+            crate::active_memory::runtime::MemoryPreparation {
+                admitted: request.admitted,
+                workspace: &filesystem.workspace,
+                storage: self.config.memory_storage.as_deref(),
+            },
+            self.config.memory_backend.clone(),
+            run_id,
+        )
+        .await;
+        let hooks = memory
+            .as_ref()
+            .ok()
+            .and_then(|memory| memory.as_ref())
+            .map(|memory| memory.hooks.clone());
         let candidate = build_native_v2_candidate_with_github_token(
             request.admitted,
             NativeV2CandidateConfig {
+                active_memory: hooks,
+                comment_delivery,
                 lanes: self.lanes(request.admitted, &filesystem, active_process_pool)?,
                 workspace: filesystem.workspace.clone(),
                 delivery,
@@ -397,10 +406,20 @@ impl ProductionCapsuleAllocator {
             request.github_token.map(Arc::<str>::from),
         )
         .map_err(|_| CapsuleAllocationUnavailable::Runtime)?;
+        let candidate = candidate.with_agent_context(self.config.agent_context.clone());
+        let candidate: Arc<dyn crate::native_v2_runner::NodeRunner> = match memory {
+            Ok(Some(memory)) => memory.wrap(request.admitted, candidate),
+            Ok(None) => Arc::new(candidate),
+            Err(_) => crate::active_memory::runtime::unavailable_memory(Arc::new(candidate)),
+        };
+        let postmortem = candidate.postmortem();
         let workspace_identity = WorkspaceIdentity::capture(&filesystem.workspace)
             .map_err(|_| CapsuleAllocationUnavailable::Runtime)?;
-        let endpoint = Arc::new(NativeCapsuleNodeEndpoint::new(Arc::new(candidate)));
-        let runner = Arc::new(RemoteCapsuleNodeRunner::new(endpoint.clone()));
+        let endpoint = Arc::new(NativeCapsuleNodeEndpoint::new(candidate));
+        let runner = crate::active_memory::runtime::attach_postmortem(
+            Arc::new(RemoteCapsuleNodeRunner::new(endpoint.clone())),
+            postmortem,
+        );
         state
             .endpoint
             .set(endpoint)
@@ -450,24 +469,9 @@ impl ProductionCapsuleAllocator {
                 .ok_or(CapsuleAllocationUnavailable::Runtime)?;
             let target = crate::native_v2_delivery::source_target(source, mode)
                 .map_err(|_| CapsuleAllocationUnavailable::Runtime)?;
-            let authority = delivery_authority(SourceDeliveryFactoryRequest {
-                source,
-                workspace: &prepared.filesystem.workspace,
-                git_program: &self.config.git_program,
-                gh_program: &self.config.gh_program,
-                home_directory: &prepared.paths.runtime_home,
-                private_directory: &prepared.paths.runtime_home,
-                git_identity: Some(pending.git_identity),
-                local_environment: None,
-                required_capabilities: &capabilities,
-                operator_diagnostics: Some((
-                    request.run_id.clone(),
-                    self.config.operator_diagnostics.clone(),
-                )),
-            })
-            .map_err(|_| CapsuleAllocationUnavailable::Runtime)?;
-            Ok(Some(NativeV2CandidateDelivery {
-                config: NativeV2DeliveryConfig::for_hosted_workspace(
+            let config = NativeV2DeliveryConfig {
+                commit_identity: request.commit_identity.cloned(),
+                ..NativeV2DeliveryConfig::for_hosted_workspace(
                     DeliveryLineage::new(
                         delivery_run_id.clone(),
                         request.adopt_existing_delivery || delivery_run_id != pending.run_id,
@@ -475,10 +479,29 @@ impl ProductionCapsuleAllocator {
                     prepared.filesystem.workspace.clone(),
                     target,
                     pending.git_identity,
-                ),
-                authority,
-                git_credentials: request.git_credentials.cloned(),
-            }))
+                )
+            };
+            NativeV2CandidateDelivery::new(
+                config,
+                SourceDeliveryFactoryRequest {
+                    source,
+                    workspace: &prepared.filesystem.workspace,
+                    git_program: &self.config.git_program,
+                    gh_program: &self.config.gh_program,
+                    home_directory: &prepared.paths.runtime_home,
+                    private_directory: &prepared.paths.runtime_home,
+                    git_identity: Some(pending.git_identity),
+                    local_environment: None,
+                    required_capabilities: &capabilities,
+                    operator_diagnostics: Some((
+                        request.run_id.clone(),
+                        self.operator_diagnostics.clone(),
+                    )),
+                },
+                request.git_credentials.cloned(),
+            )
+            .map(Some)
+            .map_err(|_| CapsuleAllocationUnavailable::Runtime)
         }
     }
 
@@ -509,6 +532,7 @@ impl ProductionCapsuleAllocator {
             return Ok(prepared);
         }
         Ok(HostedWorkspace {
+            comment_publications: None,
             checkpoints: Arc::new(
                 ResticCheckpointStore::new(
                     directory.clone(),
@@ -566,7 +590,10 @@ impl ProductionCapsuleAllocator {
             return Ok(());
         }
         let source = self.repository_source(resolved);
+        let references = crate::native_v2_review::checkout_references(request.admitted)
+            .map_err(|_| CapsuleAllocationUnavailable::SourceCheckout)?;
         install_repository(RepositoryInstall {
+            checkout_references: &references,
             git_program: &self.config.git_program,
             source: &source,
             resolved,
@@ -580,7 +607,7 @@ impl ProductionCapsuleAllocator {
         .await
         .map(|_| ())
         .map_err(|error| {
-            error.record_diagnostic(request.run_id, &self.config.operator_diagnostics);
+            error.record_diagnostic(request.run_id, &self.operator_diagnostics);
             CapsuleAllocationUnavailable::SourceCheckout
         })
     }
@@ -818,6 +845,7 @@ impl CapsuleAllocator for ProductionCapsuleAllocator {
             admitted,
             github_token,
             git_credentials,
+            commit_identity,
             preparation,
         } = request;
         self.validate_retained_selection(source_run_id, &selection)?;
@@ -833,6 +861,7 @@ impl CapsuleAllocator for ProductionCapsuleAllocator {
                 admitted,
                 github_token,
                 git_credentials,
+                commit_identity,
                 install_source: false,
                 transfer_retained_workspace: true,
                 preparation,

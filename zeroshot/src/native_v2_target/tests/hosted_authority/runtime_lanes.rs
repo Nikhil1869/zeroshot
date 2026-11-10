@@ -196,6 +196,82 @@ fn lane_free_binding() -> Value {
     json!({"kind": "agent", "model": "opaque-model"})
 }
 
+fn decision_binding() -> Value {
+    json!({
+        "kind":"decision", "api":"systemone", "model":"caller/model",
+        "minProbability":0.85, "uncertainLabel":"uncertain",
+        "connections":{"decisions":["DECISION_ENDPOINT","DECISION_API_KEY"]}
+    })
+}
+
+#[tokio::test]
+async fn decision_submission_checks_the_exact_marker_after_only_direct_discovery() {
+    for marker in [
+        None,
+        Some("openengine.decision-models/v2"),
+        Some("openengine.decision-models/v1"),
+    ] {
+        let root = temp_root();
+        let target = RecordingTarget::spawn(move |request, origin, token| {
+            if (request.method.as_str(), request.path.as_str()) != DISCOVERY {
+                return direct_without_marker(request, origin, token);
+            }
+            let mut document = TargetDiscoveryDocument::direct(TargetAuthentication::None);
+            if let Some(kind) = marker {
+                document = document.with_decision_models();
+                document
+                    .extensions
+                    .decision_models
+                    .as_mut()
+                    .assert_value()
+                    .kind = kind.to_owned();
+            }
+            ("200 OK", serde_json::to_string(&document).assert_value())
+        })
+        .await;
+        let authority = test_http_authority(root.path("refresh-locks"));
+        let result = authority
+            .submit(
+                &direct_target(target.origin.clone()),
+                &run_request(decision_binding()),
+            )
+            .await;
+        if marker == Some("openengine.decision-models/v1") {
+            result.assert_value();
+            assert_eq!(routes(&target.stop()), [DISCOVERY, RUN]);
+        } else {
+            assert!(
+                result
+                    .assert_error()
+                    .to_string()
+                    .contains("openengine.decision-models/v1")
+            );
+            assert_eq!(routes(&target.stop()), [DISCOVERY]);
+        }
+    }
+}
+
+#[tokio::test]
+async fn unsupported_decisions_send_neither_hosted_tokens_nor_profile_or_run_bodies() {
+    for profile in [false, true] {
+        let (_root, target, record, authority) =
+            hosted_authority_with(HostedCapability::Lanes(false)).await;
+        let error = if profile {
+            authority
+                .profile_set(&record, profile_request(decision_binding()))
+                .await
+                .assert_error()
+        } else {
+            authority
+                .submit(&record, &run_request(decision_binding()))
+                .await
+                .assert_error()
+        };
+        assert!(error.to_string().contains("openengine.decision-models/v1"));
+        assert_eq!(routes(&target.stop()), [DISCOVERY, OAUTH_METADATA]);
+    }
+}
+
 fn run_request(worker: Value) -> TargetRunRequest {
     let mut request = exact_run_request();
     request.submission.runtime.nodes_mut().insert(
@@ -543,4 +619,125 @@ async fn supported_hosted_target_transmits_private_credentials_only_in_the_envel
     assert_eq!(body["gitCredentials"]["password"], "transport-secret");
     assert!(!body["submission"].to_string().contains("transport-secret"));
     assert!(!body["submission"].to_string().contains("private-user"));
+}
+
+#[path = "runtime_lanes/review.rs"]
+mod review;
+
+fn core_catalog_response(
+    request: &CapturedHttpRequest,
+    origin: &str,
+    tokens: &mut u8,
+) -> (&'static str, String) {
+    if (request.method.as_str(), request.path.as_str()) == DISCOVERY {
+        let mut document: Value =
+            serde_json::from_str(&hosted_lane_discovery(origin, true)).assert_value();
+        document["extensions"]["runtime_harnesses"] = json!({
+            "kind":openengine_cluster_protocol::RUNTIME_HARNESSES_KIND,
+            "lanes":[{"harness":"codex","provider":"openai"}]
+        });
+        return ("200 OK", document.to_string());
+    }
+    hosted_response(request, origin, tokens, true)
+}
+
+#[tokio::test]
+async fn unsupported_contribution_defaults_and_overrides_stop_before_oauth_or_request_bodies() {
+    for override_lane in [false, true] {
+        for store_profile in [false, true] {
+            let root = temp_root();
+            let target = RecordingTarget::spawn(core_catalog_response).await;
+            let (record, authority) = authenticated_authority(&root, &target.origin).await;
+            let mut request = run_request(if override_lane {
+                json!({"kind":"agent","lane":{"harness":"opencode","provider":"openai"},"model":"opaque-model"})
+            } else {
+                lane_free_binding()
+            });
+            if !override_lane {
+                request.submission.runtime.harness =
+                    openengine_cluster_protocol::HarnessId::new("opencode").assert_value();
+            }
+            let authority: &dyn TargetControlAuthority = &authority;
+            let error = if store_profile {
+                let mut profile = profile_request(lane_free_binding());
+                profile.runtime = request.submission.runtime;
+                authority.profile_set(&record, profile).await.assert_error()
+            } else {
+                authority.submit(&record, &request).await.assert_error()
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("target does not advertise runtime lane opencode/openai")
+            );
+            assert_eq!(routes(&target.stop()), [DISCOVERY, OAUTH_METADATA]);
+        }
+    }
+}
+
+async fn size_target(sizes: Option<Vec<openengine_cluster_protocol::RunSize>>) -> RecordingTarget {
+    RecordingTarget::spawn(move |request, origin, tokens| {
+        if (request.method.as_str(), request.path.as_str()) == DISCOVERY {
+            let mut document: Value =
+                serde_json::from_str(&hosted_discovery(origin)).assert_value();
+            if let Some(sizes) = &sizes {
+                document["extensions"]["run_sizes"] = json!({
+                    "kind": openengine_cluster_protocol::RUN_SIZES_KIND, "sizes": sizes
+                });
+            }
+            return ("200 OK", document.to_string());
+        }
+        hosted_response(request, origin, tokens, false)
+    })
+    .await
+}
+
+#[tokio::test]
+async fn unsupported_run_sizes_send_no_hosted_tokens_or_profile_or_run_bodies() {
+    use openengine_cluster_protocol::RunSize;
+    for size in [RunSize::Xl, RunSize::GpuT4] {
+        for profile in [false, true] {
+            let root = temp_root();
+            let target = size_target(None).await;
+            let (record, authority) = authenticated_authority(&root, &target.origin).await;
+            let error = if profile {
+                let mut request = profile_request(lane_free_binding());
+                request.runtime.size = size;
+                authority.profile_set(&record, request).await.assert_error()
+            } else {
+                let mut request = run_request(lane_free_binding());
+                request.submission.runtime.size = size;
+                authority.submit(&record, &request).await.assert_error()
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains(openengine_cluster_protocol::RUN_SIZES_KIND)
+            );
+            assert_eq!(routes(&target.stop()), [DISCOVERY, OAUTH_METADATA]);
+        }
+    }
+}
+
+#[tokio::test]
+async fn supported_run_sizes_preserve_the_selected_machine_in_the_hosted_request() {
+    use openengine_cluster_protocol::RunSize;
+    for size in [RunSize::Xl, RunSize::GpuT4] {
+        let root = temp_root();
+        let target = size_target(Some(vec![size])).await;
+        let (record, authority) = authenticated_authority(&root, &target.origin).await;
+        let mut request = run_request(lane_free_binding());
+        request.submission.runtime.size = size;
+        authority.submit(&record, &request).await.assert_value();
+        let requests = target.stop();
+        assert_eq!(
+            routes(&requests),
+            [DISCOVERY, OAUTH_METADATA, TOKEN, SESSION, RUN]
+        );
+        let body: Value = serde_json::from_str(&requests.last().assert_value().body).assert_value();
+        assert_eq!(
+            body["submission"]["runtime"]["size"],
+            serde_json::to_value(size).assert_value()
+        );
+    }
 }

@@ -3,13 +3,16 @@
 //! These values are deliberately separate from OECP JSON-RPC methods. HTTP submission is the
 //! only run-creation seam; OECP begins after a target has accepted the exact immutable run.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
 
 mod problem;
+mod run_sizes;
+
+pub use run_sizes::{RUN_SIZES_KIND, TargetRunSizesDiscovery};
 
 pub use problem::{
     MAX_TARGET_HTTP_PROBLEM_CODE_BYTES, MAX_TARGET_HTTP_PROBLEM_DETAILS_BYTES,
@@ -23,6 +26,7 @@ use crate::{
 
 pub const TARGET_DISCOVERY_PATH: &str = "/.well-known/zeroshot-native-v2";
 pub const TARGET_RUN_PATH: &str = "/native-v2/run";
+pub const TARGET_TASK_RESOLUTION_PATH: &str = "/native-v2/tasks/resolve";
 pub const TARGET_SESSION_PATH: &str = "/native-v2/oecp-session";
 pub const TARGET_OECP_PATH: &str = "/native-v2/oecp";
 pub const TARGET_PRIVATE_BOOTSTRAP_PATH: &str = "/native-v2/private-bootstrap";
@@ -234,6 +238,92 @@ pub struct TargetRunRequest {
     pub connection_resolver: Option<TargetConnectionResolver>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github_token: Option<String>,
+    /// Author and committer of every commit this run's delivery creates. Omission keeps the
+    /// target's default delivery identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_identity: Option<CommitIdentity>,
+}
+
+const MAX_COMMIT_IDENTITY_FIELD_BYTES: usize = 256;
+
+/// A host-selected Git author and committer for commits created by delivery. Each value has at
+/// most 256 UTF-8 bytes, no control characters, `<` or `>`, and at least one character that Git
+/// keeps after trimming whitespace and `.,:;"'\`.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(try_from = "CommitIdentityWire")]
+pub struct CommitIdentity {
+    name: String,
+    email: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct CommitIdentityWire {
+    #[schemars(
+        length(min = 1, max = 256),
+        regex(
+            pattern = r#"^[^\u0000-\u001F\u007F-\u009F<>]*[^\s\u0000-\u001F\u007F-\u009F<>.,:;"'\\][^\u0000-\u001F\u007F-\u009F<>]*$"#
+        )
+    )]
+    name: String,
+    #[schemars(
+        length(min = 1, max = 256),
+        regex(
+            pattern = r#"^[^\u0000-\u001F\u007F-\u009F<>]*[^\s\u0000-\u001F\u007F-\u009F<>.,:;"'\\][^\u0000-\u001F\u007F-\u009F<>]*$"#
+        )
+    )]
+    email: String,
+}
+
+impl CommitIdentity {
+    /// Validates one exact Git identity; see the type documentation for the bounds.
+    pub fn new(
+        name: impl Into<String>,
+        email: impl Into<String>,
+    ) -> Result<Self, NativeV2RunValueError> {
+        let (name, email) = (name.into(), email.into());
+        if !valid_commit_identity_field(&name) {
+            return Err(NativeV2RunValueError(
+                "commit identity name must be at most 256 bytes, free of control characters, '<' and '>', and not empty after Git trims it",
+            ));
+        }
+        if !valid_commit_identity_field(&email) {
+            return Err(NativeV2RunValueError(
+                "commit identity email must be at most 256 bytes, free of control characters, '<' and '>', and not empty after Git trims it",
+            ));
+        }
+        Ok(Self { name, email })
+    }
+
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[must_use]
+    pub fn email(&self) -> &str {
+        &self.email
+    }
+}
+
+impl TryFrom<CommitIdentityWire> for CommitIdentity {
+    type Error = NativeV2RunValueError;
+
+    fn try_from(wire: CommitIdentityWire) -> Result<Self, Self::Error> {
+        Self::new(wire.name, wire.email)
+    }
+}
+
+fn valid_commit_identity_field(value: &str) -> bool {
+    // Git trims these characters around identity values, so reject values with nothing left.
+    let ignored_by_git = |character: char| {
+        character.is_whitespace() || matches!(character, '.' | ',' | ':' | ';' | '"' | '\'' | '\\')
+    };
+    !value.trim_matches(ignored_by_git).is_empty()
+        && value.len() <= MAX_COMMIT_IDENTITY_FIELD_BYTES
+        && !value
+            .chars()
+            .any(|character| character.is_control() || matches!(character, '<' | '>'))
 }
 
 impl TargetRunRequest {
@@ -255,6 +345,7 @@ impl fmt::Debug for TargetRunRequest {
             .field("connection_resolver", &self.connection_resolver)
             .field("github_token", &redacted(&self.github_token))
             .field("git_credentials", &self.git_credentials)
+            .field("commit_identity", &self.commit_identity)
             .finish()
     }
 }
@@ -456,6 +547,14 @@ pub struct TargetWorkspaceRecoveryDiscovery {
     pub kind: String,
 }
 
+pub const DECISION_MODELS_KIND: &str = "openengine.decision-models/v1";
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TargetDecisionModelsDiscovery {
+    pub kind: String,
+}
+
 pub const NODE_RUNTIME_LANES_KIND: &str = "openengine.node-runtime-lanes/v1";
 
 /// Frozen at `{"kind": ...}` so older clients parse it; new data needs a new extension key.
@@ -463,6 +562,60 @@ pub const NODE_RUNTIME_LANES_KIND: &str = "openengine.node-runtime-lanes/v1";
 #[serde(deny_unknown_fields)]
 pub struct TargetNodeRuntimeLanesDiscovery {
     pub kind: String,
+}
+
+pub const RUNTIME_HARNESSES_KIND: &str = "openengine.runtime-harnesses/v1";
+pub const MAX_TARGET_RUNTIME_LANES: usize = 128;
+
+/// The target's enabled harness/provider pairs, independently of model or credential availability.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TargetRuntimeHarnessesDiscovery {
+    pub kind: String,
+    #[serde(deserialize_with = "deserialize_runtime_harness_lanes")]
+    pub lanes: Vec<crate::RuntimeLane>,
+}
+
+impl TargetRuntimeHarnessesDiscovery {
+    pub fn new(lanes: Vec<crate::RuntimeLane>) -> Result<Self, NativeV2RunValueError> {
+        validate_runtime_harness_lanes(&lanes)?;
+        Ok(Self {
+            kind: RUNTIME_HARNESSES_KIND.to_owned(),
+            lanes,
+        })
+    }
+
+    /// Also checks metadata assembled directly by a Rust host.
+    pub fn validate(&self) -> Result<(), NativeV2RunValueError> {
+        validate_runtime_harness_lanes(&self.lanes)
+    }
+}
+
+fn validate_runtime_harness_lanes(
+    lanes: &[crate::RuntimeLane],
+) -> Result<(), NativeV2RunValueError> {
+    if lanes.len() > MAX_TARGET_RUNTIME_LANES {
+        return Err(NativeV2RunValueError(
+            "runtime harness catalog exceeds 128 lanes",
+        ));
+    }
+    if lanes.iter().collect::<BTreeSet<_>>().len() != lanes.len() {
+        return Err(NativeV2RunValueError(
+            "runtime harness catalog contains duplicate lanes",
+        ));
+    }
+    Ok(())
+}
+
+fn deserialize_runtime_harness_lanes<'de, D>(
+    deserializer: D,
+) -> Result<Vec<crate::RuntimeLane>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let lanes = Vec::<crate::RuntimeLane>::deserialize(deserializer)?;
+    validate_runtime_harness_lanes(&lanes).map_err(serde::de::Error::custom)?;
+    Ok(lanes)
 }
 
 pub const GIT_TRANSPORT_KIND: &str = "openengine.git-transport/v1";
@@ -474,15 +627,34 @@ pub struct TargetGitTransportDiscovery {
     pub kind: String,
 }
 
+pub const COMMENT_DELIVERY_KIND: &str = "openengine.comment-delivery/v1";
+pub const TASK_RESOLUTION_KIND: &str = "openengine.task-resolution/v1";
+
+/// Frozen marker; routes and future capability details belong in separate extensions.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TargetCommentDeliveryDiscovery {
+    pub kind: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TargetTaskResolutionDiscovery {
+    pub kind: String,
+    pub resolve: String,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, rename_all = "snake_case")]
 pub struct TargetDiscoveryExtensions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<crate::TargetApiKeyDiscovery>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hosted_runs: Option<TargetHostedRunsDiscovery>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run_history: Option<TargetRunHistoryDiscovery>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub merge_plans: Option<crate::TargetMergePlansDiscovery>,
+    pub stacks: Option<crate::TargetStacksDiscovery>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connections: Option<TargetConnectionsDiscovery>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -496,7 +668,17 @@ pub struct TargetDiscoveryExtensions {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub node_runtime_lanes: Option<TargetNodeRuntimeLanesDiscovery>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_harnesses: Option<TargetRuntimeHarnessesDiscovery>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_sizes: Option<TargetRunSizesDiscovery>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decision_models: Option<TargetDecisionModelsDiscovery>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub git_transport: Option<TargetGitTransportDiscovery>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comment_delivery: Option<TargetCommentDeliveryDiscovery>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_resolution: Option<TargetTaskResolutionDiscovery>,
 }
 
 /// One discovery document for direct Docker targets and OAuth-hosted targets.
@@ -522,20 +704,63 @@ pub struct TargetDiscoveryDocument {
 impl TargetDiscoveryExtensions {
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.hosted_runs.is_none()
+        self.api_key.is_none()
+            && self.hosted_runs.is_none()
             && self.run_history.is_none()
-            && self.merge_plans.is_none()
+            && self.stacks.is_none()
             && self.connections.is_none()
             && self.run_profiles.is_none()
-            && self.workspace_recovery.is_none()
+            && self.controller_extensions_empty()
+    }
+
+    const fn controller_extensions_empty(&self) -> bool {
+        self.workspace_recovery.is_none()
             && self.workspace_checkpoints.is_none()
             && self.hosted_workspace_recovery.is_none()
             && self.node_runtime_lanes.is_none()
+            && self.runtime_harnesses.is_none()
+            && self.run_sizes.is_none()
+            && self.decision_models.is_none()
             && self.git_transport.is_none()
+            && self.comment_delivery.is_none()
+            && self.task_resolution.is_none()
     }
 }
 
 impl TargetDiscoveryDocument {
+    /// Advertises machine sizes accepted by this host independently of billing or credentials.
+    #[must_use]
+    pub fn with_run_sizes(mut self, catalog: TargetRunSizesDiscovery) -> Self {
+        self.extensions.run_sizes = Some(catalog);
+        self
+    }
+
+    /// Advertises the System One choice binding on native verifier nodes.
+    #[must_use]
+    pub fn with_decision_models(mut self) -> Self {
+        self.extensions.decision_models = Some(TargetDecisionModelsDiscovery {
+            kind: DECISION_MODELS_KIND.to_owned(),
+        });
+        self
+    }
+
+    #[must_use]
+    pub fn with_comment_delivery(mut self) -> Self {
+        self.extensions.comment_delivery = Some(TargetCommentDeliveryDiscovery {
+            kind: COMMENT_DELIVERY_KIND.to_owned(),
+        });
+        self
+    }
+
+    #[must_use]
+    pub fn with_task_resolution(mut self) -> Self {
+        self.extensions.task_resolution = Some(TargetTaskResolutionDiscovery {
+            kind: TASK_RESOLUTION_KIND.to_owned(),
+            resolve: TARGET_TASK_RESOLUTION_PATH.to_owned(),
+        });
+        self
+    }
+
     #[must_use]
     pub fn direct(authentication: TargetAuthentication) -> Self {
         Self {
@@ -584,6 +809,13 @@ impl TargetDiscoveryDocument {
         self.extensions.node_runtime_lanes = Some(TargetNodeRuntimeLanesDiscovery {
             kind: NODE_RUNTIME_LANES_KIND.to_owned(),
         });
+        self
+    }
+
+    /// Advertises the same enabled lanes that the host accepts during run admission.
+    #[must_use]
+    pub fn with_runtime_harnesses(mut self, catalog: TargetRuntimeHarnessesDiscovery) -> Self {
+        self.extensions.runtime_harnesses = Some(catalog);
         self
     }
 

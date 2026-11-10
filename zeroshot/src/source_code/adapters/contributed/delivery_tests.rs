@@ -271,6 +271,7 @@ async fn registered_contribution_executes_existing_pr_and_merge_nodes_with_opaqu
                 workspace: repo.workspace.clone(),
                 git_program: "/usr/bin/git".into(),
                 git_identity: None,
+                commit_identity: None,
                 target: source_target(&source, mode).assert_value(),
                 poll: DeliveryPollPolicy::new(3, Duration::ZERO).assert_value(),
             },
@@ -456,6 +457,7 @@ fn contribution_graph(mode: DeliveryMode) -> (openengine_cluster_protocol::Graph
                 let value = match field["type"]["kind"].as_str() {
                     Some("enum") => field["type"]["values"][0].clone(),
                     Some("string") => Value::String(String::new()),
+                    Some("record") => json!({}),
                     other => panic!("unexpected contribution receipt field: {other:?}"),
                 };
                 (name.clone(), value)

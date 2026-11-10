@@ -351,7 +351,7 @@ async fn job_log_capture_opts_in_and_feedback_removes_terminal_controls() {
     let program = script(
         root.as_path(),
         r#"case "$*" in
-  'api repos/acme/project/actions/jobs/91/logs --method GET --allow-escape-sequences') ;;
+  'api repos/acme/project/actions/jobs/91/logs --method GET --allow-escape-sequences --header X-GitHub-Api-Version: 2026-03-10') ;;
   *) printf '%s\n' 'the response contains terminal escape sequences' >&2; exit 1 ;;
 esac
 exec /bin/cat "$HOME/payload"
@@ -379,6 +379,7 @@ exec /bin/cat "$HOME/payload"
         is_merge_queue_enabled: false,
         head_update: None,
         pull_request_ready: false,
+        observed_required_checks: Default::default(),
     };
     include_check_logs(&mut snapshot, &[(91, check_log_tail(&output))]);
     let SourceReviewState::Open {

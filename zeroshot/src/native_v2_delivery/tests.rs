@@ -23,7 +23,7 @@ use crate::native_v2_candidate::test_support::{
     TestGitRepository, full_graph, git, git_output, success_node,
 };
 use crate::native_v2_contract::{
-    self, CodexProvider, DeclaredConnections, DeclaredEnvironment, ExecutionRef, NodeInvocation,
+    self, DeclaredConnections, DeclaredEnvironment, ExecutionRef, NodeInvocation,
     NodeRuntimeBinding, PullRequestFeedback, RunSize, RunSubmission, RunTitle, RuntimePlan,
     SourceBranchId, SourceRepositoryId, SourceRevisionId, ResolvedSource,
 };
@@ -35,6 +35,8 @@ use crate::native_v2_supervisor::{NativeV2Supervisor, RunEnvironment};
 use crate::v2_run_ledger::fake::FakeRunLedger;
 use crate::v2_run_ledger::{CreateRun, RunLedger};
 
+#[path = "tests/diagnostics.rs"]
+mod diagnostics;
 #[path = "tests/github_fixture.rs"]
 pub(super) mod github_fixture;
 #[path = "tests/head_update.rs"]
@@ -156,6 +158,47 @@ async fn push_worker_publishes_only_the_exact_managed_branch() {
     assert!(authority.pushed.load(Ordering::SeqCst));
     assert!(authority.review_requests().is_empty());
     assert_eq!(authority.merge_requests.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn configured_commit_identity_authors_the_delivered_commit() {
+    use crate::native_v2_candidate::test_support::{BOT_AUTHOR, bot_commit_identity, commit_authorship};
+    let repo = TempRepo::delivery();
+    let authority = Arc::new(FakeGitHub::new(repo.remote.clone(), Script::NoCi));
+    let adapter = Arc::new(NativeV2DeliveryAdapter::new(
+        NativeV2DeliveryConfig {
+            delivery_run_id: RunId::new("delivery-bot-identity"),
+            adopt_existing_delivery: false,
+            git_identity: None,
+            commit_identity: Some(bot_commit_identity()),
+            workspace: repo.workspace.clone(),
+            git_program: "/usr/bin/git".into(),
+            target: target(&repo),
+            poll: DeliveryPollPolicy::new(1, Duration::ZERO).assert_value(),
+        },
+        authority,
+    ));
+    let outcome = run_with_adapter(
+        DeliveryRunRequest {
+            repo: &repo,
+            attempts: 1,
+            mode: DeliveryMode::Push,
+            run_id: "delivery-bot-identity",
+            refresh: None,
+        },
+        adapter,
+    )
+    .await
+    .outcome;
+    let output = assert_delivery_signal(&outcome, DELIVERY_PUSHED_LABEL);
+    let head = output
+        .pointer("/headRevision")
+        .and_then(Value::as_str)
+        .assert_value();
+    assert_eq!(
+        commit_authorship(&repo.workspace, head),
+        format!("{BOT_AUTHOR}|{BOT_AUTHOR}")
+    );
 }
 
 #[tokio::test]
@@ -773,7 +816,7 @@ async fn resumed_current_delivery_modes_keep_the_predecessor_branch_with_a_fresh
         if mode == DeliveryMode::Push {
             assert_eq!(
                 resumed["headBranch"],
-                delivery_branch("stable-delivery-run")
+                delivery_head_branch(&RunId::new("stable-delivery-run"))
             );
         } else {
             let reviews = authority.review_requests();
@@ -781,10 +824,71 @@ async fn resumed_current_delivery_modes_keep_the_predecessor_branch_with_a_fresh
             assert_eq!(reviews[0].head_branch, reviews[1].head_branch);
             assert_eq!(
                 reviews[1].head_branch,
-                delivery_branch("stable-delivery-run")
+                delivery_head_branch(&RunId::new("stable-delivery-run"))
             );
         }
     }
+}
+
+#[tokio::test]
+async fn public_head_branch_is_the_pull_request_branch_on_every_delivery_path() {
+    let delivery_run = RunId::new("stack-parent-delivery");
+    let head = delivery_head_branch(&delivery_run);
+    assert_eq!(
+        head, "zeroshot/v2-59b39eb2d2d1a0e1e360",
+        "the branch is a stable public contract"
+    );
+    let repo = TempRepo::delivery();
+    let authority = Arc::new(FakeGitHub::new(repo.remote.clone(), Script::NoCi));
+    let request = |run_id| DeliveryRunRequest {
+        repo: &repo,
+        attempts: 3,
+        mode: DeliveryMode::PullRequestV2,
+        run_id,
+        refresh: None,
+    };
+
+    let first = run_delivery_execution_with_identity(
+        request("stack-parent"),
+        authority.clone(),
+        delivery_run.as_str(),
+    )
+    .await;
+    let recovered = run_delivery_execution_with_identity_and_adoption(
+        request("stack-parent-successor"),
+        authority.clone(),
+        delivery_run.as_str(),
+        true,
+    )
+    .await;
+
+    assert_delivery_signal(&first.outcome, DELIVERY_READY_LABEL);
+    assert_delivery_signal(&recovered.outcome, DELIVERY_READY_LABEL);
+    let reviews = authority.review_requests();
+    assert_eq!(
+        reviews.len(),
+        2,
+        "first delivery and recovery open the same PR"
+    );
+    assert!(reviews.iter().all(|review| review.head_branch == head));
+    let preflight_reads = authority
+        .delivery_read_branches
+        .lock()
+        .assert_value()
+        .clone();
+    assert!(!preflight_reads.is_empty());
+    assert!(preflight_reads.iter().all(|branch| *branch == head));
+    let pushed = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo.remote)
+        .args(["rev-parse", "--verify", &format!("refs/heads/{head}")])
+        .output()
+        .assert_value();
+    assert!(pushed.status.success(), "delivery pushed {head}");
+    assert_eq!(
+        String::from_utf8(pushed.stdout).assert_value().trim(),
+        reviews[0].head_revision
+    );
 }
 
 #[tokio::test]
@@ -928,6 +1032,7 @@ async fn run_delivery_execution_with_identity_and_adoption(
         delivery_run_id: RunId::new(delivery_run_id),
         adopt_existing_delivery,
         git_identity: None,
+        commit_identity: None,
         workspace: request.repo.workspace.clone(),
         git_program: PathBuf::from("/usr/bin/git"),
         target: target(request.repo),
@@ -970,6 +1075,7 @@ fn retained_adapter(
             delivery_run_id: RunId::new(lineage.run_id),
             adopt_existing_delivery: lineage.adopt_existing,
             git_identity: None,
+            commit_identity: None,
             workspace: repo.workspace.clone(),
             git_program: "/usr/bin/git".into(),
             target: target(repo),
@@ -1081,6 +1187,7 @@ async fn start_with_adapter_token(
     }
     runner
         .start(NodeRunRequest {
+            dispatch: Default::default(),
             invocation: NodeInvocation {
                 reference: ExecutionRef {
                     run_id: RunId::new(request.run_id),
@@ -1136,11 +1243,10 @@ async fn admitted_with_feedback(
 }
 
 fn delivery_runtime(binding: NodeRuntimeBinding) -> RuntimePlan {
-    RuntimePlan::Codex {
-        provider: CodexProvider::OpenAi,
-        size: RunSize::Medium,
-        nodes: BTreeMap::from([(NodeName::new("deliver").assert_value(), binding)]),
-    }
+    crate::native_v2_candidate::test_support::codex_runtime(
+        RunSize::Medium,
+        BTreeMap::from([(NodeName::new("deliver").assert_value(), binding)]),
+    )
 }
 
 fn target(repo: &TempRepo) -> DeliveryTarget {

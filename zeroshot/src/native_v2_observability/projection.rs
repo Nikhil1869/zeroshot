@@ -1,17 +1,5 @@
 use super::*;
 
-fn visible_text(text: &str) -> String {
-    let mut visible = String::with_capacity(text.len());
-    for character in text.chars() {
-        if character.is_control() {
-            visible.extend(character.escape_default());
-        } else {
-            visible.push(character);
-        }
-    }
-    visible
-}
-
 pub(super) fn status_result(
     snapshot: &RunSnapshot,
 ) -> Result<RunStatusResult, NativeV2ObservationError> {
@@ -53,17 +41,25 @@ pub(super) fn status_from_snapshot(
                 .terminal
                 .clone()
                 .ok_or(NativeV2ObservationError::InvalidState)?,
-            metadata: RunMetadata {
-                token_usage: snapshot.token_usage.clone(),
-            },
+            metadata: run_metadata(snapshot),
         }),
+    }
+}
+
+pub(super) fn run_metadata(snapshot: &RunSnapshot) -> RunMetadata {
+    RunMetadata {
+        token_usage: snapshot.token_usage.clone(),
+        delivery_receipt: snapshot.delivery_receipt(),
     }
 }
 
 pub(super) fn changes_public_status(event: &RunEvent) -> bool {
     !matches!(
         event,
-        RunEvent::SafeLog { .. } | RunEvent::TokenUsageObserved { .. }
+        RunEvent::SafeLog { .. }
+            | RunEvent::TokenUsageObserved { .. }
+            | RunEvent::RunTokenUsageObserved { .. }
+            | RunEvent::PrimaryGraphCompleted { .. }
     )
 }
 
@@ -78,6 +74,7 @@ pub(super) fn log_notification(
         timestamp,
         stream,
         line,
+        ..
     } = &stored.event
     else {
         return Ok(None);
@@ -114,8 +111,11 @@ fn log_record(stream: SafeLogStream, line: &str) -> Result<LogRecord, NativeV2Ob
         level,
         target: BoundedLogTarget::new(LOG_TARGET)
             .map_err(|_| NativeV2ObservationError::InvalidState)?,
-        message: BoundedLogMessage::new(visible_text(line))
-            .unwrap_or_else(|_| BoundedLogMessage::redacted()),
+        message: BoundedLogMessage::new(crate::native_v2_runner::bounded_log_text(
+            visible_text(line),
+            openengine_cluster_protocol::MAX_LOG_MESSAGE_BYTES,
+        ))
+        .unwrap_or_else(|_| BoundedLogMessage::redacted()),
     })
 }
 
@@ -156,24 +156,9 @@ pub(super) fn resolve_public_execution(
 pub(super) fn opaque_execution(
     reference: &ExecutionRef,
 ) -> Result<PublicExecutionRef, NativeV2ObservationError> {
-    let mut digest = Sha256::new();
-    digest.update(b"zeroshot/native-v2/execution-ref/v1\0");
-    digest.update(reference.run_id.as_str().as_bytes());
-    digest.update(b"\0");
-    digest.update(reference.node.as_str().as_bytes());
-    digest.update(b"\0");
-    digest.update(reference.node_instance.to_string().as_bytes());
-    digest.update(b"\0");
-    digest.update(reference.execution.to_string().as_bytes());
-    let token = digest
-        .finalize()
-        .iter()
-        .fold(String::from("nv2-"), |mut token, byte| {
-            use std::fmt::Write as _;
-            let _ = write!(token, "{byte:02x}");
-            token
-        });
-    PublicExecutionRef::new(token).map_err(|_| NativeV2ObservationError::InvalidState)
+    reference
+        .public_execution()
+        .map_err(|_| NativeV2ObservationError::InvalidState)
 }
 
 #[cfg(test)]

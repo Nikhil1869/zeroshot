@@ -475,11 +475,15 @@ async fn start_delivery(fixture: &OwnershipFixture) -> crate::native_v2_runner::
         title: contract::RunTitle::new("Ownership handoff").assert_value(),
         graph: full_graph(vec![git_delivery_node(), success_node()]),
         initial_input: serde_json::Value::Null,
-        runtime: contract::RuntimePlan::Codex {
-            provider: contract::CodexProvider::OpenAi,
-            size: contract::RunSize::Small,
-            nodes: BTreeMap::from([(node.clone(), binding.clone())]),
-        },
+        runtime: contract::RuntimePlan::new(
+            openengine_cluster_protocol::RuntimeLane::new(
+                "codex",
+                (contract::CodexProvider::OpenAi).name(),
+            )
+            .assert_value(),
+            contract::RunSize::Small,
+            BTreeMap::from([(node.clone(), binding.clone())]),
+        ),
         source: Some(contract::ResolvedSource {
             remote: None,
             repository: contract::SourceRepositoryId::new("acme/project").assert_value(),
@@ -494,6 +498,7 @@ async fn start_delivery(fixture: &OwnershipFixture) -> crate::native_v2_runner::
             delivery_run_id: RunId::new("ownership-handoff"),
             adopt_existing_delivery: false,
             git_identity: fixture.authority.config.git_identity,
+            commit_identity: None,
             workspace: fixture.workspace.clone(),
             git_program: fixture.authority.config.git_program.clone(),
             target: fixture.delivery_target(),
@@ -509,6 +514,7 @@ async fn start_delivery(fixture: &OwnershipFixture) -> crate::native_v2_runner::
     .assert_value();
     runner
         .start(NodeRunRequest {
+            dispatch: Default::default(),
             invocation: contract::NodeInvocation {
                 reference: contract::ExecutionRef {
                     run_id: RunId::new("ownership-handoff"),

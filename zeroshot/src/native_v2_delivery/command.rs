@@ -6,7 +6,8 @@ use crate::execution::process::platform::{
 };
 use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncReadExt};
+use openengine_cluster_protocol::CommitIdentity;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
 const MAX_DIAGNOSTIC_BYTES: usize =
@@ -98,33 +99,49 @@ pub(crate) async fn capture_sensitive(
     deadline: Duration,
     private_secrets: &[String],
 ) -> Result<GitCommandOutput, GitCommandFailure> {
+    capture_exchange(command, deadline, private_secrets, None).await
+}
+
+/// Sends bounded private request bytes concurrently with output and confirmed process cleanup.
+pub(crate) async fn capture_sensitive_with_input(
+    command: &mut Command,
+    deadline: Duration,
+    private_secrets: &[String],
+    input: &[u8],
+) -> Result<GitCommandOutput, GitCommandFailure> {
+    capture_exchange(command, deadline, private_secrets, Some(input)).await
+}
+
+async fn capture_exchange(
+    command: &mut Command,
+    deadline: Duration,
+    private_secrets: &[String],
+    input: Option<&[u8]>,
+) -> Result<GitCommandOutput, GitCommandFailure> {
     let mut secrets = command_secrets(command);
     secrets.extend_from_slice(private_secrets);
     let mut diagnostic = command_diagnostic(command, &secrets);
-    command
-        .kill_on_drop(true)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    configure_capture(command, input.is_some());
     let (mut child, process_group) = spawn_contained(command).map_err(|error| {
         diagnostic.context = format!("could not start contained command: {error}").into_boxed_str();
         diagnostic.clone()
     })?;
-    let Some(stdout) = child.stdout.take() else {
-        return Err(diagnostic);
-    };
-    let Some(stderr) = child.stderr.take() else {
-        return Err(diagnostic);
-    };
+    let (stdout, stderr, stdin) = take_pipes(&mut child).ok_or_else(|| diagnostic.clone())?;
     let mut captured_stdout = CapturedBytes::default();
     let mut captured_stderr = CapturedBytes::default();
     let retain = MAX_DIAGNOSTIC_BYTES + secrets.iter().map(String::len).max().unwrap_or(0);
+    // The input exchange serves bounded forge JSON, whose private protocol bytes can be
+    // larger than printable diagnostics. Existing Git captures retain their prior bound.
+    let stdout_retain = input.map_or(retain, |_| 8 * 1024 * 1024);
     let result = tokio::time::timeout(deadline, async {
         let completion = wait_and_cleanup(&mut child, &process_group, &mut diagnostic);
-        let (status, (), ()) = tokio::join!(
+        let (status, (), (), sent) = tokio::join!(
             completion,
-            drain(stdout, &mut captured_stdout, retain),
+            drain(stdout, &mut captured_stdout, stdout_retain),
             drain(stderr, &mut captured_stderr, retain),
+            send_input(stdin, input),
         );
+        sent?;
         status
     })
     .await;
@@ -161,6 +178,42 @@ pub(crate) async fn capture_sensitive(
             Err(diagnostic)
         }
     }
+}
+
+fn configure_capture(command: &mut Command, sends_input: bool) {
+    command
+        .kill_on_drop(true)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if sends_input {
+        command.stdin(Stdio::piped());
+    }
+}
+
+fn take_pipes(
+    child: &mut tokio::process::Child,
+) -> Option<(
+    tokio::process::ChildStdout,
+    tokio::process::ChildStderr,
+    Option<tokio::process::ChildStdin>,
+)> {
+    Some((
+        child.stdout.take()?,
+        child.stderr.take()?,
+        child.stdin.take(),
+    ))
+}
+
+async fn send_input(
+    stdin: Option<tokio::process::ChildStdin>,
+    input: Option<&[u8]>,
+) -> std::io::Result<()> {
+    if let Some(input) = input {
+        let mut stdin = stdin.ok_or_else(|| std::io::Error::other("command stdin unavailable"))?;
+        stdin.write_all(input).await?;
+        stdin.shutdown().await?;
+    }
+    Ok(())
 }
 
 async fn wait_and_cleanup(
@@ -208,17 +261,27 @@ fn command_diagnostic(command: &Command, secrets: &[String]) -> GitCommandFailur
     }
 }
 
+pub(super) fn native_credential_name(name: &str) -> bool {
+    #[cfg(windows)]
+    let name = name.to_ascii_uppercase();
+    name == "GIT_USERNAME"
+        || name.ends_with("_TOKEN")
+        || name.ends_with("_PASSWORD")
+        || name.ends_with("_API_KEY")
+}
+
 fn command_secrets(command: &Command) -> Vec<String> {
-    let token = command.as_std().get_envs().find_map(|(name, value)| {
-        (name == "GH_TOKEN")
-            .then_some(value)
-            .flatten()
-            .map(|v| v.to_string_lossy().into_owned())
-    });
-    match token {
-        Some(token) => vec![super::git_auth::encode_basic_credential(&token), token],
-        None => Vec::new(),
-    }
+    command
+        .as_std()
+        .get_envs()
+        .filter(|(name, _)| name.to_str().is_some_and(native_credential_name))
+        .filter_map(|(_, value)| value)
+        .filter(|value| !value.is_empty())
+        .flat_map(|value| {
+            let value = value.to_string_lossy().into_owned();
+            [super::git_auth::encode_basic_credential(&value), value]
+        })
+        .collect()
 }
 
 async fn drain(mut reader: impl AsyncRead + Unpin, captured: &mut CapturedBytes, retain: usize) {
@@ -304,6 +367,8 @@ pub(crate) fn local_git_command(program: &Path, workspace: &Path) -> Command {
         .arg("-c")
         .arg("maintenance.autoDetach=false")
         .arg("-c")
+        .arg("gc.autoDetach=false")
+        .arg("-c")
         .arg(format!("safe.directory={}", workspace.display()))
         .arg("-C")
         .arg(workspace)
@@ -311,6 +376,97 @@ pub(crate) fn local_git_command(program: &Path, workspace: &Path) -> Command {
     let mut environment = std::collections::BTreeMap::new();
     crate::execution::platform::process_environment(&mut environment);
     command.envs(environment);
+    pin_delivery_identity(&mut command, None);
+    command
+}
+
+/// Delivery commits use the host-selected identity, or the fixed product identity without one.
+pub(crate) fn delivery_identity(identity: Option<&CommitIdentity>) -> (&str, &str) {
+    identity.map_or(("Zeroshot", "delivery@zeroshot.invalid"), |identity| {
+        (identity.name(), identity.email())
+    })
+}
+
+/// `-c` values that also make the delivery identity the configured Git user for one command.
+pub(crate) fn identity_configuration(identity: Option<&CommitIdentity>) -> [String; 2] {
+    let (name, email) = delivery_identity(identity);
+    [format!("user.name={name}"), format!("user.email={email}")]
+}
+
+fn pin_delivery_identity(command: &mut Command, identity: Option<&CommitIdentity>) {
+    let (name, email) = delivery_identity(identity);
+    command
+        .env("GIT_AUTHOR_NAME", name)
+        .env("GIT_AUTHOR_EMAIL", email)
+        .env("GIT_COMMITTER_NAME", name)
+        .env("GIT_COMMITTER_EMAIL", email);
+}
+
+/// Repository-selection controls never override an engine-selected workspace. Native Git
+/// configuration and authentication settings continue to apply inside that workspace. Platform's
+/// machine credential belongs only to target HTTP and is excluded from every Git subprocess.
+pub(crate) fn remove_repository_environment(command: &mut std::process::Command) {
+    for variable in [
+        "ZEROSHOT_API_KEY",
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+        "GIT_NAMESPACE",
+    ] {
+        command.env_remove(variable);
+    }
+}
+
+/// Trusted subprocess context shared by local workspace and transport Git commands.
+#[derive(Clone, Copy)]
+pub(crate) struct GitCommandContext<'a> {
+    pub(crate) identity: Option<crate::execution::process::HostedProcessIdentity>,
+    pub(crate) local_environment: Option<&'a std::collections::BTreeMap<String, String>>,
+    pub(crate) commit_identity: Option<&'a CommitIdentity>,
+}
+
+/// Selects the same private native Git context for local workspace and transport operations.
+/// An absent snapshot retains hosted isolation; the controller's ambient environment is never used.
+pub(crate) fn git_command(
+    program: &Path,
+    workspace: &Path,
+    context: GitCommandContext<'_>,
+) -> Command {
+    let GitCommandContext {
+        identity,
+        local_environment,
+        commit_identity,
+    } = context;
+    let mut command = local_git_command_with_identity(program, workspace, identity);
+    if let Some(environment) = local_environment {
+        command.envs(environment);
+        if identity.is_none() {
+            // Resolve native relative PATH entries in the selected workspace.
+            command.current_dir(workspace);
+        }
+        for variable in ["GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL"] {
+            #[cfg(windows)]
+            let supplied = environment
+                .keys()
+                .any(|name| name.eq_ignore_ascii_case(variable));
+            #[cfg(not(windows))]
+            let supplied = environment.contains_key(variable);
+            if !supplied {
+                command.env_remove(variable);
+            }
+        }
+    }
+    remove_repository_environment(command.as_std_mut());
+    pin_delivery_identity(&mut command, commit_identity);
+    command
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "never")
+        .env("SSH_ASKPASS_REQUIRE", "never");
     command
 }
 

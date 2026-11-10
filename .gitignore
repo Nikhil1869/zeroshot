@@ -1,6 +1,7 @@
 node_modules/
 /target/
 **/target/
+/.venv/
 sdks/python/.venv/
 sdks/python/dist/
 __pycache__/
@@ -15,6 +16,7 @@ __pycache__/
 .DS_Store
 Thumbs.db
 coverage/
+*.profraw
 .nyc_output/
 *.log
 .tmp/

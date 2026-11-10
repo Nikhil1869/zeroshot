@@ -15,8 +15,8 @@ mod hosted_runs;
 mod http_error;
 mod profiles;
 
-use hosted_runs::{build_hosted_runs_descriptor, build_merge_plans_descriptor};
-pub(super) use hosted_runs::{HostedRunsDescriptor, MergePlansDescriptor};
+use hosted_runs::{build_hosted_runs_descriptor, build_stacks_descriptor};
+pub(super) use hosted_runs::{HostedRunsDescriptor, StacksDescriptor};
 #[cfg(feature = "ui")]
 pub(super) use history::{RunHistoryDescriptor, build_run_history_descriptor};
 pub(super) use http_error::{http_error, read_success_json, read_success_json_with_limit};
@@ -48,9 +48,10 @@ pub(super) struct HostedAuthDescriptor {
     pub(super) device_grant_type: String,
     pub(super) session_endpoint: Url,
     pub(super) hosted_runs: HostedRunsDescriptor,
-    pub(super) merge_plans: Option<MergePlansDescriptor>,
+    pub(super) stacks: Option<StacksDescriptor>,
     pub(super) connections: Option<ConnectionsDescriptor>,
     pub(super) run_profiles: Option<RunProfilesDescriptor>,
+    pub(super) delegations: Option<Url>,
 }
 
 pub(super) struct ControllerDescriptor {
@@ -60,7 +61,12 @@ pub(super) struct ControllerDescriptor {
     pub(super) workspace_recovery: bool,
     pub(super) workspace_checkpoints: bool,
     pub(super) node_runtime_lanes: bool,
+    pub(super) runtime_harnesses: Option<Vec<openengine_cluster_protocol::RuntimeLane>>,
+    pub(super) run_sizes: Option<Vec<openengine_cluster_protocol::RunSize>>,
+    pub(super) decision_models: bool,
     pub(super) git_transport: bool,
+    pub(super) comment_delivery: bool,
+    pub(super) task_resolution: Option<Url>,
 }
 
 pub(super) fn build_controller_descriptor(
@@ -72,11 +78,52 @@ pub(super) fn build_controller_descriptor(
     let workspace_recovery = parse_workspace_recovery(&wire)?;
     let workspace_checkpoints = parse_workspace_checkpoints(&wire)?;
     let node_runtime_lanes = parse_node_runtime_lanes(&wire);
+    let runtime_harnesses = wire
+        .extensions
+        .runtime_harnesses
+        .as_ref()
+        .filter(|catalog| catalog.kind == openengine_cluster_protocol::RUNTIME_HARNESSES_KIND)
+        .map(|catalog| {
+            catalog
+                .validate()
+                .map_err(|error| authority_error(error.to_string()))?;
+            Ok::<_, TargetAuthorityError>(catalog.lanes.clone())
+        })
+        .transpose()?;
+    let run_sizes = wire
+        .extensions
+        .run_sizes
+        .as_ref()
+        .filter(|catalog| catalog.kind == openengine_cluster_protocol::RUN_SIZES_KIND)
+        .map(|catalog| {
+            catalog
+                .validate()
+                .map_err(|error| authority_error(error.to_string()))?;
+            Ok::<_, TargetAuthorityError>(catalog.sizes.clone())
+        })
+        .transpose()?;
+    let decision_models = wire
+        .extensions
+        .decision_models
+        .as_ref()
+        .is_some_and(|marker| marker.kind == openengine_cluster_protocol::DECISION_MODELS_KIND);
     let git_transport = wire
         .extensions
         .git_transport
         .as_ref()
         .is_some_and(|marker| marker.kind == openengine_cluster_protocol::GIT_TRANSPORT_KIND);
+    let comment_delivery = wire
+        .extensions
+        .comment_delivery
+        .as_ref()
+        .is_some_and(|marker| marker.kind == openengine_cluster_protocol::COMMENT_DELIVERY_KIND);
+    let task_resolution = wire
+        .extensions
+        .task_resolution
+        .as_ref()
+        .filter(|routes| routes.kind == openengine_cluster_protocol::TASK_RESOLUTION_KIND)
+        .map(|routes| same_origin_path(origin, &routes.resolve))
+        .transpose()?;
     Ok(ControllerDescriptor {
         run_url: same_origin_path(origin, &wire.run_path)?,
         session_url: same_origin_path(origin, &wire.session_path)?,
@@ -84,7 +131,12 @@ pub(super) fn build_controller_descriptor(
         workspace_recovery,
         workspace_checkpoints,
         node_runtime_lanes,
+        runtime_harnesses,
+        run_sizes,
+        decision_models,
         git_transport,
+        comment_delivery,
+        task_resolution,
     })
 }
 
@@ -410,14 +462,23 @@ pub(super) fn build_auth_descriptor(
         device_grant_type: oauth.device_grant_type.clone(),
         session_endpoint: same_origin_path(origin, &session.route_template)?,
         hosted_runs,
-        merge_plans: capabilities.merge_plans,
+        stacks: capabilities.stacks,
         connections: capabilities.connections,
         run_profiles: capabilities.run_profiles,
+        delegations: wire
+            .extensions
+            .api_key
+            .as_ref()
+            .map(|capability| {
+                super::machine::validate_discovery(origin, wire)?;
+                same_origin_path(origin, &capability.delegations_path)
+            })
+            .transpose()?,
     })
 }
 
 struct OptionalCapabilities {
-    merge_plans: Option<MergePlansDescriptor>,
+    stacks: Option<StacksDescriptor>,
     connections: Option<ConnectionsDescriptor>,
     run_profiles: Option<RunProfilesDescriptor>,
 }
@@ -427,7 +488,7 @@ fn build_optional_capabilities(
     extensions: &openengine_cluster_protocol::TargetDiscoveryExtensions,
 ) -> Result<OptionalCapabilities, TargetAuthorityError> {
     Ok(OptionalCapabilities {
-        merge_plans: build_merge_plans_descriptor(origin, extensions)?,
+        stacks: build_stacks_descriptor(origin, extensions)?,
         connections: build_connections_descriptor(origin, extensions)?,
         run_profiles: build_profiles_descriptor(origin, extensions)?,
     })

@@ -270,7 +270,7 @@ jobs:
             restic-executable: restic
             c-compiler: cc
           - target: aarch64-apple-darwin
-            runner: macos-14
+            runner: macos-15
             executable: zeroshot
             restic-executable: restic
             c-compiler: cc
@@ -453,6 +453,9 @@ jobs:
           path: |
             release-assets/*.tar.gz
             release-assets/zeroshot-skill.md
+            release-assets/zeroshot-memory-init-skill.md
+            release-assets/zeroshot-graph-design-skill.md
+            release-assets/zeroshot-plan-skill.md
             release-assets/SHA256SUMS
           if-no-files-found: error
 
@@ -533,7 +536,7 @@ jobs:
         run: |
           docker run --rm --network none --read-only \
             --tmpfs /tmp:rw,nosuid,nodev,size=64m,mode=1777 \
-            --tmpfs /work:rw,nosuid,nodev,exec,size=256m,mode=0700,uid=10001,gid=10001 \
+            --tmpfs /work:rw,nosuid,nodev,exec,size=512m,mode=0700,uid=10001,gid=10001 \
             --user 10001:10001 \
             --mount "type=bind,src=${PWD}/docker/zeroshot-target/smoke-toolchains.sh,dst=/smoke.sh,readonly" \
             --mount "type=bind,src=${PWD}/rust-toolchain.toml,dst=/rust-toolchain.toml,readonly" \
@@ -799,6 +802,9 @@ jobs:
           gh release download "$RELEASE_TAG" \
             --pattern 'SHA256SUMS' \
             --pattern 'zeroshot-skill.md' \
+            --pattern 'zeroshot-memory-init-skill.md' \
+            --pattern 'zeroshot-graph-design-skill.md' \
+            --pattern 'zeroshot-plan-skill.md' \
             --pattern "zeroshot-v${RELEASE_VERSION}-*.tar.gz" \
             --dir release-assets
 
@@ -830,7 +836,7 @@ jobs:
           const path = require('node:path');
           const [packageRoot, releaseDirectory] = process.argv.slice(2);
           const { install } = require(path.join(packageRoot, 'lib', 'install'));
-          const { managedSource } = require(path.join(packageRoot, 'lib', 'skills'));
+          const { SKILL_NAMES, managedSource } = require(path.join(packageRoot, 'lib', 'skills'));
           const installRoot = path.resolve(packageRoot, '..', '..', '..');
           const homeDirectory = path.join(installRoot, 'home');
           const options = {
@@ -846,13 +852,15 @@ jobs:
             };
           (async () => {
             await install(options);
-            const skillFiles = [
-              path.join(homeDirectory, '.agents', 'skills', 'zeroshot', 'SKILL.md'),
-              path.join(homeDirectory, '.claude', 'skills', 'zeroshot', 'SKILL.md'),
-            ];
+            const skillFiles = SKILL_NAMES.flatMap((name) => [
+              path.join(homeDirectory, '.agents', 'skills', name, 'SKILL.md'),
+              path.join(homeDirectory, '.claude', 'skills', name, 'SKILL.md'),
+            ]);
             const installed = skillFiles.map((filename) => fs.readFileSync(filename, 'utf8'));
-            assert.equal(installed[0], installed[1]);
-            assert.match(managedSource(installed[0]), /^---\nname: zeroshot\n/);
+            SKILL_NAMES.forEach((name, index) => {
+              assert.equal(installed[index * 2], installed[index * 2 + 1]);
+              assert.ok(managedSource(installed[index * 2]).startsWith(`---\nname: ${name}\n`));
+            });
             await install(options);
             assert.deepEqual(
               skillFiles.map((filename) => fs.readFileSync(filename, 'utf8')),
@@ -946,18 +954,40 @@ jobs:
       inputs.action == 'release' &&
       needs.plan.result == 'success' &&
       needs.shim-publish.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
     permissions:
+      actions: write
       checks: read
-      contents: write
-      id-token: write
-    uses: ./.github/workflows/release-python.yml
-    with:
-      action: release
-      zeroshot_version: ${{ needs.plan.outputs.version }}
-      sdk_revision: 1
-      release_commit: ${{ needs.plan.outputs.commit }}
-      publish_pypi: ${{ inputs.publish_pypi }}
-    secrets: inherit
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_VERSION: ${{ needs.plan.outputs.version }}
+      RELEASE_COMMIT: ${{ needs.plan.outputs.commit }}
+      PUBLISH_PYPI: ${{ inputs.publish_pypi }}
+    steps:
+      - name: Dispatch and await standalone Python SDK release
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_id="$(
+            gh api --method POST "/repos/$GITHUB_REPOSITORY/actions/workflows/release-python.yml/dispatches" \
+              -f ref=main \
+              -F return_run_details=true \
+              -f 'inputs[action]=release' \
+              -f "inputs[zeroshot_version]=$RELEASE_VERSION" \
+              -f 'inputs[sdk_revision]=1' \
+              -f "inputs[release_commit]=$RELEASE_COMMIT" \
+              -f "inputs[publish_pypi]=$PUBLISH_PYPI" \
+              --jq '.workflow_run_id'
+          )"
+          [[ "$run_id" =~ ^[1-9][0-9]*$ ]] || {
+            echo "::error::Python SDK dispatch did not return a run ID; inspect its runs before retrying"
+            exit 1
+          }
+          echo "Python SDK: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$run_id" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+          gh run watch "$run_id" --exit-status --interval 15
 
   docs:
     needs: [plan, python-sdk-release]

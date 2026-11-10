@@ -1,3 +1,7 @@
+---
+description: 'Learn how zeroshot admits a graph, executes its nodes, checks typed output and chooses the next edge independently of model behavior.'
+---
+
 # How execution works
 
 Zeroshot keeps control flow separate from model behavior through a caller-authored graph. After
@@ -72,46 +76,78 @@ read and stop commands.
 
 ## Built-in templates are ordinary graphs
 
-The executable contains `single-worker`, `software-change`, and `auto-research`. Each produces the
-public `GraphSpec` that custom submissions use:
+The executable contains `single-worker`, `software-change`, `auto-research`, `issue-review`,
+`pr-review`, and `code-review`. Each produces the public `GraphSpec` that custom submissions use:
 
 ```console
 zeroshot template list
 zeroshot template show software-change
 ```
 
-`software-change` has four delivery choices. The default keeps the accepted change local. `--push`
-publishes the managed run branch without opening a pull request. `--pr` opens or updates a pull
-request, processes visible review feedback, waits for required CI and a conflict-free head, then
+In a terminal, `template show` prints a tree and marks executable node names with `*`.
+Use `--json` or redirect stdout to export the complete `GraphSpec`.
+
+The review templates post their report as an issue or PR comment. See
+[Review an issue or PR](../guides/review.md) and [Review a PR in depth](../guides/code-review.md).
+
+`software-change` has four delivery choices and opens a pull request by default. `--delivery none`
+keeps the accepted change local. `--push` publishes the managed run branch without opening a pull
+request. `--pr`, the default, opens or updates a pull request, processes visible review feedback, waits for required CI and a conflict-free head, then
 stops without merging. `--ship` uses the same feedback loop before it follows the repository's merge
 policy and confirms the merged revision. Missing approval doesn't block `--pr`; it still blocks
 `--ship` when GitHub requires it.
 
+For local `--pr` and `--ship` runs, the target branch is the current branch's upstream when one is
+configured; otherwise, Zeroshot uses the local branch name. Preparation verifies that the selected
+remote contains this target before agent execution. To target `main` from a fresh worktree,
+run `git branch --set-upstream-to=origin/main`, or create the worktree from `origin/main` so Git
+sets the tracking branch automatically. If the remote cannot be reached or authenticated,
+preparation reports that the target branch could not be verified.
+
 `auto-research` runs ten iterations by default. Optional run input `options.iterations` selects a
-positive count that becomes the loop bound at admission, subject to the engine's general per-run
-resource budgets. A single planner compares directions using the durable backlog archive and
-chooses one bounded experiment. The archive retains credible alternatives and their evidence so
-later plans can revisit them. A one-time read-only preflight requires the exact
-judge and experiment sets before the loop; mapped evidence, method, and progress judges
-then review it independently. Ignored scratch files carry their handoffs. Unanimous `adopt` keeps
-working changes. A supported negative or inconclusive result becomes
-`record_only` and restores those changes; invalid, incomplete, or unsafe evidence becomes `abort` and
-also restores them. Finalized records live under
-`.zeroshot/research/iterations/`; the charter, state, summary, and backlog live at the research root.
-Scratch handoffs and backups use per-iteration directories. A planner, experimenter, or judge
-execution failure becomes a finalized aborted iteration; restoration runs when an experiment may have
-changed the workspace, and the bounded loop continues. A recorder or recovery failure stops before
-the next iteration. The charter distinguishes required invariants from
-optional progress measures. If evidence proves that the retained workspace violates an invariant,
-the planner prioritizes repair and judges treat a verified repair as adopt even when it does not
-clear an optional optimization threshold. Mutable state and summaries report the retained workspace
-and its invariant status separately from the best supported historical findings, so a result from a
-restored artifact is never presented as current.
-The template supports local results and `--push`. With `--push`, a read-only worker derives commit
-metadata from the finalized ledger, then the graph revisits its single Git delivery node after each
-iteration rather than only at graph completion. Manifest failures, delivery repair requests, and
-failed or rejected receipt audits stop the run instead of publishing an unreviewed repair.
+positive count bound at admission, subject to the engine's general execution and loop budgets.
+Each normal round has five model executions:
+
+1. Three independent read-only scouts propose exploration, synthesis, and challenge directions.
+2. One researcher selects the parent and experiment, verifies/restores candidate bytes, runs the
+   experiment, and prepares a supported retained result with compact evidence.
+3. A fresh read-only reviewer accepts the proposed disposition, requests concrete corrections, or
+   approves a justified early stop. A supported non-adoption can be accepted without replacing the
+   incumbent. Plateau alone does not justify stopping before the requested count.
+
+The scouts and researcher keep separate continuing sessions by default; the reviewer starts fresh.
+Required corrections return to the same researcher without repeating scouting or consuming another
+research round, then receive fresh review. This work/review cycle has a 64-pass safety limit.
+Routine file, tool, or archive errors can be repaired by the researcher. Missing optional historical
+archives and cosmetic bookkeeping issues are advisory when the current result and retained state
+are supported. Native reviewer outcomes establish approval; no separate file audit counter is
+required. There are no bootstrap, staging, finalization, or extra audit model passes.
+
+Records live under `.zeroshot/research` at the shared workspace root, including for tasks in
+subdirectories. The researcher keeps the charter, current summary, backlog, round evidence, and
+restorable candidate source there. After two accepted non-adoptions, or diminishing returns across
+`max(1, ceil(iterationLimit / 10))` accepted rounds on one approach, it explicitly reconsiders a new
+mechanism, an archived parent, and a discriminating measurement. These are reasoned alternatives,
+not a mandatory parent switch or a fixed gain threshold.
+
+The template supports local results and `--push`. With `--push`, the reviewer supplies title and
+description and one trusted Git delivery node publishes each accepted round. Research agents never
+use Git. Exhausted review, unrecovered execution errors, delivery errors, and delivery repair
+requests stop the run explicitly; unreviewed work is never published. Existing saved profiles and
+admitted runs keep their stored graph and runtime.
 
 PR and merge delivery consider feedback by default. Use `--no-pr-feedback` to ignore PR discussion;
 the [`git_delivery` binding](../reference/runtime-plan.md#git_delivery) describes the runtime
 setting.
+
+Automatic repairs accept feedback only from current writers on the target repository. GitHub
+confirms effective write or admin permission for issue comments, submitted reviews (including
+unwritten change requests), inline comments and replies. GitLab confirms active Developer-or-higher
+project membership, including inherited and invited membership, for discussion notes. The account
+must be active. Enterprise Edition also requires active `membership_state`; awaiting membership is
+ignored. Community Edition omits that field, so its response is accepted only after instance metadata
+confirms the edition. Unknown or malformed membership status fails the feedback read. Permissions
+are checked again on each inspection and bound to the author's stable numeric identity. Organization
+association, PR authorship, requested-reviewer status and bot status grant no exception. Confirmed
+read-only access or nonmembership is ignored and does not start another worker/reviewer round.
+Failed or incomplete permission lookups stop delivery or use its existing retry handling.

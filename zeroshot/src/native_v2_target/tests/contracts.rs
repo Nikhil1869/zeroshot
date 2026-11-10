@@ -1,7 +1,7 @@
 use openengine_cluster_protocol::{
     ConnectionDeleteRequest, ConnectionKey, ConnectionListRequest, ConnectionScope,
-    ConnectionSetRequest, EnvironmentVariableName, MergePlanId, RunForceParams, RunId,
-    RunListParams, RunLogsParams, RunProfileDefaultRequest, RunProfileListRequest, RunProfileName,
+    ConnectionSetRequest, EnvironmentVariableName, StackId, RunForceParams, RunId, RunListParams,
+    RunLogsParams, RunProfileDefaultRequest, RunProfileListRequest, RunProfileName,
     RunProfileRunRequest, RunProfileScope, RunProfileSelector, RunProfileSetRequest,
     RunStatusParams, RunWatchParams, StaticConnectionValues,
 };
@@ -47,6 +47,63 @@ fn profile_operations() -> (
     (target, selector, set, run)
 }
 
+#[tokio::test]
+async fn optional_control_authority_defaults_are_explicitly_unavailable() {
+    let authority = FakeAuthority::new("ws://127.0.0.1:8080/native-v2/oecp");
+    let target = direct_target("http://127.0.0.1:8080");
+    assert_eq!(
+        authority
+            .review_cache_namespace(&target)
+            .await
+            .assert_value(),
+        None
+    );
+    assert_eq!(
+        authority
+            .default_resource_scope(&target)
+            .await
+            .assert_value(),
+        ConnectionScope::User
+    );
+    let prepared = run_request();
+    let request = zeroshot_engine::native_v2_review::ReviewResolutionRequest {
+        url: "https://github.com/open-engine/zeroshot/issues/1".to_owned(),
+        branch: None,
+        revision: None,
+    };
+    assert!(
+        authority
+            .resolve_review(&target, request, &prepared.intent.runtime)
+            .await
+            .assert_error()
+            .to_string()
+            .contains("does not advertise task resolution")
+    );
+    assert!(
+        authority
+            .delegation(
+                &target,
+                zeroshot_engine::native_v2_cli::DelegationAction::List {
+                    owner: openengine_cluster_protocol::DelegationOwner::User,
+                    organization_id: None,
+                },
+            )
+            .await
+            .assert_error()
+            .to_string()
+            .contains("does not advertise delegation management")
+    );
+    let (_, _, _, run) = profile_operations();
+    assert!(
+        authority
+            .profile_run(&target, &run)
+            .await
+            .assert_error()
+            .to_string()
+            .contains("profile runs are unavailable")
+    );
+}
+
 #[test]
 fn profile_run_debug_exposes_routing_identity_and_redacts_every_secret_value() {
     let (_, _, _, mut run) = profile_operations();
@@ -86,7 +143,7 @@ fn hosted_connector(
 ) -> NativeV2TargetConnector<MemoryRegistry, FakeAuthority, FakeDialer> {
     let registry = MemoryRegistry::default();
     registry
-        .insert(hosted_target("cloud", "https://target.example"))
+        .insert(hosted_target("platform", "https://target.example"))
         .assert_value();
     NativeV2TargetConnector::new(registry, authority, FakeDialer::default())
 }
@@ -115,7 +172,7 @@ fn target_origins_match_the_existing_hosted_cli_contract() {
 #[test]
 fn target_access_is_explicit_and_hosted_remains_the_default() {
     let hosted = prepare_target(TargetAdd {
-        name: "cloud".to_owned(),
+        name: "platform".to_owned(),
         url: "https://target.example".to_owned(),
         direct: false,
     })
@@ -192,7 +249,7 @@ async fn authorities_without_profile_support_fail_closed_for_every_profile_opera
 }
 
 #[tokio::test]
-async fn connector_preserves_fail_closed_profile_and_merge_plan_errors() {
+async fn connector_preserves_fail_closed_profile_and_stack_errors() {
     let authority = FakeAuthority::new("ws://127.0.0.1:1/native-v2/oecp");
     let (target, selector, set, _) = profile_operations();
     let registry = MemoryRegistry::default();
@@ -244,19 +301,15 @@ async fn connector_preserves_fail_closed_profile_and_merge_plan_errors() {
     );
     for error in [
         connector
-            .merge_plan_status("vm", MergePlanId::new("plan-1"))
+            .stack_status("vm", StackId::new("stack-1"))
             .await
             .assert_error(),
         connector
-            .merge_plan_force("vm", MergePlanId::new("plan-1"))
+            .stack_force("vm", StackId::new("stack-1"))
             .await
             .assert_error(),
     ] {
-        assert!(
-            error
-                .to_string()
-                .contains("hosted merge plans are unavailable")
-        );
+        assert!(error.to_string().contains("hosted stacks are unavailable"));
     }
     assert!(authority.calls().is_empty());
 }
@@ -274,7 +327,7 @@ async fn connector_preserves_connection_and_checkpoint_authority_failures() {
     let errors = [
         connector
             .connection_list(
-                "cloud",
+                "platform",
                 ConnectionListRequest {
                     scope: ConnectionScope::User,
                 },
@@ -283,7 +336,7 @@ async fn connector_preserves_connection_and_checkpoint_authority_failures() {
             .assert_error(),
         connector
             .connection_set(
-                "cloud",
+                "platform",
                 ConnectionSetRequest {
                     key: key.clone(),
                     scope: ConnectionScope::User,
@@ -294,7 +347,7 @@ async fn connector_preserves_connection_and_checkpoint_authority_failures() {
             .assert_error(),
         connector
             .connection_delete(
-                "cloud",
+                "platform",
                 ConnectionDeleteRequest {
                     key,
                     scope: ConnectionScope::User,
@@ -309,7 +362,7 @@ async fn connector_preserves_connection_and_checkpoint_authority_failures() {
             .contains("fake connection management is unavailable")
     }));
     let checkpoint_error = connector
-        .connect_workspace_checkpoints("cloud", RunId::new("checkpoint-run"))
+        .connect_workspace_checkpoints("platform", RunId::new("checkpoint-run"))
         .await
         .assert_error()
         .to_string();
@@ -327,12 +380,12 @@ async fn connector_preserves_hosted_lifecycle_failures_without_fallback() {
     let run_id = RunId::new("run-hosted");
     let errors = [
         connector
-            .hosted_run_list("cloud", RunListParams {})
+            .hosted_run_list("platform", RunListParams {})
             .await
             .assert_error(),
         connector
             .hosted_run_status(
-                "cloud",
+                "platform",
                 RunStatusParams {
                     run_id: run_id.clone(),
                 },
@@ -341,7 +394,7 @@ async fn connector_preserves_hosted_lifecycle_failures_without_fallback() {
             .assert_error(),
         connector
             .hosted_run_watch(
-                "cloud",
+                "platform",
                 RunWatchParams {
                     run_id: run_id.clone(),
                     from_cursor: None,
@@ -351,7 +404,7 @@ async fn connector_preserves_hosted_lifecycle_failures_without_fallback() {
             .assert_error(),
         connector
             .hosted_run_logs(
-                "cloud",
+                "platform",
                 RunLogsParams {
                     run_id: run_id.clone(),
                     from_cursor: None,
@@ -361,7 +414,7 @@ async fn connector_preserves_hosted_lifecycle_failures_without_fallback() {
             .await
             .assert_error(),
         connector
-            .hosted_run_force("cloud", RunForceParams { run_id })
+            .hosted_run_force("platform", RunForceParams { run_id })
             .await
             .assert_error(),
     ];
@@ -378,11 +431,11 @@ async fn connector_delegates_login_and_rejects_an_unresolved_source_before_submi
     let authority = FakeAuthority::new("ws://127.0.0.1:1/native-v2/oecp");
     let connector = hosted_connector(authority.clone());
 
-    connector.login("cloud").await.assert_value();
+    connector.login("platform").await.assert_value();
     let mut request = run_request();
     request.source = None;
     let error = connector
-        .submit("cloud", request)
+        .submit("platform", request)
         .await
         .assert_error()
         .to_string();
@@ -395,7 +448,7 @@ async fn connector_delegates_login_and_rejects_an_unresolved_source_before_submi
 
 #[test]
 fn connector_errors_hide_transport_details_but_preserve_typed_failures() {
-    let target = hosted_target("cloud", "https://target.example");
+    let target = hosted_target("platform", "https://target.example");
     let disconnected = cli_connector_error(
         &target,
         TargetConnectorError::OecpConnection("private endpoint detail".to_owned()),

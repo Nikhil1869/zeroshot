@@ -19,12 +19,14 @@ pub(super) use connections::test_authority;
 #[path = "hosted_authority/direct.rs"]
 mod direct;
 pub(super) use direct::{spawn_direct_target_authority, spawn_rejecting_direct_target_authority};
-#[path = "hosted_authority/merge_plans.rs"]
-mod merge_plans;
+#[path = "hosted_authority/machine.rs"]
+mod machine;
 #[path = "hosted_authority/problem_errors.rs"]
 mod problem_errors;
 #[path = "hosted_authority/runtime_lanes.rs"]
 mod runtime_lanes;
+#[path = "hosted_authority/stacks.rs"]
+mod stacks;
 
 type HostedTestBackend = zeroshot_engine::native_v2_cli::oecp::NamedTargetCliBackend<
     NativeV2TargetConnector<
@@ -80,6 +82,7 @@ pub(super) struct CapturedHttpRequest {
     pub(super) method: String,
     pub(super) path: String,
     pub(super) authorization: Option<String>,
+    pub(super) organization: Option<String>,
     pub(super) body: String,
 }
 
@@ -281,6 +284,12 @@ fn controller_response(
     address: std::net::SocketAddr,
 ) -> Option<String> {
     match (request.method.as_str(), request.path.as_str()) {
+        ("GET", "/auth/v1/me") => {
+            Some(json!({"id": "00000000-0000-4000-8000-000000000001"}).to_string())
+        }
+        ("GET", "/api/v1/machine") => Some(json!({"owner":
+            if request.authorization.as_deref() == Some("Bearer user-machine-key") { "user" } else { "org" }
+        }).to_string()),
         ("POST", "/native-v2/run") => {
             Some(r#"{"runId":"018f5e78-7f95-7c22-8d98-3f15af20c991"}"#.to_owned())
         }
@@ -314,6 +323,13 @@ fn hosted_discovery(origin: &str) -> String {
             "cachePolicy": "no-store"
         },
         "extensions": {
+            "api_key": {
+                "kind": "zeroshot.api-key-authentication/v1",
+                "header": "Authorization", "scheme": "Bearer",
+                "organization_header": "X-Zeroshot-Organization",
+                "identity_path": "/api/v1/machine",
+                "delegations_path": "/auth/v1/delegations"
+            },
             "run_profiles": {
                 "kind": "zeroshot.run-profiles/v1",
                 "baseUrl": origin,
@@ -344,13 +360,13 @@ fn hosted_discovery(origin: &str) -> String {
                     "page": "/native-v2/workspaces/user/runs/{run_id}/history{?after}"
                 }
             },
-            "merge_plans": {
-                "kind": "zeroshot.merge-plans/v1",
+            "stacks": {
+                "kind": "zeroshot.stacks/v1",
                 "baseUrl": origin,
                 "routeTemplates": {
-                    "create": "/native-v2/merge-plans",
-                    "status": "/native-v2/merge-plans/{plan_id}",
-                    "force": "/native-v2/merge-plans/{plan_id}/force"
+                    "create": "/native-v2/stacks",
+                    "status": "/native-v2/stacks/{stack_id}",
+                    "force": "/native-v2/stacks/{stack_id}/force"
                 }
             },
             "connections": {
@@ -434,11 +450,13 @@ pub(super) async fn read_http_request(stream: &mut tokio::net::TcpStream) -> Cap
     let content_length = header_value(head, "content-length")
         .map_or(0, |value| value.parse::<usize>().assert_value());
     let authorization = header_value(head, "authorization").map(str::to_owned);
+    let organization = header_value(head, "x-zeroshot-organization").map(str::to_owned);
     read_http_body(stream, &mut bytes, header_end + content_length).await;
     CapturedHttpRequest {
         method,
         path,
         authorization,
+        organization,
         body: String::from_utf8(
             bytes
                 .get(header_end..header_end + content_length)

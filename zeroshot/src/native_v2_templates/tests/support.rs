@@ -70,11 +70,12 @@ pub(super) fn runtime_for(
     if let Some((name, binding)) = template.delivery_runtime_binding(delivery).assert_value() {
         nodes.insert(name, binding);
     }
-    RuntimePlan::Codex {
-        provider: CodexProvider::OpenAi,
-        size: RunSize::Medium,
+    RuntimePlan::new(
+        openengine_cluster_protocol::RuntimeLane::new("codex", (CodexProvider::OpenAi).name())
+            .assert_value(),
+        RunSize::Medium,
         nodes,
-    }
+    )
 }
 
 fn agent_binding() -> NodeRuntimeBinding {
@@ -82,6 +83,9 @@ fn agent_binding() -> NodeRuntimeBinding {
         lane: None,
         model: ModelId::new("gpt-5.6").assert_value(),
         effort: Some(ReasoningEffort::Max),
+        harness_config: None,
+        context_window: None,
+        max_tokens: None,
         session_scope: SessionScope::Execution,
         connections: DeclaredConnections::empty(),
     }
@@ -280,6 +284,7 @@ pub(super) fn delivery_receipt(mode: DeliveryMode, outcome: &str) -> serde_json:
         receipt["headBranch"] = json!("zeroshot/v2-test");
     } else {
         receipt["pullRequestId"] = json!("17");
+        receipt["links"] = json!({});
     }
     if let Some(merge_revision) = merge_revision {
         receipt["mergeRevision"] = json!(merge_revision);

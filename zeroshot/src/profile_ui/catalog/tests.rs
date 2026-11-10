@@ -29,12 +29,8 @@ fn delivery_choices_use_native_contracts_and_preserve_legacy_identities() {
             choice["node"]["signals"][DELIVERY_SIGNAL_FIELD],
             json!(delivery_signal_labels(mode).assert_value())
         );
-        let binding = if mode == DeliveryMode::Push {
-            json!({"kind":"git_delivery"})
-        } else {
-            json!({"kind":"git_delivery","connections":{"github":["GH_TOKEN"]}})
-        };
-        assert_eq!(choice["runtimeBinding"], binding);
+        // The selected instance supplies delivery connections at submission.
+        assert_eq!(choice["runtimeBinding"], json!({"kind":"git_delivery"}));
         assert_eq!(
             choice["node"]["input"]["fields"]["issueNumber"]["required"],
             false
@@ -61,7 +57,7 @@ fn delivery_choices_use_native_contracts_and_preserve_legacy_identities() {
 #[tokio::test]
 async fn template_variants_keep_exact_factory_graphs_and_admit_with_factory_bindings() {
     let templates = templates().assert_value();
-    assert_eq!(templates.len(), 7);
+    assert_eq!(templates.len(), 11);
     for template in templates {
         let kind =
             BuiltinGraphTemplate::parse(template["name"].as_str().assert_value()).assert_value();
@@ -69,6 +65,7 @@ async fn template_variants_keep_exact_factory_graphs_and_admit_with_factory_bind
             "pull_request" => TemplateDelivery::PullRequest,
             "push" => TemplateDelivery::Push,
             "merge" => TemplateDelivery::Merge,
+            "comment" => TemplateDelivery::Comment,
             _ => TemplateDelivery::None,
         };
         assert_eq!(
@@ -103,6 +100,24 @@ async fn template_variants_keep_exact_factory_graphs_and_admit_with_factory_bind
 }
 
 #[test]
+fn first_template_choices_use_their_default_delivery_bindings() {
+    let choices = templates().assert_value();
+    for (template, kind) in [
+        (BuiltinGraphTemplate::IssueReview, "comment_delivery"),
+        (BuiltinGraphTemplate::PrReview, "comment_delivery"),
+        (BuiltinGraphTemplate::CodeReview, "comment_delivery"),
+        (BuiltinGraphTemplate::SoftwareChange, "git_delivery"),
+    ] {
+        let choice = choices
+            .iter()
+            .find(|choice| choice["name"] == template.name())
+            .assert_value();
+        assert_eq!(choice["delivery"], template.default_delivery().name());
+        assert_eq!(choice["runtimeBindings"]["deliver"]["kind"], kind);
+    }
+}
+
+#[test]
 fn software_templates_keep_one_worker_session_and_fresh_reviewers() {
     for template in templates()
         .assert_value()
@@ -114,4 +129,52 @@ fn software_templates_keep_one_worker_session_and_fresh_reviewers() {
         assert!(bindings["acceptance"].is_null());
         assert!(bindings["code"].is_null());
     }
+}
+
+#[test]
+fn research_editor_bindings_keep_four_sessions_and_a_fresh_reviewer() {
+    let templates = templates().assert_value();
+    for mode in ["none", "push"] {
+        let template = templates
+            .iter()
+            .find(|t| t["name"] == "auto-research" && t["delivery"] == mode)
+            .assert_value();
+        let bindings = &template["runtimeBindings"];
+        for role in ["explorer", "synthesizer", "challenger", "researcher"] {
+            assert_eq!(bindings[role]["sessionScope"], "node_instance");
+        }
+        assert!(
+            bindings.get("reviewer").is_none(),
+            "reviewer uses the protocol's execution default"
+        );
+        assert_eq!(
+            bindings.get("checkpoint_delivery").is_some(),
+            mode == "push"
+        );
+    }
+}
+
+#[tokio::test]
+async fn decision_worker_uses_the_native_contract_and_keeps_the_model_caller_owned() {
+    let choice = workers()
+        .unwrap()
+        .into_iter()
+        .find(|value| value["runtimeKind"] == "decision")
+        .unwrap();
+    assert_eq!(choice["runtimeBinding"]["model"], "");
+    let mut node = choice["node"].clone();
+    node["name"] = json!("triage");
+    let graph = crate::native_v2_candidate::test_support::full_graph(vec![
+        node,
+        crate::native_v2_candidate::test_support::success_node(),
+    ]);
+    let mut binding = choice["runtimeBinding"].clone();
+    binding["model"] = json!("caller/model");
+    let runtime = serde_json::from_value(
+        json!({"harness":"codex","provider":"openai","size":"small","nodes":{"triage":binding}}),
+    )
+    .unwrap();
+    super::super::validate_profile(&graph, &runtime)
+        .await
+        .unwrap();
 }

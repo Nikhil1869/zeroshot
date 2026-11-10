@@ -70,6 +70,7 @@ pub(in crate::native_v2_delivery) enum Script {
 }
 
 pub(in crate::native_v2_delivery) struct FakeGitHub {
+    pub(super) feedback_authority: Option<(GhCliDeliveryAuthority, PathBuf)>,
     remote: PathBuf,
     script: Script,
     pub(super) pushed: AtomicBool,
@@ -83,6 +84,7 @@ pub(in crate::native_v2_delivery) struct FakeGitHub {
     pub(super) inspections: AtomicUsize,
     pub(super) feedback_reads: AtomicUsize,
     pub(super) delivery_reads: AtomicUsize,
+    pub(super) delivery_read_branches: Mutex<Vec<String>>,
     pub(super) reviews: Mutex<Vec<SourceReviewRequest>>,
     pub(super) review_sync_attempts: AtomicUsize,
     pub(super) conflict_materializations: AtomicUsize,
@@ -92,6 +94,7 @@ pub(in crate::native_v2_delivery) struct FakeGitHub {
 impl FakeGitHub {
     pub(in crate::native_v2_delivery) fn new(remote: PathBuf, script: Script) -> Self {
         Self {
+            feedback_authority: None,
             remote,
             script,
             pushed: AtomicBool::new(false),
@@ -108,6 +111,7 @@ impl FakeGitHub {
             inspections: AtomicUsize::new(0),
             feedback_reads: AtomicUsize::new(0),
             delivery_reads: AtomicUsize::new(0),
+            delivery_read_branches: Mutex::new(Vec::new()),
             reviews: Mutex::new(Vec::new()),
             review_sync_attempts: AtomicUsize::new(0),
             conflict_materializations: AtomicUsize::new(0),
@@ -370,6 +374,10 @@ impl SourceDeliveryAuthority for FakeGitHub {
         _credential: SourceDeliveryCredential<'_>,
     ) -> Result<SourceDeliverySnapshot, SourceDeliveryError> {
         let read = self.delivery_reads.fetch_add(1, Ordering::SeqCst);
+        self.delivery_read_branches
+            .lock()
+            .assert_value()
+            .push(request.head_branch.to_owned());
         if matches!(self.script, Script::PreflightRefusedAfterTransientRead) && read == 0 {
             return Err(SourceDeliveryError::Unavailable);
         }
@@ -624,10 +632,18 @@ impl SourceDeliveryAuthority for FakeGitHub {
 
     async fn inspect_review_feedback(
         &self,
-        _review: &SourceReviewReceipt,
-        _credential: SourceDeliveryCredential<'_>,
+        review: &SourceReviewReceipt,
+        credential: SourceDeliveryCredential<'_>,
     ) -> Result<SourceReviewFeedback, SourceDeliveryError> {
         let read = self.feedback_reads.fetch_add(1, Ordering::SeqCst);
+        if let Some((authority, program)) = &self.feedback_authority {
+            fs::write(format!("{}.review", program.display()), json!({
+                "number":17,
+                "base":{"ref":review.target_branch,"sha":"a".repeat(40),"repo":{"full_name":review.repository}},
+                "head":{"ref":review.head_branch,"sha":review.head_revision,"repo":{"full_name":review.repository}},
+            }).to_string()).assert_value();
+            return authority.inspect_review_feedback(review, credential).await;
+        }
         if matches!(self.script, Script::FeedbackReadTransient) && read == 0 {
             return Err(SourceDeliveryError::Unavailable);
         }
@@ -1004,6 +1020,9 @@ case "$endpoint:$method" in
     ;;
   repos/acme/project/issues/208/comments:POST)
     /usr/bin/printf '%s\n' '{"id":71}'
+    ;;
+  'repos/acme/project/rules/branches/main?per_page=100:GET')
+    /usr/bin/printf '%s\n' '[[]]'
     ;;
   graphql:GET)
     /usr/bin/printf '%s%s%s%s%s%s\n' \

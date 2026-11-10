@@ -23,10 +23,12 @@ mod connections;
 mod context;
 #[path = "execution/failure.rs"]
 mod failure;
-#[path = "execution/merge_plans.rs"]
-mod merge_plans;
+#[path = "graph_tree.rs"]
+mod graph_tree;
 #[path = "execution/profiles.rs"]
 mod profiles;
+#[path = "execution/stacks.rs"]
+mod stacks;
 #[path = "execution/status.rs"]
 mod status;
 #[path = "execution/submission.rs"]
@@ -34,7 +36,10 @@ mod submission;
 use attach::{RoutedAttach, follow_attach};
 pub(crate) use context::CliExecutionContext;
 pub use failure::RunFailure;
-pub use submission::{try_execute_native_v2_preflight, try_execute_native_v2_static};
+pub use submission::{
+    try_execute_native_v2_preflight, try_execute_native_v2_static,
+    try_execute_native_v2_static_with_terminal,
+};
 use submission::{RunSubmission, select_connection_requirements, submit_run, validate_github_token};
 use status::outcome_for_status;
 
@@ -71,17 +76,11 @@ where
     if let Some(outcome) = try_execute_native_v2_static(&command, output)? {
         return Ok(outcome);
     }
-    if command.is_plan_operation() {
-        return merge_plans::execute(command, context, signal, output).await;
+    if command.is_stack_operation() {
+        return stacks::execute(command, context, signal, output).await;
     }
-    if command.is_connection_operation() {
-        return connections::execute_connection(command, context.backend, output).await;
-    }
-    if command.is_profile_operation() {
-        return profiles::execute_profile(command, context.backend, output).await;
-    }
-    if command.is_target_operation() {
-        return execute_target(command, context.backend).await;
+    if command.is_management_operation() {
+        return execute_management(command, context.backend, output).await;
     }
     match command {
         NativeV2CliCommand::Run(run) => execute_run(*run, context, signal, output).await,
@@ -89,6 +88,26 @@ where
         | NativeV2CliCommand::TargetServe(_)
         | NativeV2CliCommand::Ui { .. } => Err(NativeV2CliError::ProcessCommand),
         command => execute_run_operation(command, context, signal, output).await,
+    }
+}
+
+async fn execute_management<B: NativeV2CliBackend, W: Write>(
+    command: NativeV2CliCommand,
+    backend: &B,
+    output: &mut W,
+) -> Result<CliOutcome, NativeV2CliError> {
+    if command.is_connection_operation() {
+        return connections::execute_connection(command, backend, output).await;
+    }
+    if command.is_profile_operation() {
+        return profiles::execute_profile(command, backend, output).await;
+    }
+    match command {
+        NativeV2CliCommand::Delegation(command) => {
+            write_json(output, &backend.delegation(command).await?)?;
+            Ok(CliOutcome::Completed)
+        }
+        command => execute_target(command, backend).await,
     }
 }
 
@@ -156,7 +175,7 @@ where
     B: NativeV2CliBackend,
     W: Write,
 {
-    let run = command.run;
+    let run = &command.run;
     let status = context
         .backend
         .run_status(
@@ -167,10 +186,12 @@ where
         )
         .await?;
     if !status.workspace_recovery.recoverable {
-        return Err(NativeV2CliError::Target(
+        return Err(NativeV2CliError::Usage(
             "run does not have a recoverable workspace".to_owned(),
         ));
     }
+    context.backend.validate_resume_selection(&command).await?;
+    let run = command.run;
     let requirements = context
         .backend
         .authorize_resume_connection_requirements(
@@ -180,14 +201,20 @@ where
         )
         .await?;
     let connections = select_connection_requirements(requirements, context.environment)?;
-    let github_token = (context.environment)("GH_TOKEN")
+    let allow_legacy_github_token = run.target.is_none()
+        || status
+            .source
+            .as_ref()
+            .is_some_and(crate::native_v2_candidate::is_github_com_source);
+    let github_token = allow_legacy_github_token
+        .then(|| (context.environment)("GH_TOKEN"))
+        .flatten()
         .map(|value| {
             value
                 .into_string()
                 .map_err(|_| NativeV2CliError::GitHubToken)
+                .and_then(validate_github_token)
         })
-        .transpose()?
-        .map(validate_github_token)
         .transpose()?;
     let result = context
         .backend
@@ -201,6 +228,7 @@ where
                 connection_resolver: None,
                 github_token,
                 git_credentials: None,
+                commit_identity: None,
             },
         )
         .await?;
@@ -312,20 +340,50 @@ where
 {
     match command {
         NativeV2CliCommand::Watch(RunWatchCommand { run, after }) => {
-            follow_durable(
+            let target = run.target.as_deref();
+            let run_id = run.run_id.clone();
+
+            let detach = signal.wait();
+            tokio::pin!(detach);
+
+            let mut observed = failure::FailureOutput::new(output);
+
+            let outcome = follow_durable_with_detach(
                 DurableFollow {
                     backend,
-                    target: run.target.as_deref(),
-                    run_id: run.run_id,
+                    target,
+                    run_id: run_id.clone(),
                     kind: DurableFollowKind::Watch,
                     initial_cursor: after,
                     execution: None,
                 },
-                signal,
-                output,
+                detach.as_mut(),
+                &mut observed,
             )
-            .await
+            .await?;
+
+            if outcome == CliOutcome::Failed {
+                let failure = if let Some(context) = observed.context {
+                    RunFailure::from_context(run_id, target, context)
+                } else if let Some(reason) = observed.reason {
+                    RunFailure::read_with_reason(
+                        backend,
+                        target,
+                        run_id,
+                        Some(reason),
+                        detach.as_mut(),
+                    )
+                    .await
+                } else {
+                    RunFailure::read(backend, target, run_id, detach.as_mut()).await
+                };
+
+                return Err(NativeV2CliError::RunFailed(Box::new(failure)));
+            }
+
+            Ok(outcome)
         }
+
         NativeV2CliCommand::Logs(RunLogsCommand {
             run,
             after,
@@ -345,6 +403,7 @@ where
             )
             .await
         }
+
         NativeV2CliCommand::Attach { run, execution } => {
             follow_attach(
                 backend,
@@ -360,12 +419,12 @@ where
             )
             .await
         }
+
         _ => Err(NativeV2CliError::Usage(
             "expected a subscription run operation".to_owned(),
         )),
     }
 }
-
 async fn execute_run<B, S, W>(
     run: RunCommand,
     context: &CliExecutionContext<'_, B>,
@@ -395,6 +454,7 @@ where
         return Ok(CliOutcome::Detached);
     }
     let target = run.target.as_deref();
+    let mut observed = failure::FailureOutput::new(output);
     let outcome = match follow_durable_with_detach(
         DurableFollow {
             backend: context.backend,
@@ -405,7 +465,7 @@ where
             execution: None,
         },
         detach.as_mut(),
-        output,
+        &mut observed,
     )
     .await?
     {
@@ -420,16 +480,21 @@ where
                 biased;
                 () = detach.as_mut() => CliOutcome::Detached,
                 result = context.backend.run_status(target, params) => {
-                    outcome_for_status(&result?.status)
+                    let result = result?;
+                    observed.observe(&result.status);
+                    outcome_for_status(&result.status)
                 }
             }
         }
         outcome => outcome,
     };
     if outcome == CliOutcome::Failed {
-        let failure =
-            RunFailure::read(context.backend, target, receipt.run_id, detach.as_mut()).await;
-        return Err(NativeV2CliError::RunFailed(failure));
+        let failure = if let Some(failure) = observed.context {
+            RunFailure::from_context(receipt.run_id, target, failure)
+        } else {
+            RunFailure::read(context.backend, target, receipt.run_id, detach.as_mut()).await
+        };
+        return Err(NativeV2CliError::RunFailed(Box::new(failure)));
     }
     Ok(outcome)
 }
@@ -499,7 +564,7 @@ where
         match self {
             Self::Watch(subscription) => subscription.next().await.map(|item| {
                 item.map(|item| match item {
-                    CliSubscriptionItem::Event(event) => DurableItem::Watch(event),
+                    CliSubscriptionItem::Event(event) => DurableItem::Watch(Box::new(event)),
                     CliSubscriptionItem::Closed { reason } => DurableItem::Closed(reason),
                 })
             }),
@@ -514,7 +579,7 @@ where
 }
 
 enum DurableItem {
-    Watch(CliRunWatchEventNotification),
+    Watch(Box<CliRunWatchEventNotification>),
     Log(RunLogEventNotification),
     Closed(SubscriptionCloseReason),
 }
@@ -649,7 +714,7 @@ fn write_durable_event(
     let outcome = match event {
         DurableItem::Watch(event) => {
             let outcome = watched_outcome(&event.status);
-            output.watch_event(event)?;
+            output.watch_event(*event)?;
             outcome
         }
         DurableItem::Log(event) => {

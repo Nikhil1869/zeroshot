@@ -54,20 +54,54 @@ class ActiveExecution:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class FailureDiagnostic:
+    """One producer-redacted failure record retained with the run.
+
+    Args:
+        message: Bounded secret-safe explanation.
+        execution: Associated executable graph node, or None for a run-wide record.
+        cursor: Cursor of the original diagnostic log, when durably recorded.
+    """
+
+    message: str
+    execution: ActiveExecution | None = None
+    cursor: str | None = None
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class FailureContext:
+    """Recorded failure evidence without inferring causality from log order.
+
+    Args:
+        primary: Explicitly identified runtime failure, when available.
+        recorded: Recent failure records, which may include recovered or voided attempts.
+        incomplete: Whether additional failure evidence may be missing from this summary.
+    """
+
+    primary: FailureDiagnostic | None = None
+    recorded: tuple[FailureDiagnostic, ...] = ()
+    incomplete: bool = False
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class RunResult:
     """Terminal outcome from Client.run(), Run.wait(), or Run.force_stop().
 
     Args:
         run_id: Public durable run identity.
         succeeded: Whether the graph completed successfully.
-        output: Successful graph output, which may be JSON null.
+        output: Successful graph-authored output, which may be JSON null.
+        delivery_receipt: Native delivery evidence, independent of output; None when unavailable.
         failure: Stable nonempty failure reason when succeeded is false.
+        context: Structured safe failure evidence, or None for older run data.
     """
 
     run_id: str
     succeeded: bool
     output: JsonValue = None
+    delivery_receipt: JsonValue = None
     failure: str | None = None
+    context: FailureContext | None = None
 
     def raise_for_failure(self) -> None:
         """Raise RunFailedError for a failed graph result; otherwise return None."""
@@ -95,7 +129,7 @@ class RunStatus:
     run_id: str
     title: str
     source: ResolvedSource | None
-    size: Literal["small", "medium", "large"]
+    size: Literal["small", "medium", "large", "xl", "gpu_t4"]
     cursor: str
     phase: Literal["admitted", "running", "stopping", "finished"]
     active_executions: tuple[ActiveExecution, ...] = ()
@@ -119,7 +153,7 @@ class RunSummary:
     run_id: str
     title: str
     source: ResolvedSource | None
-    size: Literal["small", "medium", "large"]
+    size: Literal["small", "medium", "large", "xl", "gpu_t4"]
     cursor: str
     phase: Literal["admitted", "running", "stopping", "finished"]
     force_stop_requested: bool

@@ -1,9 +1,28 @@
 use openengine_cluster_testkit::assertions::AssertValue;
 
 use super::*;
-use crate::native_v2_candidate::NativeV2HarnessConfig;
+use crate::harnesses::{HarnessBuildContext, HarnessHost};
 use crate::native_v2_candidate::test_support::TestDirectory;
 use crate::native_v2_contract::RuntimeLane;
+
+fn assert_contained_lane(
+    context: &HarnessBuildContext,
+    filesystem: &CapsuleFilesystem,
+    root: &TestDirectory,
+) {
+    assert_eq!(context.workspace, filesystem.workspace);
+    assert_eq!(context.runtime_home, filesystem.runtime_home);
+    assert!(matches!(context.host, HarnessHost::Contained { .. }));
+    assert_eq!(
+        context.base_environment.get("ZEROSHOT_TOOLS"),
+        Some(&root.child("tools").to_string_lossy().into_owned())
+    );
+    assert!(
+        context
+            .search_path
+            .starts_with(&format!("{}:", root.child("tools/bin").display()))
+    );
+}
 
 fn recovery_document(run_id: &RunId) -> HostedRecoveryDocument {
     HostedRecoveryDocument {
@@ -42,25 +61,10 @@ fn cleanup_request<'a>(
 }
 
 fn test_allocator(root: &Path) -> ProductionCapsuleAllocator {
-    let harness = PathBuf::from("/usr/bin/false");
-    ProductionCapsuleAllocator::new(ProductionCapsuleConfig {
-        workspace_storage: None,
-        storage_root: root.to_path_buf(),
-        copilot_executable: harness.clone(),
-        codex_executable: harness.clone(),
-        claude_executable: harness.to_string_lossy().into_owned(),
-        claude_prefix_arguments: Vec::new(),
-        claude_process_environment: ClaudeProcessEnvironment::default(),
-        pi_executable: harness.to_string_lossy().into_owned(),
-        pi_prefix_arguments: Vec::new(),
-        pi_process_environment: PiProcessEnvironment::default(),
-        executable_search_path: "/usr/bin:/bin".to_owned(),
-        git_program: harness.clone(),
-        gh_program: harness,
-        process_pool: HostedProcessPool::new(8_000_000, 8_000_000, 8_001_000).assert_value(),
-        operator_diagnostics: Arc::new(OperatorDiagnosticStore::default()),
-    })
-    .assert_value()
+    let mut config = crate::native_v2_hosting::tests::fixtures::capsule_config(root.to_path_buf());
+    config.git_program = PathBuf::from("/usr/bin/false");
+    config.process_pool = HostedProcessPool::new(8_000_000, 8_000_000, 8_001_000).assert_value();
+    crate::native_v2_hosting::tests::fixtures::capsule_allocator(config).assert_value()
 }
 
 #[test]
@@ -478,11 +482,11 @@ fn hosted_copilot_harness_and_invalid_filesystem_layout_preserve_capsule_boundar
     let allocator = test_allocator(root.path());
     let mut admitted = crate::native_v2_runner::test_support::admitted();
     let nodes = admitted.runtime.nodes().clone();
-    admitted.runtime = crate::native_v2_contract::RuntimePlan::Copilot {
-        provider: crate::native_v2_contract::CopilotProvider::Github,
-        size: crate::native_v2_contract::RunSize::Medium,
+    admitted.runtime = crate::native_v2_contract::RuntimePlan::new(
+        RuntimeLane::new("copilot", "github").assert_value(),
+        crate::native_v2_contract::RunSize::Medium,
         nodes,
-    };
+    );
     let filesystem = CapsuleFilesystem {
         workspace: root.child("workspace"),
         runtime_home: root.child("runtime"),
@@ -492,22 +496,13 @@ fn hosted_copilot_harness_and_invalid_filesystem_layout_preserve_capsule_boundar
     let lanes = allocator
         .lanes(&admitted, &filesystem, process_pool)
         .assert_value();
-    let [NativeV2HarnessConfig::Copilot(config)] = lanes.as_slice() else {
-        panic!("Copilot admission must select only the Copilot harness");
+    let [lane] = lanes.as_slice() else {
+        panic!("Copilot admission must select exactly one harness configuration");
     };
+    assert_eq!(lane.lane().harness_name(), "copilot");
+    let config = &lane.context;
     assert_eq!(config.executable, PathBuf::from("/usr/bin/false"));
-    assert_eq!(config.workspace, filesystem.workspace);
-    assert_eq!(config.runtime_home, filesystem.runtime_home);
-    assert_eq!(
-        config.base_environment.get("ZEROSHOT_TOOLS"),
-        Some(&root.child("tools").to_string_lossy().into_owned())
-    );
-    assert!(
-        config
-            .search_path
-            .starts_with(&format!("{}:", root.child("tools/bin").display()))
-    );
-    assert!(config.local_command_environment.is_empty());
+    assert_contained_lane(config, &filesystem, &root);
 
     assert!(production_filesystem(root.path(), root.path(), process_pool).is_err());
 }
@@ -517,17 +512,21 @@ fn hosted_lanes_build_one_configuration_per_effective_lane_from_shared_capsule_i
     let root = TestDirectory::new("host-mixed-lanes");
     let allocator = test_allocator(root.path());
     let mut admitted = crate::native_v2_runner::test_support::admitted();
-    let claude_anthropic = RuntimeLane::Claude {
-        provider: crate::native_v2_contract::ClaudeProvider::Anthropic,
-    };
+    let claude_anthropic = RuntimeLane::new(
+        "claude",
+        (crate::native_v2_contract::ClaudeProvider::Anthropic).name(),
+    )
+    .expect("valid built-in lane");
     for (node, node_lane) in [
-        ("verify", claude_anthropic),
+        ("verify", claude_anthropic.clone()),
         ("left", claude_anthropic),
         (
             "right",
-            RuntimeLane::Copilot {
-                provider: crate::native_v2_contract::CopilotProvider::Github,
-            },
+            RuntimeLane::new(
+                "copilot",
+                (crate::native_v2_contract::CopilotProvider::Github).name(),
+            )
+            .expect("valid built-in lane"),
         ),
     ] {
         let name = openengine_cluster_protocol::NodeName::new(node).assert_value();
@@ -546,43 +545,20 @@ fn hosted_lanes_build_one_configuration_per_effective_lane_from_shared_capsule_i
     let lanes = allocator
         .lanes(&admitted, &filesystem, allocator.config.process_pool)
         .assert_value();
-    let [
-        NativeV2HarnessConfig::Copilot(copilot),
-        NativeV2HarnessConfig::Codex(codex),
-        NativeV2HarnessConfig::Claude(claude),
-    ] = lanes.as_slice()
-    else {
-        panic!("expected exactly the Copilot, Codex, and Claude lanes in lane order");
-    };
-    assert_eq!(
-        codex.provider,
-        crate::native_v2_contract::CodexProvider::OpenAi
-    );
-    assert_eq!(
-        claude.provider,
-        crate::native_v2_contract::ClaudeProvider::Anthropic
-    );
-    for (workspace, runtime_home) in [
-        (&copilot.workspace, &copilot.runtime_home),
-        (&codex.workspace, &codex.runtime_home),
-        (&claude.workspace, &claude.runtime_home),
+    assert_eq!(lanes.len(), 3);
+    for (harness, provider) in [
+        ("codex", "openai"),
+        ("claude", "anthropic"),
+        ("copilot", "github"),
     ] {
-        assert_eq!(workspace, &filesystem.workspace);
-        assert_eq!(runtime_home, &filesystem.runtime_home);
+        let lane = lanes
+            .iter()
+            .find(|config| config.lane().harness_name() == harness)
+            .assert_value();
+        let context = &lane.context;
+        assert_eq!(lane.lane().provider_name(), provider);
+        assert_contained_lane(context, &filesystem, &root);
     }
-
-    let tools = root.child("tools").to_string_lossy().into_owned();
-    let claude_environment = claude.base_environment.clone_values();
-    assert_eq!(copilot.base_environment.get("ZEROSHOT_TOOLS"), Some(&tools));
-    assert_eq!(codex.base_environment.get("ZEROSHOT_TOOLS"), Some(&tools));
-    assert_eq!(claude_environment.get("ZEROSHOT_TOOLS"), Some(&tools));
-    assert!(
-        copilot
-            .search_path
-            .starts_with(&format!("{}:", root.child("tools/bin").display()))
-    );
-    assert_eq!(codex.search_path, copilot.search_path);
-    assert_eq!(claude_environment.get("PATH"), Some(&copilot.search_path));
 }
 
 #[test]
@@ -591,11 +567,11 @@ fn hosted_pi_harness_builds_the_contained_lane_from_the_capsule() {
     let allocator = test_allocator(root.path());
     let mut admitted = crate::native_v2_runner::test_support::admitted();
     let nodes = admitted.runtime.nodes().clone();
-    admitted.runtime = crate::native_v2_contract::RuntimePlan::Pi {
-        provider: crate::native_v2_contract::PiProvider::Anthropic,
-        size: crate::native_v2_contract::RunSize::Medium,
+    admitted.runtime = crate::native_v2_contract::RuntimePlan::new(
+        RuntimeLane::new("pi", "anthropic").assert_value(),
+        crate::native_v2_contract::RunSize::Medium,
         nodes,
-    };
+    );
     let filesystem = CapsuleFilesystem {
         workspace: root.child("workspace"),
         runtime_home: root.child("runtime"),
@@ -603,31 +579,144 @@ fn hosted_pi_harness_builds_the_contained_lane_from_the_capsule() {
     let lanes = allocator
         .lanes(&admitted, &filesystem, allocator.config.process_pool)
         .assert_value();
-    let [NativeV2HarnessConfig::Pi(config)] = lanes.as_slice() else {
-        panic!("Pi admission must select only the Pi harness");
+    let [lane] = lanes.as_slice() else {
+        panic!("Pi admission must select exactly one harness configuration");
     };
-    assert_eq!(
-        config.provider,
-        crate::native_v2_contract::PiProvider::Anthropic
-    );
-    assert_eq!(config.executable, "/usr/bin/false");
-    assert_eq!(config.workspace, filesystem.workspace);
-    assert_eq!(config.runtime_home, filesystem.runtime_home);
-    // A contained lane never reuses a user home or an ambient environment.
-    assert!(config.local_user_home.is_none());
-    let values = config.base_environment.clone_values();
-    assert_eq!(
-        values.get("HOME").map(String::as_str),
-        filesystem.runtime_home.to_str()
-    );
-    // The capsule adds the run's tools directory and puts it ahead of the base search path.
-    assert_eq!(
-        values.get("ZEROSHOT_TOOLS").map(String::as_str),
-        Some(root.child("tools").to_string_lossy().as_ref())
-    );
-    assert!(
-        values.get("PATH").is_some_and(
-            |path| path.starts_with(&format!("{}:", root.child("tools/bin").display()))
+    assert_eq!(lane.lane().harness_name(), "pi");
+    assert_eq!(lane.lane().provider_name(), "anthropic");
+    let context = &lane.context;
+    assert_eq!(context.executable, PathBuf::from("/usr/bin/false"));
+    assert_contained_lane(context, &filesystem, &root);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn environment_hooks_prepare_private_homes_without_starting_scripts() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    use crate::native_v2_candidate::test_support::admit;
+
+    let uid = unsafe { libc::geteuid() };
+    let gid = unsafe { libc::getegid() };
+    if uid == 0 {
+        return;
+    }
+    let pool = HostedProcessPool::new(uid, gid, uid.saturating_add(1_000)).assert_value();
+    let root = TestDirectory::new("host-environment-hooks");
+    let run_root = root.child("run");
+    std::fs::create_dir(&run_root).assert_value();
+    std::fs::set_permissions(&run_root, std::fs::Permissions::from_mode(0o700)).assert_value();
+    let runtime_home = root.child("runtime");
+    std::fs::create_dir(&runtime_home).assert_value();
+    std::fs::set_permissions(&runtime_home, std::fs::Permissions::from_mode(0o700)).assert_value();
+    let workspace = root.child("workspace");
+    std::fs::create_dir(&workspace).assert_value();
+
+    let run_id = RunId::new("environment-hook-run");
+    let mut admitted = admit(
+        serde_json::from_value(serde_json::json!({
+            "title":"Environment hook fixture",
+            "graph":crate::native_v2_candidate::test_support::full_graph(vec![
+                serde_json::json!({
+                    "kind":"step","name":"work","worker":"agent.work@1",
+                    "instructions":"This node must never start.",
+                    "input":{"kind":"null"},"output":{"kind":"null"},
+                    "inputBindings":[],"writeBindings":[],"attempts":1
+                }),
+                crate::native_v2_candidate::test_support::success_node()
+            ]),
+            "initialInput":null,
+            "runtime":{
+                "harness":"codex","provider":"openai","size":"small",
+                "nodes":{"work":{
+                    "kind":"agent","model":"environment-hook-model","sessionScope":"execution",
+                    "connections":{}
+                }}
+            },
+            "source":{
+                "repository":"acme/project","branch":"main",
+                "revision":"2222222222222222222222222222222222222222"
+            },
+            "submissionKey":"environment-hook-fixture"
+        }))
+        .assert_value(),
+    )
+    .await;
+    admitted.environment = Some(openengine_cluster_protocol::RuntimeEnvironment {
+        setup: None,
+        startup: None,
+        variables: BTreeMap::new(),
+        connections: Default::default(),
+    });
+    let preparation = CapsulePreparation::quiet(&admitted.runtime).assert_value();
+    let request = CapsuleBuildRequest {
+        run_id: &run_id,
+        delivery_run_id: &run_id,
+        adopt_existing_delivery: false,
+        admitted: &admitted,
+        github_token: None,
+        git_credentials: None,
+        commit_identity: None,
+        install_source: false,
+        transfer_retained_workspace: false,
+        preparation,
+        retained_restore: None,
+    };
+    let filesystem = CapsuleFilesystem {
+        workspace: workspace.clone(),
+        runtime_home: runtime_home.clone(),
+    };
+    let (loss_sender, _) = watch::channel(false);
+    let state = ProductionCapsuleState {
+        environment: EnvironmentProcesses::default(),
+        endpoint: OnceLock::new(),
+        run_root: run_root.clone(),
+        checkpoint_directory: root.child("checkpoints"),
+        checkpoint_repository: root.child("checkpoint-repository"),
+        run_root_identity: OnceLock::new(),
+        recovery_path: root.child("recovery.json"),
+        delivery_run_id: run_id.clone(),
+        restored_delivery_run_id: OnceLock::new(),
+        inherited_retained_workspace: false,
+        process_pool: Mutex::new(None),
+        portable_processes: false,
+        _loss_sender: loss_sender,
+        cleanup_turn: Mutex::new(false),
+    };
+    let allocator = test_allocator(root.path());
+    allocator
+        .run_environment_hook(
+            &request,
+            &filesystem,
+            HookContext {
+                state: &state,
+                process_pool: pool,
+                phase: HookPhase::Setup,
+            },
         )
+        .await
+        .assert_value();
+    let setup_home = runtime_home.join("setup-home");
+    let metadata = std::fs::metadata(&setup_home).assert_value();
+    assert!(metadata.is_dir());
+    assert_eq!(metadata.uid(), uid);
+    assert_eq!(metadata.mode() & 0o777, 0o700);
+    allocator
+        .run_environment_hook(
+            &request,
+            &filesystem,
+            HookContext {
+                state: &state,
+                process_pool: pool,
+                phase: HookPhase::Startup,
+            },
+        )
+        .await
+        .assert_value();
+    assert!(
+        !std::fs::read_dir(&workspace)
+            .assert_value()
+            .next()
+            .is_some()
     );
 }

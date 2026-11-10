@@ -28,8 +28,31 @@ Direct `target serve` mounts `/ui/` on its existing listener, stores profiles/hi
 `--storage`, and requires the browser's exact `--public-origin`. Private/hosted targets exclude
 this mount. See the [target image guide](../docker/zeroshot-target/README.md) for persistence and restart behavior.
 
+The bootstrap `harnesses` catalog supplies each host-enabled adapter's `id`, `label`, and
+`providers`. The editor uses this catalog for runtime choices; `runtimeSchema` supplies structural
+fields such as run size and effort. For older hosts that omit the catalog, choices come from their
+legacy runtime schema; an explicit empty catalog offers no adapters. Local catalogs include compiled
+[contributed adapters](../docs/project/harness-adapters.md); target and Platform catalogs use their
+host's enabled registry. Existing unavailable selections remain visible and stay in the profile until
+the author changes them.
+
+Hosting shells may supply a `machines` array in the existing bootstrap. Each entry has `size`,
+`label`, `vcpus`, `memoryMiB`, `diskGiB`, `laneUnits`, and optional
+`gpu: {name, memoryMiB}` or `null`. The shared size picker displays the host label and lane count. Starting a size with Boost uses its full `laneUnits` in Boosts for that run; ordinary
+runs do not spend Boosts merely because a size is selected. This is presentation metadata: the host
+owns admission and billing. An explicit empty list offers no machines. When the array is absent,
+the native `RunSize` schema supplies size identities without resource or pricing claims. Unavailable
+saved selections remain visible until the author changes them. Resource descriptors never enter
+the saved runtime plan.
+
 Profiles contain graphs and agent runtime configuration. Environments belong to run submission,
 not profile authoring. Plain local UI has no environment catalog or management page.
+
+Local profile lists return readable metadata in `profiles` and malformed entries in optional `problems`,
+with each entry's name, default status and diagnostic. The sidebar shows these problems alongside
+usable profiles. Graph/runtime schemas are checked when a profile is opened; unrelated saves and
+metadata operations preserve incompatible entries. Target v1 profile responses retain their original
+`profiles`-only contract; diagnostics are local CLI/UI data. Invalid shared store JSON remains a store error.
 
 For frontend development, keep the native server running:
 
@@ -66,12 +89,12 @@ These are the local browser BFF routes. A selected target is read server-side th
 contracts.
 Omit `after` to begin. SSE resumes from `Last-Event-ID` and closes after the terminal cursor drains.
 
-## Cloud integration
+## Platform integration
 
-Build `ui/dist` from Cloud's exact pinned Zeroshot source revision and mount it on the
-Cloud origin independently of run containers. The shell-less entry is `embed.html`;
+Build `ui/dist` from Platform's exact pinned Zeroshot source revision and mount it on the
+Platform origin independently of run containers. The shell-less entry is `embed.html`;
 `index.html` retains the standalone toolbar. Both entries use the same editor and viewer.
-Cloud must permit its same-origin frame and the workspace's bundled assets/ELK worker in CSP.
+Platform must permit its same-origin frame and the workspace's bundled assets/ELK worker in CSP.
 
 The API-gateway can call `zeroshot_engine::workspace::{catalog, author, data, validate_profile}`
 with Cargo's `workspace` feature; this does not embed UI assets. Authenticated private targets
@@ -98,10 +121,11 @@ same origin and expected parent/iframe window. The iframe first sends
 ```
 
 The authenticated bootstrap must return `version: 1` and
-`workspace: {kind: "cloud", id: workspaceId}`. Bind this ID to user, organization and profile
+`workspace: {kind: "platform", id: workspaceId}`. Bind this ID to user, organization and profile
 scope. Recreating the iframe binds a different authority; protect the old draft before doing so.
+The `platform` kind starts a new browser storage namespace for drafts and preferences.
 Optional CSRF configuration contains names only. The iframe reads the existing cookie for each
-service write and rejects missing/duplicate cookies. Cloud omits this configuration only for its
+service write and rejects missing/duplicate cookies. Platform omits this configuration only for its
 server-selected local authentication mode. Credentials never enter messages.
 
 After `init`, every message carries `version`, `workspaceId`, `documentId`, `generation` and
@@ -113,24 +137,26 @@ The workspace rejects stale document generations. A document switch may change b
 | -------------- | ----------------------------------------------------------------------------------------------------------------------------- |
 | `open_profile` | `nextDocumentId`, optional `discard`, and either `profile: {name, graph, runtime}` with optional `revision`, or `templateId`. |
 | `open_run`     | `nextDocumentId`, `runId`, optional `discard`. History is fetched through the API.                                            |
-| `request_save` | Optional `name` for save-as. The current identity must be a profile.                                                          |
-| `save_ack`     | The snapshot's request ID and generation, with either `saved: {profile, revision}` or `problem: {code, message, details?}`.   |
+| `request_save` | Optional `name` for profile save-as. Captures the current profile or environment draft.                                      |
+| `save_ack`     | The snapshot's request ID and generation, with a saved profile/environment or `problem: {code, message, details?}`.          |
+| `environment_settings` | Environment view only; reports whether opaque host-owned settings are dirty.                                          |
 | `theme`        | `theme: "light"` or `"dark"`.                                                                                                 |
 | `navigate`     | `action: "profiles"`, `"runs"` or `"leave"`, optional `discard`.                                                              |
 
 `templateId: "blank"` creates an empty profile using the existing editor factory; otherwise use a
 bootstrap template's `id` (or `name` when it has no ID). Template opens cannot carry a profile or
-revision. New/imported full documents omit revision. Cloud never constructs graph bindings.
+revision. New/imported full documents omit revision. Platform never constructs graph bindings.
 
 Dirty or unresolved drafts refuse switches with `unsaved_changes`; an explicit host confirmation
 may resend with `discard: true`. Pending saves refuse switches even with discard. The host waits
 for the correlated `state` acknowledgement before changing outer navigation or removing the frame.
 
-`save_snapshot` replies contain `profile: {name, graph, runtime, expectedRevision}`, the captured
-`authority`, and the original request/document/generation envelope. Valid focused field edits commit
-before capture; unresolved edits return a structured problem. The host performs the conditional
-write with the captured authority/workspace/revision and returns `save_ack`. An acknowledgement
-only settles its captured snapshot, preserving later edits. A save-as name drops the old revision.
+`save_snapshot` replies contain the captured `authority`, the original request/document/generation
+envelope, and either `profile: {name, graph, runtime, expectedRevision}` or
+`environment: {id?, name, definition, expectedRevision}`. Valid focused field edits commit before
+capture; unresolved edits return a structured problem. The host performs the conditional write and
+returns `save_ack`. An acknowledgement only settles its captured snapshot, preserving later edits.
+A profile save-as name drops the old revision.
 
 Unsolicited `state` messages report `dirty`, `pending`, `validation`, `saving`, `loading` and profile
 `name`. Command replies report `accepted` or a structured `problem`. `navigate` messages from the
@@ -139,30 +165,33 @@ workspace request the host's `save` or `defaults` action. The host keeps selecti
 Set `view: "environments"` and an explicit `environmentApi` collection URL in `init` to mount the hosted environment manager;
 `readOnly: true` disables mutation controls. The server remains responsible for write authorization.
 The manager reuses the same theme, state, and guarded navigation messages, with one document identity
-for its mounted surface. It handles resource selection and conditional CRUD through the service below;
-profile-specific bridge commands are unavailable. Failed writes preserve the draft and saved revision.
+for its mounted surface. It handles resource reads and deletion through the service below. Saves emit
+only the generic environment snapshot; the host may combine it atomically with private metadata before
+acknowledging it. A single opaque dirty bit brings that metadata into the manager's existing navigation
+guard without exposing its shape. Profile-specific bridge commands are unavailable. Failed writes
+preserve the draft and saved revision.
 
 ### Authenticated service paths and history lifecycle
 
 `apiBase` must be a same-origin absolute path ending with `/`. The embedded workspace uses these
 paths beneath it; its profile load/save work passes through the host bridge instead:
 
-| Request                              | Response                                                                 |
-| ------------------------------------ | ------------------------------------------------------------------------ |
-| `GET environmentApi` | `{environments: [{id, name, revision}]}`. |
-| `GET environmentApi/{id}` | `{id, name, definition, revision}`. |
-| `POST environmentApi` | Save `{id?, name, definition, expectedRevision: string or null}`; returns the saved resource. |
-| `DELETE environmentApi/{id}` | Delete with `{expectedRevision}`; returns `{deleted: true}`. |
-| `GET bootstrap`                      | Existing workspace bootstrap with templates, workers and runtime schema. |
-| `POST validate`                      | Native validation of `{graph, runtime}`.                                 |
-| `POST authoring`, `POST data`        | Native draft transform of `{graph, runtime, action}`.                    |
-| `GET runs/{id}`                      | Version 1 admitted definition with projection version 1.                 |
-| `GET runs/{id}/history?after=CURSOR` | Existing ordered native history page.                                    |
-| `GET runs/{id}/events?after=CURSOR`  | SSE `history` pages and structured `history_error` problems.             |
+| Request                              | Response                                                                                      |
+| ------------------------------------ | --------------------------------------------------------------------------------------------- |
+| `GET environmentApi`                 | `{environments: [{id, name, revision}]}`.                                                     |
+| `GET environmentApi/{id}`            | `{id, name, definition, revision}`.                                                           |
+| `POST environmentApi`                | Host save of `{id?, name, definition, expectedRevision: string or null}` plus host-owned fields; returns the saved resource. |
+| `DELETE environmentApi/{id}`         | Delete with `{expectedRevision}`; returns `{deleted: true}`.                                  |
+| `GET bootstrap`                      | Existing workspace bootstrap with templates, workers and runtime schema.                      |
+| `POST validate`                      | Native validation of `{graph, runtime}`.                                                      |
+| `POST authoring`, `POST data`        | Native draft transform of `{graph, runtime, action}`.                                         |
+| `GET runs/{id}`                      | Version 1 admitted definition with projection version 1.                                      |
+| `GET runs/{id}/history?after=CURSOR` | Existing ordered native history page.                                                         |
+| `GET runs/{id}/events?after=CURSOR`  | SSE `history` pages and structured `history_error` problems.                                  |
 
 Environment writes carry the pinned `X-Zeroshot-Workspace` bootstrap identity. The generic hosted
-manager preserves the explicit collection URL's query parameters for CRUD and draft recovery;
-the host owns repository matching, defaults, authorization, and any additional resource fields.
+manager preserves the explicit collection URL's query parameters for reads, deletion, and draft
+recovery; the host owns authorization, persistence, and any additional resource fields.
 It reports opaque `resourceId`/`resourceRevision` state changes so host controls can refresh their
 catalog. Plain local services never create this adapter. Profiles reject `runtime.environment`.
 Committed drafts and their original CAS baseline recover in the same authority and collection
@@ -177,8 +206,8 @@ Definition wrappers and pages may carry
 `observation: {state: "active" | "collecting" | "complete" | "incomplete" | "expired" | "unavailable", code?}`.
 This metadata describes retained observation; current run termination remains separate.
 A `finished` run can still follow `active` or `collecting` observation. Completion closes the stream
-only after `page.complete` drains the observed head. Cloud retains these execution cursors and native
-control records across archive handoff; Cloud status cursors never enter graph playback.
+only after `page.complete` drains the observed head. Platform retains these execution cursors and native
+control records across archive handoff; Platform status cursors never enter graph playback.
 
 ## Verification
 

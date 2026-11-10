@@ -1,3 +1,7 @@
+---
+description: 'RuntimePlan selects execution settings and supplies bindings for graph nodes. It names models and connection fields without containing secrets.'
+---
+
 # RuntimePlan
 
 A `RuntimePlan` says how each executable node in a graph runs. It selects the run size and a default
@@ -12,18 +16,35 @@ machine-readable contract.
 
 ## Document fields
 
-`RuntimePlan` is a closed JSON object. All four fields are required, and unknown fields are rejected.
+`RuntimePlan` is a closed JSON object. The following four fields are required; unknown fields are rejected.
 
 | Field      | Value                                                                              |
 | ---------- | ---------------------------------------------------------------------------------- |
-| `harness`  | Harness of the default lane: `codex`, `claude`, `copilot`, or `pi`                |
+| `harness`  | Registered harness of the default lane                                             |
 | `provider` | Provider of the default lane, supported by the selected harness                    |
 | `size`     | `small`, `medium`, or `large`                                                      |
 | `nodes`    | Object mapping each executable graph node name to a [node binding](#node-bindings) |
 
+Optional `workspaceCheckpoints` is a boolean that defaults to `true`. Local CLI runs may set it
+to `false` to skip workspace snapshot storage and the Restic dependency. Run history, structured
+outputs, usage, and logs remain durable. Restart uses the retained workspace and original graph
+input. Selected workspace-checkpoint resume is unavailable when snapshots were disabled.
+This controls file snapshots, not external side effects or node retry semantics.
+The current named targets reject opt-out explicitly.
+The field is accepted in exact and uniform runtime plans and is preserved in saved profiles.
+
+```json
+{ "workspaceCheckpoints": false }
+```
+
+Optional `activeMemory` controls repository and graph recall/collection independently, and
+`globalAgents.postmortem` configures the built-in after-run specialists. Both default to enabled
+on local CLI runs and direct targets. The same sections are accepted by uniform runtime files.
+See [Active Memory](../guides/active-memory.md) for budgets, provider inheritance and opt-out examples.
+
 `harness` and `provider` form the default lane. Every agent node runs on it unless its binding
-carries its own [`lane`](#per-node-lanes). `size` applies to the whole run. Model, effort, session
-scope, and connections are chosen per node.
+carries its own [`lane`](#per-node-lanes). `size` applies to the whole run. Model, effort, context
+window, output limit, session scope, and connections are chosen per node.
 
 `size` is a run-level resource class. Zeroshot records it with the run and reports it in run
 status; the hosting target decides what resources each class receives.
@@ -47,31 +68,27 @@ This plan binds the three agent nodes of the built-in `software-change` template
 
 ## Harness and provider
 
-`harness` selects which `provider` values parse:
+Harness and provider identifiers are bounded non-control strings. The host registry validates their
+compatibility during admission; see [Harness adapters](../project/harness-adapters.md) for available
+pairs and where each adapter runs. The same compatibility rules apply to an agent node's
+[`lane`](#per-node-lanes).
 
-| `harness` | `provider`                                                |
-| --------- | --------------------------------------------------------- |
-| `codex`   | `openai`, `openrouter`, `bedrock`, `gateway`              |
-| `claude`  | `anthropic`, `openrouter`, `bedrock`, `gateway`           |
-| `copilot` | `github`                                                  |
-| `pi`      | `anthropic`, `openai`, `openrouter`, `bedrock`, `gateway` |
-
-The same pairs apply to an agent node's [`lane`](#per-node-lanes). Any other pair is rejected when
-the plan is read.
-
-`pi/anthropic` and `pi/openai` reuse a local Pi login from `~/.pi/agent`; the other `pi` lanes
+`pi/anthropic`, `pi/openai` and `pi/github` reuse a local Pi login from `~/.pi/agent`; the other `pi` lanes
 need a connection.
 
-`pi/gateway` carries `GATEWAY_BASE_URL`, `GATEWAY_API_KEY`, and `GATEWAY_API`. The last names the
+Pi, Copilot, OpenCode and Hermes gateway lanes carry `GATEWAY_BASE_URL`, `GATEWAY_API_KEY`, and `GATEWAY_API`. The last names the
 wire protocol as `openai-responses`, `openai-completions`, or `anthropic-messages`, so one lane
-reaches any endpoint Pi implements and the model identifier stays opaque and caller-owned. Zeroshot
+selects the native transport and the model identifier stays opaque and caller-owned. Zeroshot
 never infers the protocol from the identifier, and an unrecognized value fails before launch.
+Pi's gateway model entry carries a node's `contextWindow` and `maxTokens` only when the caller
+has declared them; omitted limits keep Pi's own defaults. Built-in-provider endpoint overrides
+keep Pi's catalog and receive no synthesized model entry.
 
-To send the `anthropic` lane to a caller-owned Messages-compatible endpoint, declare
+To send Pi's `anthropic` lane to a caller-owned Messages-compatible endpoint, declare
 `ANTHROPIC_BASE_URL` with any one of the lane's credentials (`ANTHROPIC_API_KEY`,
 `ANTHROPIC_AUTH_TOKEN`, or `ANTHROPIC_OAUTH_TOKEN`); a local run also honors the invoking shell's
 `ANTHROPIC_BASE_URL`. The endpoint override interpolates the API key only when the connection
-supplies it, so a token keeps Pi's own environment authentication. The `openai` lane likewise
+supplies it, so a token keeps Pi's own environment authentication. Pi's `openai` lane likewise
 honors `OPENAI_BASE_URL` or `OPENAI_API_BASE`. Pi ignores these variables itself, so Zeroshot turns each into a provider
 override that keeps that provider's own protocol; the `openai` lane therefore needs a
 Responses-compatible endpoint, and any other protocol uses `pi/gateway`. A declared endpoint ends
@@ -82,21 +99,55 @@ rather than a bypass argument.
 
 ## Node bindings
 
-`kind` selects one of two binding shapes. Fields that belong to the other kind are rejected.
+`kind` selects an agent, script, decision, Git delivery, or comment delivery binding. Fields belonging to another
+kind are rejected.
+
+### `script`
+
+A script binding executes a caller-owned program on an existing `step`, using the step's typed
+input and output. The step must omit `instructions`. This initial implementation is local only.
+Named targets and contained placements reject script bindings.
+
+```json
+{ "kind": "script", "command": ["python3", "retrieve.py"], "connections": {} }
+```
+
+`command` is an executable followed by literal arguments. Zeroshot does not invoke a shell.
+There must be 1 to 128 entries, each at most 8,192 bytes, with no NUL characters and at most
+65,536 bytes in total. The executable must be nonblank. Paths resolve from the run workspace.
+Scripts inherit a small process environment for executable lookup, the user's home directory,
+temporary files and locale. Public run variables and explicitly declared connection fields are
+added through the existing connection resolver. Other ambient credentials are not inherited.
+
+The program receives one JSON value on stdin, followed by EOF, and must exit zero with exactly
+one JSON value on stdout. Zeroshot validates that value against the step's output schema.
+Process input and output are each bounded at 8 MiB. A result must also fit the ledger's
+1 MiB serialized completion event, including execution metadata. Complete stderr is retained
+as bounded diagnostics with resolved connection values redacted. Truncated stderr is omitted because its cut boundary
+may split a credential. A nonzero exit becomes `crash`, and invalid or oversized
+JSON becomes `malformed`. The ordinary graph error and retry rules apply. Cancellation and the
+step's optional `timeoutMs` terminate the process tree through the shared process runner.
+Script steps record zero native model tokens. Services started separately by the application
+may keep indexes or models warm across script invocations. Service lifecycle is application owned.
 
 ### `agent`
 
-| Field          | Required | Value                                                              |
-| -------------- | -------- | ------------------------------------------------------------------ |
-| `kind`         | Yes      | `agent`                                                            |
-| `lane`         | No       | [Harness and provider](#per-node-lanes); default lane when omitted |
-| `model`        | Yes      | Provider-owned model identifier, 1 to 2,048 non-control characters |
-| `effort`       | No       | `low`, `medium`, `high`, `xhigh`, or `max`; unset when omitted     |
-| `sessionScope` | No       | `execution` (default) or `node_instance`                           |
-| `connections`  | No       | [Connection declarations](#connections); empty when omitted        |
+| Field           | Required | Value                                                              |
+| --------------- | -------- | ------------------------------------------------------------------ |
+| `kind`          | Yes      | `agent`                                                            |
+| `lane`          | No       | [Harness and provider](#per-node-lanes); default lane when omitted |
+| `model`         | Yes      | Provider-owned model identifier, 1 to 2,048 non-control characters |
+| `effort`        | No       | `low`, `medium`, `high`, `xhigh`, or `max`; unset when omitted     |
+| `contextWindow` | No       | Model context window, 1 to 10,000,000; unset when omitted          |
+| `maxTokens`     | No       | Model output limit, 1 to 10,000,000; unset when omitted            |
+| `sessionScope`  | No       | `execution` (default) or `node_instance`                           |
+| `connections`   | No       | [Connection declarations](#connections); empty when omitted        |
 
 Zeroshot passes `model` and `effort` to the harness unchanged. It keeps no model catalog and does not
-check whether a model supports the chosen effort.
+check whether a model supports the chosen effort. `contextWindow` and `maxTokens` are caller
+declarations, never inferences: they are validated at admission, emitted only into the
+`pi/gateway` model entry, and otherwise left unset for the provider to default. An absent value
+retains the provider's own limit; a present value must be a positive integer in the stated range.
 
 `sessionScope` controls provider conversation state. It does not change graph state or bindings.
 
@@ -107,6 +158,77 @@ check whether a model supports the chosen effort.
 
 If a reused session is lost, Zeroshot fails that execution with `session_lost`. It does not open a
 replacement session silently.
+
+### `decision`
+
+A decision binding evaluates one categorical question on an existing `verifier`, using the
+TypeSafe System One request and response format. It makes a direct HTTP request, with no coding
+harness or tool access. Upstream nodes must supply the evidence through ordinary input bindings.
+
+```json
+{
+  "kind": "decision",
+  "api": "systemone",
+  "model": "jev-1.14.0",
+  "minProbability": 0.85,
+  "uncertainLabel": "uncertain",
+  "connections": {
+    "decisions": ["DECISION_ENDPOINT", "DECISION_API_KEY"]
+  }
+}
+```
+
+All these fields are required. `model` is an opaque, caller-owned identifier; `minProbability`
+is a finite number from 0 to 1, inclusive. The example threshold is illustrative: evaluate it
+against your chosen model and workload. A decision has no `lane`, `effort`, or `sessionScope`.
+
+The verifier must have instructions, `attempts: 1`, and exactly one signal. Its signal declares
+at least two options plus the uncertainty label. For example, `route` can declare
+`["simple", "complex", "uncertain"]`. Describe each option in the instructions. The adapter
+sends one Choice question named `route`, with the remaining signal labels as criteria and null
+descriptions. The complete bound input becomes `state` and must be a string, record, or array.
+
+The output must be a record with exactly these required fields:
+
+| Field           | Payload type                                                |
+| --------------- | ----------------------------------------------------------- |
+| `choice`        | Enum of the options, excluding the uncertainty label        |
+| `probabilities` | Record with one required `number` field for each option     |
+| `model`         | `string`, preserving the identifier returned by the service |
+
+The diagnostic must be a record with one required string field named `message`. The adapter
+checks the complete distribution, its sum, and its agreement with the chosen option. It emits
+the chosen label when its probability is at least `minProbability`; a tie or lower probability
+emits `uncertainLabel`. Output preserves the original choice and distribution in both cases.
+This threshold uses the winning probability, rather than the provider's separate confidence
+statistic. Use normal graph guards on the signal to select an already authored branch.
+A decision binding cannot supply the postmortem's agent model. Graphs with no agent bindings
+skip Active Memory setup; mixed graphs inherit a postmortem model from an agent binding.
+
+Declare exactly `DECISION_ENDPOINT` and `DECISION_API_KEY` through named connections. Local
+runs resolve these fields from the invoking environment; hosted runs use the target's connection
+resolver. Supply the full POST endpoint, including its path:
+
+| Service                        | Example `DECISION_ENDPOINT`                          |
+| ------------------------------ | ---------------------------------------------------- |
+| TypeSafe                       | `https://api.typesafe.ai/v1/systemone`               |
+| OpenRouter                     | `https://openrouter.ai/api/v1/systemone`             |
+| Vercel TypeSafe-compatible API | `https://ai-gateway.vercel.sh/typesafe/v1/systemone` |
+
+Use that service's bearer API key and model identifier. The adapter preserves the supplied path
+and accepts additional response metadata. Endpoints must be absolute HTTP(S) URLs without
+embedded credentials, a query, or a fragment. It follows no redirects. Requests and responses
+have a 4 MiB bound and each evaluation has a sixty-second ceiling, within any shorter authored
+node timeout. Cancellation interrupts HTTP work; a failed request does not silently retry or
+become an uncertainty signal. Known usage survives invalid answers; unavailable usage remains
+incomplete. Settled outcomes use ordinary run persistence and checkpoint replay.
+
+The profile editor's **Decision model** worker creates a verifier with this contract. Choose
+the model and probability threshold, then bind its evidence inputs and configure the named
+connection. Changing option labels also requires updating the output enum and probability
+fields to match. Targets must advertise `openengine.decision-models/v1` before the CLI submits
+or stores a decision-bearing profile. Other question types and provider-specific extensions
+are outside this binding's current contract.
 
 ### `git_delivery`
 
@@ -134,10 +256,22 @@ software-change --pr` prints a delivery node with the current contract.
 
 A graph can contain at most one delivery node, and no other executable node may run in parallel with
 it, either as a `par` sibling or inside a `map` that can have more than one item. A hosting service
-may require exactly one delivery node; Zeroshot Cloud quick runs require one. See
+may require exactly one delivery node; Zeroshot Platform quick runs require one. See
 [concurrent workspace changes](../concepts/execution.md#concurrent-workspace-changes).
 
 `ignore` skips pull-request discussion. CI, conflict, freshness, and merge-policy checks still apply.
+
+### `comment_delivery`
+
+This binding accepts only `kind: "comment_delivery"` and optional `connections`. It has no model,
+lane, effort, or provider session. It binds a verifier using `builtin.comment-delivery.post@1`
+with that worker's fixed input/output, signal, and diagnostic contracts and no authored instructions.
+
+The node reads a required discussion `url` and report `body`, plus optional captured `reviewScope`.
+Its URL and present scope bind directly from required caller input; they cannot change before
+publication. A graph permits one trusted delivery node, and comment publication must follow all
+other executable work and cleanup, outside loops and maps. The confirmed native result appears in `status.metadata.deliveryReceipt`, independently of
+graph-authored terminal output. See [Review an issue or pull request](../guides/review.md).
 
 ## Per-node lanes
 
@@ -174,9 +308,9 @@ on the default `codex`/`openai` lane, and both reviewers run on Claude Code:
 Each `model` goes to the provider of its node's effective lane, so here `worker` needs an OpenAI
 model identifier and the reviewers need Anthropic ones.
 
-- `lane` accepts the same pairs as the run level, listed in
-  [Harness and provider](#harness-and-provider). An invalid pair is rejected when the plan is read.
-- A `git_delivery` binding cannot carry a `lane`.
+- `lane` follows the same [harness/provider admission rules](#harness-and-provider) as the run
+  level. An invalid pair is rejected when the plan is admitted.
+- A `git_delivery` or `comment_delivery` binding cannot carry a `lane`.
 - A `lane` equal to the run-level pair is accepted, and the node runs exactly as it would without
   one. It is still a `lane` field, so the [target support](#target-support) check applies to it and
   older binaries reject it. Omit `lane` when a node should use the default lane.
@@ -196,8 +330,9 @@ reading the target's discovery document and before it requests an access token o
 target operation failed: target does not support per-node runtime lanes (openengine.node-runtime-lanes/v1)
 ```
 
-Plans without a `lane` are unchanged on the wire and work with every target. Older Zeroshot
-binaries reject a plan that contains a `lane` field when they read it.
+Plans without a `lane` do not require the per-node capability. Targets separately advertise enabled
+harness/provider pairs through `openengine.runtime-harnesses/v1`; see [Targets](../concepts/targets.md).
+Older Zeroshot binaries reject a plan that contains a `lane` field when they read it.
 
 Local profiles are saved together in one file in the configuration store (`ZEROSHOT_CONFIG_DIR`).
 Once any local profile carries a `lane`, an older binary cannot read that file at all. Every local
@@ -214,7 +349,7 @@ the profile or its `lane` fields with the newer binary.
 ### Local runs
 
 Before the controller starts, a local `zeroshot run` or `zeroshot resume` checks that each lane's
-executable, `codex`, `claude`, `copilot`, or `pi`, is on `PATH`. A missing executable fails the
+registered executable is on `PATH`. A missing executable fails the
 command with a message such as:
 
 ```text
@@ -224,10 +359,10 @@ lane claude/anthropic needs the `claude` executable on PATH
 `zeroshot acp` runs the same check when each session opens, against that session's workspace, and
 the session request fails with the same message. When every `PATH` entry is absolute, it also
 checks at startup. An empty or relative entry resolves against the directory the harness starts in,
-which is known only per session, so then the startup check is skipped. The check does not inspect login state; a missing login surfaces at
-that lane's first turn. As in a single-lane run, local `codex`/`openai`, `claude`/`anthropic`,
-`copilot`/`github`, `pi`/`anthropic`, and `pi`/`openai` lanes reuse their harness's native login,
-and other lanes need their provider's connection fields; see [Connections](#connections).
+which is known only per session, so then the startup check is skipped. The check does not inspect
+login state; a missing login surfaces at that lane's first turn. Lanes with native-login support reuse
+their harness's login. Other lanes need provider connection fields; see
+[Runtimes and connections](../concepts/runtimes-and-connections.md#runtime-configuration-contains-names-not-secret-values).
 
 ## Coverage
 
@@ -282,15 +417,21 @@ the fields of several providers.
 
 `--uniform-runtime-config` accepts a single agent configuration and expands it into a full plan:
 
-| Field          | Required | Value                                 |
-| -------------- | -------- | ------------------------------------- |
-| `harness`      | Yes      | As in `RuntimePlan`                   |
-| `provider`     | Yes      | As in `RuntimePlan`                   |
-| `size`         | No       | As in `RuntimePlan`; default `medium` |
-| `model`        | Yes      | As in an `agent` binding              |
-| `effort`       | No       | As in an `agent` binding              |
-| `sessionScope` | No       | As in an `agent` binding              |
-| `connections`  | No       | Applied to every agent node           |
+| Field           | Required | Value                                 |
+| --------------- | -------- | ------------------------------------- |
+| `harness`       | Yes      | As in `RuntimePlan`                   |
+| `provider`      | Yes      | As in `RuntimePlan`                   |
+| `size`          | No       | As in `RuntimePlan`; default `medium` |
+| `model`         | Yes      | As in an `agent` binding              |
+| `effort`        | No       | As in an `agent` binding              |
+| `contextWindow` | No       | As in an `agent` binding              |
+| `maxTokens`     | No       | As in an `agent` binding              |
+| `sessionScope`  | No       | As in an `agent` binding              |
+| `connections`   | No       | Applied to every agent node           |
+
+`contextWindow` and `maxTokens` are available in both an exact `agent` binding and a uniform
+runtime configuration. They are caller declarations and are never inferred from the model
+identifier.
 
 Every executable node gets an `agent` binding with these values, except nodes that use a delivery
 worker. Those get a `git_delivery` binding as described below.
@@ -303,21 +444,31 @@ authored scopes; use `node_instance` on `worker` in an exact plan to retain its 
 When using the updated template with an older exact runtime config, remove its `review_repair`
 and `delivery_repair` bindings. Existing saved profiles keep their stored graph and bindings.
 
+For `auto-research`, an omitted uniform `sessionScope` defaults to `node_instance` for `explorer`,
+`synthesizer`, `challenger`, and `researcher`, and `execution` for `reviewer`. The normal round has
+these five agent bindings; `--push` adds `checkpoint_delivery`. Exact plans must supply these node
+names and their desired scopes. Existing saved profiles keep their stored topology and runtime.
+
 A uniform configuration applies one lane to every agent node. Neither `--uniform-runtime-config` nor
 the Python SDK's `UniformRuntime` can express [per-node lanes](#per-node-lanes); use an exact
 `--runtime-config` or an opaque `RuntimePlan` instead.
 
 ## Template delivery bindings
 
-Built-in templates own their delivery nodes. With `software-change`, `--push`, `--pr`, and `--ship`
-add a delivery verifier named `deliver`. The existing `worker` handles delivery repairs. With `auto-research`, `--push`
-adds `checkpoint_delivery` plus the agent nodes `checkpoint_manifest` and `checkpoint_audit`.
+Built-in templates own their delivery nodes. `software-change` defaults to a pull-request delivery
+verifier named `deliver`; `--push` and `--ship` select push and merge delivery, and `--delivery none`
+omits delivery. The existing `worker` handles delivery repairs. With
+`auto-research`, `--push` adds only the trusted `checkpoint_delivery` node; the researcher and
+reviewer already handle the round records and delivery description.
 `single-worker` has no delivery modes.
 
 The CLI inserts a `git_delivery` binding with no forge connection for push, or
 `{"github": ["GH_TOKEN"]}` for PR and merge. Git transport uses the selected
 [source credentials](../concepts/targets.md#source-and-delivery-credentials).
-`--no-pr-feedback` (requires `--pr` or `--ship`) sets `pullRequestFeedback` to `ignore`.
+`--no-pr-feedback` (requires pull-request or merge delivery) sets `pullRequestFeedback` to `ignore`.
+When feedback is enabled, the forge adapter admits repair requests only from current repository
+writers, with permissions rechecked on each inspection. See [Execution](../concepts/execution.md)
+for the GitHub and GitLab authorization rules and lookup failure behavior.
 
 A uniform configuration binds the added agent nodes too. An exact `--runtime-config` must bind
 all agent nodes itself. Software-change uses `worker`, `acceptance`, and `code` with every delivery
@@ -325,3 +476,96 @@ mode. It may omit the delivery node; if it includes it, the binding must be `git
 with `zeroshot template show TEMPLATE` plus the same delivery flag.
 
 Custom graphs author delivery in both the graph and the plan.
+
+## Contributed harnesses
+
+Official local builds include contributed OpenCode and Hermes adapters; their native CLIs are
+installed separately. See [Harness adapters](../project/harness-adapters.md) for available providers,
+target support and the shared execution and Active Memory contracts.
+
+## Per-node native harness configuration
+
+An agent binding can include optional, secret-free `harnessConfig` beside `model` and `effort`.
+It is one JSON object, bounded to 64 KiB of encoded JSON, containing only `args` (an array of
+argument strings) and/or `options` (a JSON object). Each adapter supports the carriers below.
+Omitting it preserves existing behavior. Nodes sharing a lane can have different configuration:
+
+```json
+{
+  "harness": "claude",
+  "provider": "anthropic",
+  "size": "small",
+  "nodes": {
+    "writer": { "kind": "agent", "model": "your-model" },
+    "reviewer": {
+      "kind": "agent",
+      "model": "your-model",
+      "harnessConfig": { "args": ["--tools", "Read,Grep,Glob"] }
+    }
+  }
+}
+```
+
+| Harness     | Carriers                                                                               | Example `harnessConfig`                           |
+| ----------- | -------------------------------------------------------------------------------------- | ------------------------------------------------- |
+| Codex       | `args` for native `exec`/`exec resume` options                                         | `{"args":["--config","web_search=\"disabled\""]}` |
+| Claude Code | `args` for native print mode; one inline `--settings` JSON object is supported         | `{"args":["--tools","Read,Grep,Glob"]}`           |
+| Copilot     | `options` for native `session.create` / `session.resume` parameters                    | `{"options":{"availableTools":["view","grep"]}}`  |
+| Pi          | `args` for native JSON mode                                                            | `{"args":["--tools","read,grep"]}`                |
+| OpenCode    | `args` for native `run`; `options` for native inline configuration                     | `{"options":{"permission":{"edit":"deny"}}}`      |
+| Hermes      | `options` over its native loaded configuration before native policy/agent construction | `{"options":{"agent":{"max_turns":12}}}`          |
+
+Argument strings are passed directly, without a shell. Native options retain native semantics:
+unknown JSON keys may be accepted or ignored, and native versions may behave differently.
+Zeroshot validates the envelope and reserved controls, not a catalog of native settings or tools.
+This feature does not guarantee a read-only filesystem or protect `tests/` when an allowed native
+tool can write files.
+
+`args` configures native options; positional task messages and unbound `@file` inputs are reserved
+for Zeroshot. Each CLI adapter recognizes its native separated option operands (including Claude's
+variadic tool lists and Pi's `--tools -read`). For other option syntax, bind a value explicitly with
+the harness's joined form, such as `--native-option=value`; unknown option names still reach the
+harness. Native values are not validated or translated. A bare value after a no-value switch is
+rejected with its `harnessConfig.args` index instead of being appended or queued as another prompt.
+
+Overrides apply only to that node's invocation/session and remain present on correction turns,
+provider continuation, and node-instance revisits. Native configuration discovery remains enabled
+as before; supplied values override only supported settings. OpenCode/Hermes objects merge recursively
+with existing native objects; supplied arrays/scalars replace their native values. User and repository
+configuration files are never edited. Changing a lane preserves the authored object for review;
+the new harness interprets it without translation. JSON import/export and saved profiles retain it.
+Python `RuntimePlan` mappings accept it unchanged; `UniformRuntime(harness_config=...)` supplies the
+same object to every generated agent binding.
+
+Zeroshot reserves model/provider selection and credentials, private state, workspace/session identity,
+transport, prompt and response contracts, required hooks, and cleanup/cancellation. Conflicts identify
+the node, harness and configuration path or flag. Credentials must use declared connections. Opaque
+Claude `--settings` files and runtime-changing Codex profiles are excluded because they can replace
+owned controls; ordinary native user/project discovery still works. Contained placements also retain
+host-owned permission/resource requirements. Locally, nonempty Claude/Codex overrides suppress
+automatic permission bypass; permission inspection never becomes arbitrary CLI validation.
+
+Hook-trust bypass and session redirection are reserved, including Codex
+`--dangerously-bypass-hook-trust` and `--worktree`, Claude `--safe-mode`, `--background`/`--bg`
+and `--cloud`, and Pi `--fork`. Contained Pi also owns tool selection and project trust under
+their native aliases, including `-t`/`--tools` and `-a`/`--approve`. Local Pi tool modifiers such
+as `{"args":["--tools","-read"]}` are passed through: Pi's exact short tokens do not treat
+`-read` as the reserved `-r` option.
+OpenCode `--pure` (including joined forms) is reserved because it disables the runtime's
+authentication and Active Memory plugins.
+
+Codex `exec` subcommand tokens (`resume`, `fork`, `review`, `help`) are runtime-owned anywhere
+in `args`; if a native option needs one as a literal value, use its `--option=value` form.
+Codex prompt attachments (`--image`/`-i`) are also runtime-owned. Claude reserves `--from-pr`, `--teleport`, `--system-prompt-file`
+and `--append-system-prompt-file` to preserve session and prompt ownership.
+
+Generated review-loop reviewers and built-in auxiliary memory agents retain inherited `harnessConfig`,
+so copying a binding does not broaden its native restrictions. Reviewers still receive fresh sessions
+and do not inherit credentials. Built-in defaults are unchanged when configuration is absent. Active
+Memory installs its existing hooks/plugins independently; Claude inline settings compose with its owned
+hook in a single layer. Restrictions can prevent an auxiliary agent from completing its work.
+
+A native launch or session-initialization rejection fails the node with the native cause through
+normal bounded, redacted diagnostics and authored error routing. It does not trigger response
+correction, configuration fallback, or adapter retries of rejected initialization. Settings accepted
+or ignored by the native harness have no effective-configuration acknowledgement or added preflight.

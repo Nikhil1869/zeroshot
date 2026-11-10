@@ -1,10 +1,12 @@
 use futures_util::FutureExt;
 
-use crate::native_v2_capsule::provider_process::report_provider_error;
+use crate::native_v2_capsule::provider_process::{report_cleanup_failure, report_provider_error};
 
 use super::*;
 
 mod conflict;
+#[cfg(all(test, unix))]
+mod diagnostics_tests;
 mod head;
 mod input;
 mod preflight;
@@ -39,7 +41,9 @@ impl NativeV2DeliveryAdapter {
         config: NativeV2DeliveryConfig,
         authority: Arc<dyn SourceDeliveryAuthority>,
     ) -> Self {
-        let git = SystemGit::new(config.git_program.clone()).with_identity(config.git_identity);
+        let git = SystemGit::new(config.git_program.clone())
+            .with_identity(config.git_identity)
+            .with_commit_identity(config.commit_identity.clone());
         Self {
             config: Arc::new(config),
             authority,
@@ -50,6 +54,16 @@ impl NativeV2DeliveryAdapter {
             trusted_git_credentials: None,
             state: Arc::new(std::sync::Mutex::new(preflight::DeliveryState::default())),
         }
+    }
+
+    /// Supplies the invoking shell snapshot only to trusted local Git subprocesses.
+    #[must_use]
+    pub(crate) fn with_local_git_environment(
+        mut self,
+        environment: Option<BTreeMap<String, String>>,
+    ) -> Self {
+        self.git = self.git.with_local_environment(environment);
+        self
     }
 
     /// Supplies source-only Git credentials without adding them to provider children.
@@ -169,7 +183,19 @@ impl NativeV2DeliveryAdapter {
         let (session, mut credentials, mode, pull_request_feedback) =
             match self.authorize(&invocation) {
                 Ok(authorized) => authorized,
-                Err(stop) => return stop.result(),
+                Err(stop) => {
+                    let credentials = DeliveryCredentials::diagnostic_only(&invocation.environment);
+                    self.report_stop(
+                        &stop,
+                        DeliveryDiagnostic {
+                            credentials: &credentials,
+                            control: &control,
+                            repair_supported: false,
+                        },
+                    )
+                    .await;
+                    return stop.result();
+                }
             };
         ensure_active(&control)?;
         let mut cancellation = control.cancellation();
@@ -191,6 +217,7 @@ impl NativeV2DeliveryAdapter {
                             outcome: DELIVERY_PUSHED_LABEL,
                             review: &review,
                             merge_revision: None,
+                            links: None,
                         },
                         diagnostic,
                     ).map_err(DeliveryStop::Runner);
@@ -206,6 +233,16 @@ impl NativeV2DeliveryAdapter {
                 Err(_) => Err(DeliveryStop::Runner(NodeRunnerError::DriverDetail("Git delivery panicked".to_owned()))),
             },
         };
+        // Publish the original failure before cleanup can replace its settlement outcome.
+        self.report_delivery_result(
+            &result,
+            DeliveryDiagnostic {
+                credentials: &credentials,
+                control: &control,
+                repair_supported: contract::supports_repair(&invocation.response),
+            },
+        )
+        .await;
         if let Some(validator) = &self.trusted_delivery_validator {
             if let Err(error) = validator.drain().await {
                 result = Err(DeliveryStop::Runner(error));
@@ -218,10 +255,6 @@ impl NativeV2DeliveryAdapter {
                     invocation: &invocation,
                     credentials: &credentials,
                 };
-                let error = NodeRunnerError::DriverDetail(
-                    self.redact_feedback(&credentials, &failure.diagnostic),
-                );
-                let _ = report_provider_error("Git delivery", &error, &[], &control).await;
                 self.repair_outcome(&feedback, mode, failure).await
             }
             Err(stop) => stop.result(),
@@ -242,8 +275,18 @@ impl NativeV2DeliveryAdapter {
 enum DeliveryStop {
     Runner(NodeRunnerError),
     Outcome(WorkerOutcome),
+    Explained {
+        result: Box<Result<WorkerOutcome, NodeRunnerError>>,
+        diagnostic: String,
+    },
     Repair(recovery::RepairFailure),
     Retry(SourceDeliveryError),
+}
+
+struct DeliveryDiagnostic<'a, 'environment> {
+    credentials: &'a DeliveryCredentials<'environment>,
+    control: &'a DriverControl,
+    repair_supported: bool,
 }
 
 struct DeliveryPreparation<'a, 'environment> {
@@ -254,10 +297,32 @@ struct DeliveryPreparation<'a, 'environment> {
 }
 
 impl DeliveryStop {
+    fn failure(outcome: WorkerOutcome, diagnostic: impl Into<String>) -> Self {
+        Self::Explained {
+            result: Box::new(Ok(outcome)),
+            diagnostic: diagnostic.into(),
+        }
+    }
+
+    fn diagnostic(&self) -> Option<String> {
+        match self {
+            Self::Explained { diagnostic, .. } => Some(diagnostic.clone()),
+            Self::Repair(failure) => Some(failure.diagnostic.clone()),
+            Self::Retry(error) => Some(error.to_string()),
+            Self::Runner(NodeRunnerError::Cancelled) => None,
+            Self::Runner(error) => Some(error.to_string()),
+            Self::Outcome(WorkerOutcome::Error { code, .. }) => {
+                Some(format!("Git delivery failed: {}", code.as_str()))
+            }
+            Self::Outcome(_) => None,
+        }
+    }
+
     fn result(self) -> Result<WorkerOutcome, NodeRunnerError> {
         match self {
             Self::Runner(error) => Err(error),
             Self::Outcome(outcome) => Ok(outcome),
+            Self::Explained { result, .. } => *result,
             Self::Repair(_) | Self::Retry(_) => {
                 Ok(WorkerOutcome::declared_failure(WorkerErrorCode::Crash))
             }
@@ -293,6 +358,18 @@ struct DeliveryCredentials<'a> {
 }
 
 impl<'a> DeliveryCredentials<'a> {
+    fn diagnostic_only(environment: &'a ResolvedEnvironment) -> Self {
+        Self {
+            environment: Some(environment),
+            token_file: None,
+            token: String::new(),
+            git: environment.source_git_credentials().cloned(),
+            forge_field: None,
+            github_git_token: String::new(),
+            token_from_environment: false,
+        }
+    }
+
     fn current(&self) -> SourceDeliveryCredential<'_> {
         super::transport::source_credential(&self.github_git_token, self.git.as_ref())
             .with_forge_token(&self.token)
@@ -319,11 +396,7 @@ impl<'a> DeliveryCredentials<'a> {
         };
         let refreshed = crate::native_v2_runner::refresh_environment(environment).await?;
         self.refresh_forge_token(&refreshed)?;
-        let refreshed_git = match refreshed.source_git_credentials() {
-            Some(credentials) => Some(credentials.clone()),
-            None => git_credentials(&refreshed)
-                .map_err(|_| crate::native_v2_runner::EnvironmentRefreshError::InvalidResponse)?,
-        };
+        let refreshed_git = resolved_git_credentials(&refreshed, None)?;
         if let Some(git) = refreshed_git {
             self.git = Some(git);
         }
@@ -354,12 +427,14 @@ fn refresh_failure(error: crate::native_v2_runner::EnvironmentRefreshError) -> D
         crate::native_v2_runner::EnvironmentRefreshError::Unavailable => {
             recovery::repair("forge credential refresh is temporarily unavailable")
         }
-        crate::native_v2_runner::EnvironmentRefreshError::Refused => {
-            DeliveryStop::Outcome(WorkerOutcome::authentication_refusal())
-        }
-        crate::native_v2_runner::EnvironmentRefreshError::InvalidResponse => {
-            DeliveryStop::Outcome(WorkerOutcome::malformed())
-        }
+        crate::native_v2_runner::EnvironmentRefreshError::Refused => DeliveryStop::failure(
+            WorkerOutcome::authentication_refusal(),
+            "Forge credential refresh was refused",
+        ),
+        crate::native_v2_runner::EnvironmentRefreshError::InvalidResponse => DeliveryStop::failure(
+            WorkerOutcome::malformed(),
+            "Forge credential refresh returned an invalid response",
+        ),
     }
 }
 
@@ -382,6 +457,71 @@ fn authorized_mode(
 }
 
 impl NativeV2DeliveryAdapter {
+    fn result_links(
+        &self,
+        response: &NodeResponseContract,
+        review: &SourceReviewReceipt,
+    ) -> Result<Option<Map<String, Value>>, NodeRunnerError> {
+        if !contract::supports_links(response) {
+            return Ok(None);
+        }
+        let mut fields = Map::new();
+        if let Some(links) = self
+            .authority
+            .review_links(review)
+            .map_err(|error| NodeRunnerError::DriverDetail(error.to_string()))?
+        {
+            fields.insert("url".to_owned(), Value::String(links.url));
+            fields.insert("commitUrl".to_owned(), Value::String(links.commit_url));
+        }
+        Ok(Some(fields))
+    }
+
+    async fn report_delivery_result(
+        &self,
+        result: &Result<WorkerOutcome, DeliveryStop>,
+        context: DeliveryDiagnostic<'_, '_>,
+    ) {
+        if let Err(stop) = result {
+            self.report_stop(stop, context).await;
+        }
+    }
+
+    async fn report_stop(&self, stop: &DeliveryStop, context: DeliveryDiagnostic<'_, '_>) {
+        let DeliveryDiagnostic {
+            credentials,
+            control,
+            repair_supported,
+        } = context;
+        if let Some(diagnostic) = stop.diagnostic() {
+            let diagnostic = match stop {
+                DeliveryStop::Runner(NodeRunnerError::DriverDetail(_)) => diagnostic,
+                _ => format!("Git delivery: {diagnostic}"),
+            };
+            let diagnostic = self.redact_feedback(credentials, diagnostic);
+            let cleanup_unconfirmed = match stop {
+                DeliveryStop::Runner(NodeRunnerError::CleanupUnconfirmed) => true,
+                DeliveryStop::Explained { result, .. } => {
+                    matches!(result.as_ref(), Err(NodeRunnerError::CleanupUnconfirmed))
+                }
+                _ => false,
+            };
+            if cleanup_unconfirmed {
+                report_cleanup_failure(control, diagnostic).await;
+            } else if repair_supported && matches!(stop, DeliveryStop::Repair(_)) {
+                let error = NodeRunnerError::DriverDetail(diagnostic);
+                let _ = report_provider_error("Git delivery", &error, &[], control).await;
+            } else {
+                let _ = control
+                    .emit(LiveOutput::diagnostic(
+                        FailureDiagnosticKind::Failure,
+                        diagnostic,
+                    ))
+                    .await;
+            }
+        }
+    }
+
     fn authorize<'a>(
         &'a self,
         invocation: &'a DriverInvocation,
@@ -420,23 +560,30 @@ impl NativeV2DeliveryAdapter {
             Some(_) => declared
                 .or(trusted)
                 .or_else(|| token_file.map(|_| ""))
-                .ok_or_else(|| DeliveryStop::Outcome(WorkerOutcome::authentication_refusal()))?
+                .ok_or_else(|| {
+                    DeliveryStop::failure(
+                        WorkerOutcome::authentication_refusal(),
+                        format!(
+                            "Required forge credential {} was not supplied",
+                            forge_field.unwrap_or("unknown")
+                        ),
+                    )
+                })?
                 .to_owned(),
             None => String::new(),
         };
-        let github_git_token = forge_credential(&invocation.environment, GITHUB_TOKEN_ENV)
-            .or(self.trusted_github_token.as_deref())
-            .unwrap_or("")
-            .to_owned();
-        let git = invocation
-            .environment
-            .source_git_credentials()
-            .cloned()
-            .or(self.trusted_git_credentials.clone());
-        let git = match git {
-            Some(credentials) => Some(credentials),
-            None => git_credentials(&invocation.environment)?,
-        };
+        let github_git_token = github_git_token(
+            &invocation.environment,
+            self.trusted_github_token.as_deref(),
+        )
+        .map_err(refresh_failure)?
+        .unwrap_or("")
+        .to_owned();
+        let git = resolved_git_credentials(
+            &invocation.environment,
+            self.trusted_git_credentials.as_ref(),
+        )
+        .map_err(|_| DeliveryStop::Outcome(WorkerOutcome::malformed()))?;
         Ok(DeliveryCredentials {
             environment: Some(&invocation.environment),
             token_file,
@@ -453,18 +600,12 @@ impl NativeV2DeliveryAdapter {
         environment: &ResolvedEnvironment,
         forge_field: Option<&str>,
     ) -> Result<Option<&'a TrustedGitHubTokenFile>, DeliveryStop> {
-        let name = EnvironmentVariableName::new(GITHUB_TOKEN_ENV)
-            .map_err(|_| DeliveryStop::Outcome(WorkerOutcome::malformed()))?;
         match (
-            environment
-                .get(&name)
-                .or(self.trusted_github_token.as_deref()),
+            github_git_token(environment, self.trusted_github_token.as_deref())
+                .map_err(refresh_failure)?,
             forge_field,
         ) {
-            (Some(token), _) => {
-                validate_github_delivery_token(token).map_err(refresh_failure)?;
-                Ok(None)
-            }
+            (Some(_), _) => Ok(None),
             (None, Some(GITHUB_TOKEN_ENV)) => Ok(self.trusted_github_token_file.as_ref()),
             _ => Ok(None),
         }
@@ -490,9 +631,10 @@ impl NativeV2DeliveryAdapter {
                 Err(crate::native_v2_runner::EnvironmentRefreshError::Unavailable) => {
                     attempts = attempts.saturating_add(1);
                     if !self.config.poll.has_next(attempts) {
-                        return Err(DeliveryStop::Outcome(WorkerOutcome::declared_failure(
-                            WorkerErrorCode::Timeout,
-                        )));
+                        return Err(DeliveryStop::failure(
+                            WorkerOutcome::declared_failure(WorkerErrorCode::Timeout),
+                            "Trusted GitHub credential remained unavailable through the delivery retry limit",
+                        ));
                     }
                     emit(
                         control,
@@ -518,7 +660,7 @@ impl NativeV2DeliveryAdapter {
             .await?;
         let review_request = SourceReviewRequest {
             target: self.config.target.clone(),
-            head_branch: delivery_branch(self.config.delivery_run_id.as_str()),
+            head_branch: delivery_head_branch(&self.config.delivery_run_id),
             head_revision,
             title: input.title,
             description: input.description,
@@ -575,7 +717,10 @@ impl NativeV2DeliveryAdapter {
             .await
             .map_err(|stop| stop.with_review(&pending))?;
         if !valid_review(&request, &review) {
-            return Err(DeliveryStop::Outcome(WorkerOutcome::malformed()));
+            return Err(DeliveryStop::failure(
+                WorkerOutcome::malformed(),
+                "Forge returned a review receipt that does not match the intended repository, branch or revision",
+            ));
         }
         self.record_published(review.clone());
         emit(
@@ -648,12 +793,10 @@ impl NativeV2DeliveryAdapter {
             }
             completed_attempts = completed_attempts.saturating_add(1);
             if !self.config.poll.has_next(completed_attempts) {
-                emit(
-                    drive.control,
-                    "delivery: authoritative confirmation timed out",
-                )
-                .await?;
-                return Ok(WorkerOutcome::declared_failure(WorkerErrorCode::Timeout));
+                return Err(DeliveryStop::failure(
+                    WorkerOutcome::declared_failure(WorkerErrorCode::Timeout),
+                    "Authoritative forge confirmation timed out",
+                ));
             }
             wait_for_poll(drive.control, self.config.poll.interval).await?;
         }
@@ -743,7 +886,10 @@ impl NativeV2DeliveryAdapter {
             return Ok(None);
         }
         let diagnostic = feedback_diagnostic(&items).ok_or_else(|| {
-            DeliveryStop::Outcome(WorkerOutcome::declared_failure(WorkerErrorCode::Refusal))
+            DeliveryStop::failure(
+                WorkerOutcome::declared_failure(WorkerErrorCode::Refusal),
+                "Pull-request feedback exceeded the 4 MiB absolute repair backstop",
+            )
         });
         let diagnostic = match diagnostic {
             Ok(diagnostic) => diagnostic,
@@ -797,11 +943,7 @@ impl NativeV2DeliveryAdapter {
                 .await
             }
             ReviewProgress::Merged(_) | ReviewProgress::Closed => {
-                review::failed_review(
-                    drive.control,
-                    "pull request was closed or merged before delivery completed",
-                )
-                .await
+                review::failed_review("pull request was closed or merged before delivery completed")
             }
         }
     }
@@ -838,11 +980,7 @@ impl NativeV2DeliveryAdapter {
                 Ok(ReviewStep::Continue)
             }
             ReviewProgress::Merged(_) | ReviewProgress::Closed => {
-                review::failed_review(
-                    drive.control,
-                    "pull request was closed or merged before delivery completed",
-                )
-                .await
+                review::failed_review("pull request was closed or merged before delivery completed")
             }
         }
     }
@@ -876,11 +1014,7 @@ impl NativeV2DeliveryAdapter {
                 Ok(ReviewStep::Continue)
             }
             ReviewProgress::Closed => {
-                review::failed_review(
-                    drive.control,
-                    "pull request was closed or merged before delivery completed",
-                )
-                .await
+                review::failed_review("pull request was closed or merged before delivery completed")
             }
         }
     }
@@ -1002,7 +1136,10 @@ fn checked_progress(
     observation: SourceReviewObservation,
 ) -> Result<ReviewProgress, DeliveryStop> {
     if !valid_observation(review, &observation) {
-        return Err(DeliveryStop::Outcome(WorkerOutcome::malformed()));
+        return Err(DeliveryStop::failure(
+            WorkerOutcome::malformed(),
+            "Forge returned a review observation that does not match the published repository, branch or revision",
+        ));
     }
     ReviewProgress::from_observation(observation)
 }
@@ -1029,26 +1166,4 @@ fn feedback_diagnostic(items: &[SourceReviewFeedbackItem]) -> Option<String> {
         }
     }
     Some(diagnostic)
-}
-
-fn git_credentials(
-    environment: &ResolvedEnvironment,
-) -> Result<Option<openengine_cluster_protocol::GitTransportCredentials>, DeliveryStop> {
-    let values: BTreeMap<_, _> = environment
-        .iter()
-        .filter(|(name, _)| {
-            matches!(
-                name.as_str(),
-                "GIT_USERNAME" | "GIT_PASSWORD" | "GIT_SSH_PRIVATE_KEY" | "GIT_SSH_KNOWN_HOSTS"
-            )
-        })
-        .map(|(name, value)| (name.clone(), value.to_owned()))
-        .collect();
-    if values.is_empty() {
-        return Ok(None);
-    }
-    let values = openengine_cluster_protocol::StaticConnectionValues::new(values)
-        .map_err(|_| DeliveryStop::Outcome(WorkerOutcome::malformed()))?;
-    openengine_cluster_protocol::GitTransportCredentials::from_connection_values(&values)
-        .map_err(|_| DeliveryStop::Outcome(WorkerOutcome::malformed()))
 }

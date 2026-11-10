@@ -6,7 +6,9 @@ use crate::native_v2_contract::{
 };
 use crate::native_v2_delivery::{DeliveryMode, GITHUB_TOKEN_ENV};
 use crate::native_v2_delivery::contract::{delivery_result_schema, delivery_signal_labels};
-use openengine_cluster_protocol::{IdempotencyKey, ReasoningEffort};
+use openengine_cluster_protocol::{
+    IdempotencyKey, MAX_MODEL_CONTEXT_WINDOW, MAX_MODEL_MAX_TOKENS, ReasoningEffort,
+};
 use serde_json::{json, Value};
 
 fn null_verifier(name: &str, worker: &str) -> Value {
@@ -77,6 +79,9 @@ fn binding(model: &str, effort: Option<ReasoningEffort>) -> NodeRuntimeBinding {
         lane: None,
         model: crate::worker_catalog::ModelId::new(model).assert_value(),
         effort,
+        harness_config: None,
+        context_window: None,
+        max_tokens: None,
         session_scope: SessionScope::Execution,
         connections: DeclaredConnections::empty(),
     }
@@ -87,6 +92,9 @@ fn binding_with_environment(names: impl IntoIterator<Item = String>) -> NodeRunt
         lane: None,
         model: crate::worker_catalog::ModelId::new("claude-sonnet-5").assert_value(),
         effort: None,
+        harness_config: None,
+        context_window: None,
+        max_tokens: None,
         session_scope: SessionScope::Execution,
         connections: DeclaredConnections::single(
             "test",
@@ -125,11 +133,15 @@ fn submission(graph: GraphSpec, nodes: BTreeMap<NodeName, NodeRuntimeBinding>) -
         title: RunTitle::new("Admission test").assert_value(),
         graph,
         initial_input: json!({"items":[null]}),
-        runtime: RuntimePlan::Claude {
-            provider: ClaudeProvider::Anthropic,
-            size: RunSize::Medium,
+        runtime: RuntimePlan::new(
+            openengine_cluster_protocol::RuntimeLane::new(
+                "claude",
+                (ClaudeProvider::Anthropic).name(),
+            )
+            .assert_value(),
+            RunSize::Medium,
             nodes,
-        },
+        ),
         source: Some(resolved_source()),
         submission_key: IdempotencyKey::new("admission-test").assert_value(),
     }
@@ -179,7 +191,10 @@ async fn admits_authored_loop_and_parallel_verifiers_without_defaulting_effort()
     for binding in admitted.runtime.nodes().values() {
         let effort = match binding {
             NodeRuntimeBinding::Agent { effort, .. } => Some(effort),
-            NodeRuntimeBinding::GitDelivery { .. } => None,
+            NodeRuntimeBinding::Script { .. }
+            | NodeRuntimeBinding::Decision { .. }
+            | NodeRuntimeBinding::GitDelivery { .. }
+            | NodeRuntimeBinding::CommentDelivery { .. } => None,
         };
         let effort = effort.assert_value_with("fixture has only agent bindings");
         assert_eq!(*effort, None);
@@ -353,24 +368,21 @@ async fn admits_bedrock_for_both_harnesses_and_preserves_provider_owned_models()
         title: RunTitle::new("Opaque Codex model").assert_value(),
         graph: graph.clone(),
         initial_input: json!({"items":[null]}),
-        runtime: RuntimePlan::Codex {
-            provider: CodexProvider::Bedrock,
-            size: RunSize::Small,
-            nodes: BTreeMap::from([(
+        runtime: RuntimePlan::new(
+            openengine_cluster_protocol::RuntimeLane::new("codex", (CodexProvider::Bedrock).name())
+                .assert_value(),
+            RunSize::Small,
+            BTreeMap::from([(
                 named("work"),
                 binding("provider/future-model", Some(ReasoningEffort::Max)),
             )]),
-        },
+        ),
         source: Some(resolved_source()),
         submission_key: IdempotencyKey::new("opaque-codex-model").assert_value(),
     };
     let admitted = NativeV2Admission.admit(codex_runtime).await.assert_value();
-    let provider = match &admitted.runtime {
-        RuntimePlan::Codex { provider, .. } => Some(provider),
-        RuntimePlan::Claude { .. } | RuntimePlan::Copilot { .. } | RuntimePlan::Pi { .. } => None,
-    };
-    let provider = provider.assert_value_with("admission preserves the Codex harness");
-    assert_eq!(*provider, CodexProvider::Bedrock);
+    assert_eq!(admitted.runtime.harness.as_str(), "codex");
+    assert_eq!(admitted.runtime.provider.as_str(), "bedrock");
     assert!(matches!(
         admitted.runtime.nodes().get(&named("work")),
         Some(NodeRuntimeBinding::Agent { model, effort: Some(ReasoningEffort::Max), .. })
@@ -384,19 +396,11 @@ async fn admits_bedrock_for_both_harnesses_and_preserves_provider_owned_models()
             binding("claude-haiku-4-5", Some(ReasoningEffort::Low)),
         )]),
     );
-    let provider = match &mut claude_runtime.runtime {
-        RuntimePlan::Claude { provider, .. } => Some(provider),
-        RuntimePlan::Codex { .. } | RuntimePlan::Copilot { .. } | RuntimePlan::Pi { .. } => None,
-    };
-    let provider = provider.assert_value_with("submission fixture uses Claude");
-    *provider = ClaudeProvider::Bedrock;
+    assert_eq!(claude_runtime.runtime.harness.as_str(), "claude");
+    claude_runtime.runtime.provider = ClaudeProvider::Bedrock.into();
     let admitted = NativeV2Admission.admit(claude_runtime).await.assert_value();
-    let provider = match &admitted.runtime {
-        RuntimePlan::Claude { provider, .. } => Some(provider),
-        RuntimePlan::Codex { .. } | RuntimePlan::Copilot { .. } | RuntimePlan::Pi { .. } => None,
-    };
-    let provider = provider.assert_value_with("admission preserves the Claude harness");
-    assert_eq!(*provider, ClaudeProvider::Bedrock);
+    assert_eq!(admitted.runtime.harness.as_str(), "claude");
+    assert_eq!(admitted.runtime.provider.as_str(), "bedrock");
     assert!(matches!(
         admitted.runtime.nodes().get(&named("work")),
         Some(NodeRuntimeBinding::Agent { model, effort: Some(ReasoningEffort::Low), .. })
@@ -551,5 +555,153 @@ async fn environment_name_limit_counts_distinct_names_across_nodes_hooks_and_var
             expected
         );
         assert_eq!(NativeV2Admission.admit(request).await.map(|_| ()), expected);
+    }
+}
+
+#[tokio::test]
+async fn rejects_invalid_caller_declared_model_limits_at_admission() {
+    fn test_graph() -> GraphSpec {
+        graph(vec![null_step("work", "agent.work@1"), succeed("done")])
+    }
+
+    fn with_limits(context_window: Option<u32>, max_tokens: Option<u32>) -> NodeRuntimeBinding {
+        let mut binding = binding("claude-sonnet-5", None);
+        let NodeRuntimeBinding::Agent {
+            context_window: binding_context_window,
+            max_tokens: binding_max_tokens,
+            ..
+        } = &mut binding
+        else {
+            unreachable!("fixture only builds agent bindings")
+        };
+        *binding_context_window = context_window;
+        *binding_max_tokens = max_tokens;
+        binding
+    }
+
+    for (field, context_window, max_tokens) in [
+        ("contextWindow", Some(0), None),
+        ("contextWindow", Some(MAX_MODEL_CONTEXT_WINDOW + 1), None),
+        ("maxTokens", None, Some(0)),
+        ("maxTokens", None, Some(MAX_MODEL_MAX_TOKENS + 1)),
+    ] {
+        let error = NativeV2Admission
+            .admit(submission(
+                test_graph(),
+                BTreeMap::from([(named("work"), with_limits(context_window, max_tokens))]),
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                NativeV2AdmissionError::InvalidRuntimeBinding { node, detail }
+                    if node == &named("work")
+                        && detail.contains(field)
+                        && detail.contains("1..=10000000")
+            ),
+            "{field}: {error:?}"
+        );
+    }
+
+    NativeV2Admission
+        .admit(submission(
+            test_graph(),
+            BTreeMap::from([(named("work"), with_limits(Some(1_000_000), Some(32_000)))]),
+        ))
+        .await
+        .assert_value();
+}
+
+#[path = "tests/comments.rs"]
+mod comments;
+
+#[tokio::test]
+async fn host_selected_harness_registry_controls_profiles_intents_and_run_admission() {
+    use crate::harnesses::{HarnessDescriptor, HarnessRegistration, HarnessRegistry, HarnessSource};
+    let mut registry = HarnessRegistry::core();
+    registry
+        .register(HarnessRegistration {
+            descriptor: HarnessDescriptor {
+                id: "fixture-contribution",
+                label: "Fixture contribution",
+                providers: &["private-provider"],
+                executable: "must-not-launch",
+                source: HarnessSource::Contributed,
+            },
+            build: |_, _| panic!("pure admission must not construct a harness"),
+            access: |_| panic!("pure admission must not resolve provider credentials"),
+            normalize_local: |_, _| panic!("pure admission must not inspect local configuration"),
+            validate_config: |_| Ok(()),
+        })
+        .assert_value();
+    let mut request = submission(
+        graph(vec![null_step("work", "agent.work@1"), succeed("done")]),
+        BTreeMap::from([(named("work"), binding("opaque-model", None))]),
+    );
+    request.runtime.harness =
+        openengine_cluster_protocol::HarnessId::new("fixture-contribution").assert_value();
+    request.runtime.provider =
+        openengine_cluster_protocol::ProviderId::new("private-provider").assert_value();
+    let context = NativeV2AdmissionContext::new(&registry, DeliveryPolicy::Optional);
+    NativeV2Admission
+        .validate_profile_with_context(&request.graph, &request.runtime, context)
+        .await
+        .assert_value();
+    let intent = RunSubmissionIntent::from(&request);
+    NativeV2Admission
+        .validate_intent_with_context(&intent, context)
+        .await
+        .assert_value();
+    let admitted = NativeV2Admission
+        .admit_with_context(request.clone(), context)
+        .await
+        .assert_value();
+    assert_eq!(admitted.runtime, request.runtime);
+    assert!(matches!(
+        NativeV2Admission.admit(request.clone()).await,
+        Err(NativeV2AdmissionError::InvalidRuntime(_))
+    ));
+    let core = HarnessRegistry::core();
+    assert!(matches!(
+        NativeV2Admission
+            .admit_with_context(
+                request,
+                NativeV2AdmissionContext::new(&core, DeliveryPolicy::Optional)
+            )
+            .await,
+        Err(NativeV2AdmissionError::InvalidRuntime(_))
+    ));
+}
+
+#[path = "tests/source_access.rs"]
+mod source_access;
+
+#[tokio::test]
+async fn scripts_require_a_step_without_instructions() {
+    let script: NodeRuntimeBinding =
+        serde_json::from_value(json!({"kind":"script", "command":["python3"]})).assert_value();
+    let mut plain = null_step("work", "app.work@1");
+    plain.as_object_mut().assert_value().remove("instructions");
+    NativeV2Admission
+        .admit(submission(
+            graph(vec![plain, succeed("done")]),
+            BTreeMap::from([(named("work"), script.clone())]),
+        ))
+        .await
+        .assert_value();
+    for node in [
+        null_step("work", "app.work@1"),
+        null_verifier("work", "app.work@1"),
+    ] {
+        assert!(matches!(
+            NativeV2Admission
+                .admit(submission(
+                    graph(vec![node, succeed("done")]),
+                    BTreeMap::from([(named("work"), script.clone())])
+                ))
+                .await,
+            Err(NativeV2AdmissionError::InvalidRuntimeBinding { .. })
+        ));
     }
 }
